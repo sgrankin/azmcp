@@ -1,7 +1,7 @@
 # Azure Code-Mode MCP Server — Design Spec
 
-**Status:** reviewed draft / implementation plan
-**Working name:** `armctl` (placeholder)
+**Status:** reviewed design / staged implementation plan
+**Working name:** `azmcp`
 
 ---
 
@@ -92,7 +92,7 @@ Subscription and tenant *are* defaulted — per cloud, declared once, immutable 
 execution context.
 
 ```toml
-# ~/.config/armctl/config.toml
+# ~/.config/azmcp/config.toml
 [clouds.AzureUSGovernment]
 subscription = "…"
 tenant       = "…"
@@ -210,8 +210,10 @@ sets, and Government often receives versions later. A version literal that works
 
 ### 3.1 Choice
 
-**Rust + `deno_core`.** One `JsRuntime` (V8 isolate) per execution context, hosted in a
-worker process behind the MCP front end.
+**Rust + `deno_core`.** One `JsRuntime` (V8 isolate) per execution context, hosted in its
+own worker process behind the MCP front end in v0. This is intentionally the simplest
+honest crash boundary. Measure its startup and memory cost before considering a pooled
+worker that lets one V8 failure evict multiple contexts.
 
 Use the official `rmcp` 3.0 line for the `2026-07-28` JSON-RPC types, stdio transport,
 per-request metadata, discovery, caching fields, and MRTR plumbing. The first reviewed
@@ -248,13 +250,13 @@ invocation, which the ergonomics do not justify).
 | CPU / runaway loops | Worker watchdog terminates execution; kills the worker if V8 does not yield |
 | Heap ceiling | Per-isolate heap limits plus an OS RSS limit on the worker process |
 | Context lifetime | Idle TTL (default 30m) + absolute max, LRU eviction under memory pressure |
-| Concurrent contexts | Configurable cap; each is a full isolate |
+| Concurrent contexts | Configurable cap; each is a full isolate in its own worker in v0 |
 | Host-op input | Per-request path/header/body limits before allocation or network I/O |
 
 An ordinary timeout kills the context and returns a structured error. A V8 fatal OOM may
-kill the worker; the front end reports all contexts in that worker as evicted and starts a
-fresh worker. An in-process isolate alone cannot honestly promise that a V8 OOM leaves its
-host process healthy.
+kill the worker; in v0 that evicts exactly one context, and the front end starts a fresh
+worker for the next context. An in-process isolate alone cannot honestly promise that a V8
+OOM leaves its host process healthy.
 
 ### 3.3 Explicit security posture
 
@@ -716,9 +718,23 @@ metadata or application state from an earlier request. Every tool has JSON Schem
 for validator cost and never cause automatic network dereferencing of `$ref` URIs.
 Domain failures are returned as stable error codes rather than prose parsing.
 
+**Codex host compatibility.** The first source-verified host baseline is Codex CLI
+`0.147.0`. Its MCP `2026-07-28` client is present but under development and disabled by
+default. The tagged source contains discovery commit `be2e4afcd739`, MRTR commit
+`f2bee854a736`, and the `rmcp` 3.0 upgrade `a05bcda3dbd6`. Integration runs must start
+Codex with `--enable mcp_2026_07_28`. For a stdio server, the Codex MCP configuration must
+also contain
+`CODEX_MCP_PROTOCOL_VERSION=2026-07-28` in that server's configured environment. This is a
+Codex-only out-of-band selection marker, not part of MCP and not an `azmcp` configuration
+API: Codex consumes and removes it before launching the child, so `azmcp` must not expect
+to observe it. HTTP discovery does not use this marker. Default/unflagged Codex remains a
+legacy client; supporting it would require the deliberately deferred second protocol
+stack.
+
 Tool annotations are descriptive hints, not authorization. Mark discovery and inspect-only
-tools `readOnlyHint: true`; mark `azure_apply` destructive and non-idempotent. A client may
-use those hints to choose an approval UI, but the server does not rely on it.
+tools `readOnlyHint: true`; mark `azure_apply` with `destructiveHint: true` and
+`idempotentHint: false`. A client may use those hints to choose an approval UI, but the
+server does not rely on it.
 
 The Tasks extension is not needed for v0: `azure_run` is a bounded tool call and a retained
 V8 execution context is an application handle, not a task. Add Tasks only for a measured
@@ -742,15 +758,21 @@ Client Registration.
 
 Deliberately small — the API surface lives in the code, not in the tool list.
 
-| Tool | Purpose |
-|---|---|
-| `azure_context_open` | Resolve immutable identity, capability, and cloud bindings; return an application handle |
-| `azure_context_close` | Dispose the isolate and all context refs immediately |
-| `azure_run` | Execute JS in a context isolate; returns value + logs + call log |
-| `azure_accounts` | Enumerate cached subscription/account candidates across all clouds |
-| `azure_schema_search` | Keyword search over resource types / operations |
-| `azure_schema_get` | Full request/response schema for a type + api-version |
-| `azure_apply` | Elicit human approval, then replay an immutable mutation plan |
+| Tool | First phase | Purpose |
+|---|---:|---|
+| `azure_context_open` | v0 | Resolve immutable identity, capability, and cloud bindings; return an application handle |
+| `azure_context_close` | v0 | Dispose the isolate and all context refs immediately |
+| `azure_run` | v0 | Execute JS in a context isolate; returns value + logs + call log |
+| `azure_accounts` | v0 | Enumerate cached subscription/account candidates across all clouds |
+| `azure_schema_search` | v1 | Keyword search over resource types / operations |
+| `azure_schema_get` | v1 | Full request/response schema for a type + api-version |
+| `azure_apply` | v2 | Elicit human approval, then replay an immutable mutation plan |
+
+`tools/list` advertises only tools implemented in the running release. Likewise, v0's
+`azure_context_open` input schema accepts only `identity: "user"`,
+`armTier: "inspect"`, and an empty `dataPlanes` list. Later-phase enum values do not appear
+early as accepted-but-unimplemented options. There are no placeholder tools or successful
+stub results.
 
 ### 6.3 Application execution contexts are explicit
 
@@ -837,13 +859,15 @@ The model never holds the write capability.
    capabilities. If form elicitation is supported, return MCP
    `resultType: "input_required"` with an `elicitation/create` entry in `inputRequests`.
    The form message shows the exact plan hash, identity, cloud, subscriptions, operations,
-   and material body changes; its schema requires an explicit approval boolean.
-4. Return an AEAD-protected `requestState` binding the tool name, canonical argument hash,
-   plan hash, context, identity, policy hash, expiry, and one-time nonce. The client retries
-   `azure_apply` with a new JSON-RPC ID, the same arguments, the exact `requestState`, and
+   and material body changes; its schema requires an explicit approval boolean. The result
+   includes `io.modelcontextprotocol/serverInfo` in `_meta`, like every modern result.
+4. Return a random, opaque `requestState` that indexes a server-side approval-attempt
+   record. That record binds the tool name, canonical argument hash, plan hash, context,
+   identity, policy hash, expiry, and one-time status. The client retries `azure_apply`
+   with a new JSON-RPC ID, the same arguments, the exact `requestState`, and
    `inputResponses`. Treat all returned state and responses as attacker-controlled; apply
-   only when the retry independently declares form elicitation support, integrity
-   verification succeeds, and the elicitation action is `accept` with approval `true`.
+   only when the retry independently declares form elicitation support, the stored binding
+   matches, and the elicitation action is `accept` with approval `true`.
 5. If the client lacks form elicitation, do not emit `inputRequests`; return MCP
    `MissingRequiredClientCapabilityError` (`-32021`) with
    `requiredCapabilities: { elicitation: { form: {} } }`. The only fallback is a separate
@@ -851,9 +875,9 @@ The model never holds the write capability.
    receives a server approval secret. MCP necessarily trusts the client to truthfully
    mediate the human interaction; it cannot prove that a human clicked the UI.
 6. Apply performs no JS execution and no re-planning. It revalidates the plan and replays
-   the recorded requests. The nonce is consumed server-side before mutation begins so an
-   accepted retry cannot be replayed; decline invalidates the plan and cancel performs no
-   mutation.
+   the recorded requests. The approval attempt is atomically changed from `pending` to
+   `consumed` before mutation begins so an accepted retry cannot be replayed; decline
+   invalidates the plan and cancel performs no mutation.
 
 MCP tool annotations alone are never approval. Plans expire (default 15m), are one-shot,
 and are bound to the context, identity, cloud manifest, policy hash, subscriptions, and
@@ -924,6 +948,9 @@ content block containing the same JSON. `azure_run` returns:
 ```text
 {
   resultType: "complete",
+  _meta: {
+    "io.modelcontextprotocol/serverInfo": { name: "azmcp", version: "<build version>" }
+  },
   content: [{ type: "text", text: "<bounded JSON mirror>" }],
   structuredContent: {
     value | summary,
@@ -1199,7 +1226,7 @@ unrecognized method/path/version is denied — the same fail-closed rule as §5.
 | Wrong subscription assumed | Immutable per-cloud binding, live validation, and provenance in every request (§2.2.1) |
 | Protocol state leaks across calls | Require modern per-request metadata; treat stdio as a multiplexed transport (§6.1) |
 | Context handle is reused by another conversation | v0 treats it honestly as a bearer: fixed authority, bounded lifetime, explicit close; remote mode must bind an authenticated caller (§6.3) |
-| Forged or replayed apply retry | AEAD-bound MRTR state plus a server-side one-shot nonce ledger (§6.5) |
+| Forged or replayed apply retry | Random MRTR state bound to a server-side, one-shot approval record (§6.5) |
 | Late principal or capability switch | Resolved principal mapping and capabilities are fixed per isolate/context (§6.3) |
 | Running under Owner without noticing | Identity + incomplete-role warning disclosed at context open (§4.3) |
 | Context evicted mid-workflow | Explicit eviction notice in the next call's result |
@@ -1224,11 +1251,30 @@ unrecognized method/path/version is denied — the same fail-closed rule as §5.
 - `identity: 'user'` through the explicit Azure CLI credential broker (§4.7).
 - `az.request` and `az.graph` only, `inspect` only, no data-plane grants.
 - A deliberately small reviewed route bundle: subscription validation, Resource Graph,
-  provider metadata, and the ARM GET routes needed by the first real scenarios.
+  provider metadata, and an enumerated set of ARM GET path templates selected by the first
+  real scenarios. “Needed by the first scenarios” is resolved into checked-in route rows
+  and golden tests before implementation; it is not a runtime wildcard for arbitrary GETs.
 - Structured per-call results, bounded returned call log, durable redacted log, timeout,
   body limits, and exact-origin enforcement.
 
-### 11.1 v0 acceptance criteria
+### 11.1 v0 implementation order
+
+Keep the first executable slices narrow enough that each proves a separate boundary:
+
+1. Build a no-Azure stdio server with `server/discover`, deterministic `tools/list`, and a
+   trivial structured tool. Run the pinned MCP server conformance gate and the Codex
+   `0.147.0` modern-mode smoke test before introducing application state.
+2. Add config parsing, `azure_accounts`, immutable context records, and the credential
+   broker behind a fake `az` executable. No V8 or network calls yet.
+3. Add the reviewed v0 route rows, URL canonicalization, signing boundary, and HTTP client
+   against fake Azure endpoints. Unknown routes and origins must fail before token
+   acquisition or network I/O.
+4. Add one worker process and persistent isolate per context, exposing only the host ops
+   already proven at the front-end boundary.
+5. Run the authenticated commercial-plus-Government acceptance scenario and record startup
+   time, steady-state RSS, and first-call latency before changing the worker topology.
+
+### 11.2 v0 acceptance criteria
 
 1. Unit tests prove that URL canonicalization, route matching, capability checks, and log
    redaction fail closed for malformed and unknown inputs.
@@ -1246,14 +1292,18 @@ unrecognized method/path/version is denied — the same fail-closed rule as §5.
    worker and leave the MCP front end responsive.
 8. A real inventory scenario returns a correct small result from a much larger ARM/ARG
    response without truncating JSON.
-9. The official MCP `2026-07-28` server conformance suite passes. Focused regression tests
-   additionally cover `server/discover`, required request `_meta`, `resultType`, JSON Schema
-   2020-12, deterministic `tools/list` caching fields, stdio cancellation, and rejection of
-   `initialize` with an actionable supported-version error.
+9. The official MCP `2026-07-28` server conformance suite passes at an exact, checked-in
+   upstream revision, and the resulting report is retained as a build artifact. Focused
+   regression tests additionally cover `server/discover`, required request `_meta`,
+   `resultType`, JSON Schema 2020-12, deterministic `tools/list` caching fields, stdio
+   cancellation, and rejection of `initialize` with an actionable supported-version
+   error.
 10. Interleaved calls from unrelated logical conversations prove that no ambient current
     context, client capabilities, protocol version, or identity leaks across requests.
-11. The intended MCP host completes `server/discover`, `tools/list`, context open, and a
-    run using `2026-07-28`. If the host is still legacy-only, dual-era compatibility is a
+11. Codex CLI `0.147.0`, started with `--enable mcp_2026_07_28` and the stdio selection
+    marker described in §6.1, completes `server/discover`, `tools/list`, context open, and
+    a run using `2026-07-28`. The test also proves that `azmcp` does not receive the
+    Codex-only marker. A legacy-host failure is expected; dual-era compatibility is a
     separate explicit scope decision rather than hidden fallback behavior in the core.
 
 **v1 — usable**
@@ -1317,12 +1367,13 @@ What is the minimum signed/configured manifest for USSec, USNat, Azure Stack, an
 deployments, and which endpoint fields may metadata refresh replace? Do not answer this by
 guessing DNS suffixes from public or Government cloud.
 
-### 12.4 Worker containment
+### 12.4 Worker cost budget
 
-Is one worker process per context acceptable, or should several isolates share a worker
-with an OS RSS ceiling? Measure V8 startup snapshot size, steady-state isolate RSS, and
-worker restart latency before choosing. Crash containment is required; one-process-per-
-context is not assumed without measurement.
+v0 deliberately uses one worker process per context. Measure V8 startup snapshot size,
+steady-state worker RSS, first-call latency, and restart latency under the configured
+context cap. Pool isolates only if those results violate an explicit deployment budget;
+pooling trades resource efficiency for a larger crash and OOM blast radius and therefore
+requires new multi-context eviction tests.
 
 ### 12.5 Direct authentication backend
 
