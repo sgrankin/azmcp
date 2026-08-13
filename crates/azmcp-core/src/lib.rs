@@ -7,4 +7,5 @@ pub mod context;
 pub mod credential;
 pub mod http;
 pub mod policy;
+pub mod routes;
 pub mod target;

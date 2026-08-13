@@ -34,10 +34,22 @@ pub enum ArmTier {
     Write,
 }
 
+/// The reviewed entry point allowed to invoke a route.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RoutePurpose {
+    /// Caller-authored `az.request` code.
+    Request,
+    /// The first-class `az.graph` operation, whose body has separate scope validation.
+    ResourceGraph,
+    /// Server-owned validation and metadata calls.
+    Internal,
+}
+
 /// One reviewed and executable route-policy row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewedRoute {
     cloud: AzureCloud,
+    purpose: RoutePurpose,
     method: HttpMethod,
     template: RouteTemplate,
     api_versions: Vec<String>,
@@ -50,6 +62,7 @@ impl ReviewedRoute {
     /// Construct a reviewed row from checked-in policy data.
     pub fn new(
         cloud: AzureCloud,
+        purpose: RoutePurpose,
         method: HttpMethod,
         path_template: &str,
         api_versions: impl IntoIterator<Item = impl Into<String>>,
@@ -66,6 +79,7 @@ impl ReviewedRoute {
         }
         Ok(Self {
             cloud,
+            purpose,
             method,
             template: RouteTemplate::parse(path_template)?,
             api_versions,
@@ -104,6 +118,11 @@ impl ReviewedRoute {
         self.cloud
     }
 
+    /// The trusted entry point reviewed for this route.
+    pub fn purpose(&self) -> RoutePurpose {
+        self.purpose
+    }
+
     /// The reviewed HTTP method.
     pub fn method(&self) -> HttpMethod {
         self.method
@@ -127,11 +146,13 @@ impl ReviewedRoute {
     fn matches(
         &self,
         cloud: AzureCloud,
+        purpose: RoutePurpose,
         method: HttpMethod,
         target: &RelativeRequestTarget,
         api_version: &str,
     ) -> bool {
         self.cloud == cloud
+            && self.purpose == purpose
             && self.method == method
             && self
                 .api_versions
@@ -178,6 +199,7 @@ impl PolicyBundle {
     pub fn classify(
         &self,
         cloud: AzureCloud,
+        purpose: RoutePurpose,
         method: HttpMethod,
         target: &RelativeRequestTarget,
         api_version: &str,
@@ -185,7 +207,7 @@ impl PolicyBundle {
         let mut best: Option<(&ReviewedRoute, usize)> = None;
         let mut best_is_ambiguous = false;
         for route in &self.routes {
-            if !route.matches(cloud, method, target, api_version) {
+            if !route.matches(cloud, purpose, method, target, api_version) {
                 continue;
             }
             let specificity = route.template.literal_count;
@@ -337,6 +359,7 @@ mod tests {
     fn route(template: &str, action: &str) -> ReviewedRoute {
         ReviewedRoute::new(
             AzureCloud::AzureCloud,
+            RoutePurpose::Request,
             HttpMethod::Get,
             template,
             ["2024-01-01"],
@@ -372,6 +395,7 @@ mod tests {
         let matched = bundle
             .classify(
                 AzureCloud::AzureCloud,
+                RoutePurpose::Request,
                 HttpMethod::Get,
                 &target,
                 "2024-01-01",
@@ -404,6 +428,7 @@ mod tests {
         assert_eq!(
             bundle.classify(
                 AzureCloud::AzureCloud,
+                RoutePurpose::Request,
                 HttpMethod::Post,
                 &known,
                 "2024-01-01"
@@ -413,6 +438,7 @@ mod tests {
         assert_eq!(
             bundle.classify(
                 AzureCloud::AzureCloud,
+                RoutePurpose::Request,
                 HttpMethod::Get,
                 &unknown,
                 "2024-01-01"
@@ -422,6 +448,7 @@ mod tests {
         assert_eq!(
             bundle.classify(
                 AzureCloud::AzureCloud,
+                RoutePurpose::Request,
                 HttpMethod::Get,
                 &known,
                 "2025-01-01"
@@ -449,6 +476,7 @@ mod tests {
         assert_eq!(
             bundle.classify(
                 AzureCloud::AzureCloud,
+                RoutePurpose::Request,
                 HttpMethod::Get,
                 &target,
                 "2024-01-01"
@@ -469,6 +497,7 @@ mod tests {
             assert_eq!(
                 ReviewedRoute::new(
                     AzureCloud::AzureCloud,
+                    RoutePurpose::Request,
                     HttpMethod::Get,
                     template,
                     ["2024-01-01"],
@@ -503,6 +532,7 @@ mod tests {
             bundle
                 .classify(
                     AzureCloud::AzureCloud,
+                    RoutePurpose::Request,
                     HttpMethod::Get,
                     &allowed,
                     "2024-01-01"
@@ -512,6 +542,7 @@ mod tests {
         assert_eq!(
             bundle.classify(
                 AzureCloud::AzureUSGovernment,
+                RoutePurpose::Request,
                 HttpMethod::Get,
                 &allowed,
                 "2024-01-01"
@@ -521,6 +552,17 @@ mod tests {
         assert_eq!(
             bundle.classify(
                 AzureCloud::AzureCloud,
+                RoutePurpose::ResourceGraph,
+                HttpMethod::Get,
+                &allowed,
+                "2024-01-01"
+            ),
+            Err(PolicyDenial::UnknownRoute)
+        );
+        assert_eq!(
+            bundle.classify(
+                AzureCloud::AzureCloud,
+                RoutePurpose::Request,
                 HttpMethod::Get,
                 &denied,
                 "2024-01-01"

@@ -248,7 +248,7 @@ invocation, which the ergonomics do not justify).
 |---|---|
 | Wall-clock timeout | Per `azure_run` call, default 60s; cancel host ops and call V8 `TerminateExecution` |
 | CPU / runaway loops | Worker watchdog terminates execution; kills the worker if V8 does not yield |
-| Heap ceiling | Per-isolate heap limits plus an OS RSS limit on the worker process |
+| Heap ceiling | Per-isolate heap limits plus a parent-enforced 256 MiB OS RSS limit, sampled every 50 ms, on the worker process |
 | Context lifetime | Idle TTL (default 30m) + absolute max, LRU eviction under memory pressure |
 | Concurrent contexts | Configurable cap; each is a full isolate in its own worker in v0 |
 | Host-op input | Per-request path/header/body limits before allocation or network I/O |
@@ -432,7 +432,8 @@ Requirements:
   Azure CLI broker subprocesses behind one process-wide mutex. Token refresh is infrequent;
   serializing it avoids cross-key contention on Azure CLI's shared MSAL persistence while
   ARM requests remain concurrent. Cache access tokens in memory until five minutes before
-  `expires_on`.
+  `expires_on`. A newly opened context must establish its principal with a fresh broker
+  acquisition; it must not inherit a prior context's cached token after `az login` changes.
 - Verify that the returned tenant and subscription match the requested binding before
   using the token. Pin the token's principal and client claims in the context's resolved
   principal mapping. Every refresh must match; if `az login` changed the account
@@ -790,6 +791,35 @@ azure_run({ contextId, code, timeoutMs? })
 azure_context_close({ contextId })
 ```
 
+The v0 JSON representation is closed and explicit:
+
+```json
+{
+  "bindings": {
+    "AzureCloud": { "subscription": "<uuid>", "tenant": "<uuid, optional>" }
+  },
+  "allowedSubscriptions": {
+    "AzureCloud": [
+      { "subscription": "<additional uuid>", "tenant": "<uuid>" }
+    ]
+  },
+  "graphScopes": {
+    "AzureCloud": { "subscriptions": ["<uuid>"] },
+    "AzureUSGovernment": { "scope": "allAccessible" }
+  }
+}
+```
+
+`allowedSubscriptions` input entries are additional explicit subscription/tenant pairs.
+The normalized output includes the primary binding as well as those additions.
+A `graphScopes` entry is exactly one of an explicit subscription list or
+`{ "scope": "allAccessible" }`; it cannot contain both.
+An omitted graph scope normalizes to the cloud's primary binding.
+Every explicitly listed graph subscription must occur in that cloud's normalized
+subscription allowlist.
+`allAccessible` widens only `az.graph`; it never widens `az.request`.
+Unknown cloud keys, duplicate subscription IDs, and ambiguous tenant routes are errors.
+
 Contexts are evicted on idle TTL, absolute max age, process restart, or memory pressure.
 Eviction is reported so the model knows its state is gone rather than silently observing
 `undefined`.
@@ -1056,6 +1086,10 @@ signing, the front end:
 4. Disables redirects by default.
 5. Repeats origin and route validation for every `nextLink`, LRO polling URL, and
    service-provided continuation before sending credentials.
+
+The v0 inspect-only route bundle accepts no caller-supplied headers or request body.
+Later route rows may open only explicitly schema-reviewed fields; they do not inherit an
+arbitrary header or body channel.
 
 Data-plane helpers use the same rule with a plane-specific origin allowlist. A response can
 never turn paging or polling into a signed request to another host. Request and response
@@ -1374,6 +1408,17 @@ steady-state worker RSS, first-call latency, and restart latency under the confi
 context cap. Pool isolates only if those results violate an explicit deployment budget;
 pooling trades resource efficiency for a larger crash and OOM blast radius and therefore
 requires new multi-context eviction tests.
+
+Recent synthetic worker runs on macOS arm64 measured roughly 28–32 MiB RSS after
+startup and roughly 67–80 MiB under heap pressure before the test ceiling terminated
+them. These are diagnostic samples, not a portability guarantee. v0 therefore uses a 256 MiB
+per-process RSS ceiling, with a 50 ms parent-side sampler and hard termination on
+breach. The ceiling is intentionally above the 64 MiB V8 heap limit so normal V8
+heap growth, the executable/snapshot, and allocator overhead do not turn a valid
+JavaScript turn into an RSS false positive. A breached ceiling is a typed worker
+failure and evicts only that context. Linux and macOS use `sysinfo` OS process
+APIs; no shell process is used for measurement or enforcement. Other targets must
+provide an equivalent process-RSS implementation before claiming this control.
 
 ### 12.5 Direct authentication backend
 

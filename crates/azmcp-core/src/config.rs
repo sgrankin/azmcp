@@ -664,6 +664,25 @@ mod tests {
         );
         let error = Config::from_toml(&ambiguous).expect_err("ambiguous pair must fail");
         assert!(error.to_string().contains("ambiguous tenants"));
+
+        assert!(
+            toml::from_str::<CloudBinding>(&format!(
+                r#"
+                    subscription = "{SUB_COMMERCIAL}"
+                    tenant = "{TENANT_COMMERCIAL}"
+
+                    [[allowed_subscriptions]]
+                    subscription = "{SUB_EXTRA}"
+                    tenant = "{TENANT_EXTRA}"
+
+                    [[allowed_subscriptions]]
+                    subscription = "{SUB_EXTRA}"
+                    tenant = "{TENANT_EXTRA}"
+                "#
+            ))
+            .is_err(),
+            "direct serde construction must enforce binding invariants"
+        );
     }
 
     #[test]

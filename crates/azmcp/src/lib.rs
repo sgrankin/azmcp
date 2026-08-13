@@ -1,11 +1,16 @@
 //! The modern-only MCP front end for `azmcp`.
 //!
-//! The first executable slice deliberately stops at the protocol boundary.  It
-//! has no Azure credential, account, or network behavior, so the only tool it
-//! advertises is a local protocol-status probe.  The v0 Azure tools are added
-//! only when their stateful implementations exist.
+//! MCP requests are stateless; explicit application context handles retain the
+//! isolated JavaScript workers and immutable Azure authority records.
 
-use std::{borrow::Cow, future::Future, sync::Arc};
+pub mod app;
+pub mod audit;
+pub mod host;
+pub mod runtime;
+pub mod tools;
+pub mod worker;
+
+use std::{borrow::Cow, future::Future};
 
 use rmcp::{
     ServerHandler, Service,
@@ -13,11 +18,21 @@ use rmcp::{
         CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ClientRequest,
         DiscoverResult, ErrorCode, ErrorData, Implementation, JsonObject, ListToolsResult,
         MetaObject, PaginatedRequestParams, ProtocolVersion, RequestMetaObject, ServerCapabilities,
-        ServerInfo, ServerResult, Tool, ToolAnnotations,
+        ServerInfo, ServerResult, Tool,
     },
     service::{NotificationContext, RequestContext, RoleServer},
 };
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+
+use crate::{
+    app::{AppError, Application},
+    tools::{
+        ACCOUNTS_TOOL, AccountsArgs, CONTEXT_CLOSE_TOOL, CONTEXT_OPEN_TOOL, ContextCloseArgs,
+        ContextOpenArgs, RUN_TOOL, RunArgs,
+    },
+    worker::ResultTooLargeSummary,
+};
 
 /// The only protocol revision implemented by this server.
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
@@ -31,19 +46,22 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Cache lifetime for discovery and the deterministic tool catalog.
 pub const CACHE_TTL_MS: u64 = 60_000;
 
-/// A local, dependency-free probe that proves the modern result envelope.
-pub const STATUS_TOOL_NAME: &str = "azmcp_status";
-
 const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
+const MAX_TOOL_RESULT_BYTES: usize = 1024 * 1024;
 
-/// The protocol-only server implementation.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AzmcpServer;
+/// The modern protocol front end over the stateful application.
+#[derive(Clone)]
+pub struct AzmcpServer {
+    application: Application,
+}
 
 impl AzmcpServer {
-    /// Construct the protocol-only server.
-    pub const fn new() -> Self {
-        Self
+    /// Construct a server only when both JavaScript host operations are real.
+    pub fn new(application: Application) -> Result<Self, ServerConfigurationError> {
+        if !application.host_calls_ready() || !application.audit_ready() {
+            return Err(ServerConfigurationError);
+        }
+        Ok(Self { application })
     }
 
     /// Return the deterministic server identity.
@@ -60,7 +78,7 @@ impl AzmcpServer {
 
     /// Return the deterministic catalog of tools implemented in this release.
     pub fn tools() -> Vec<Tool> {
-        vec![status_tool()]
+        tools::catalog()
     }
 
     /// Wrap the handler with the modern per-request lifecycle boundary.
@@ -68,6 +86,10 @@ impl AzmcpServer {
         ModernService { server: self }
     }
 }
+
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("the v0 server requires semantic Azure host calls and a durable audit sink")]
+pub struct ServerConfigurationError;
 
 impl ServerHandler for AzmcpServer {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -110,33 +132,70 @@ impl ServerHandler for AzmcpServer {
         std::future::ready(Ok(result))
     }
 
-    fn call_tool(
+    async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> + rmcp::service::MaybeSendFuture + '_
-    {
-        let result = if request.name != STATUS_TOOL_NAME {
-            Err(ErrorData::new(
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        match request.name.as_ref() {
+            ACCOUNTS_TOOL => {
+                let args = parse_tool_args::<AccountsArgs>(request.arguments)?;
+                tool_result(self.application.accounts(args).await)
+            }
+            CONTEXT_OPEN_TOOL => {
+                let args = parse_tool_args::<ContextOpenArgs>(request.arguments)?;
+                let result = tokio::select! {
+                    biased;
+                    _ = context.ct.cancelled() => None,
+                    result = self.application.context_open(args) => Some(result),
+                };
+                match result {
+                    Some(result) => tool_result(result),
+                    None => domain_error_result(
+                        "context_evicted",
+                        "request cancelled; context creation was rolled back",
+                        false,
+                        None,
+                    ),
+                }
+            }
+            CONTEXT_CLOSE_TOOL => {
+                let args = parse_tool_args::<ContextCloseArgs>(request.arguments)?;
+                tool_result(self.application.context_close(args).await)
+            }
+            RUN_TOOL => {
+                let args = parse_tool_args::<RunArgs>(request.arguments)?;
+                let context_id = args.context_id.clone();
+                let result = tokio::select! {
+                    result = self.application.run(args) => Some(result),
+                    _ = context.ct.cancelled() => None,
+                };
+                match result {
+                    Some(result) => tool_result(result),
+                    None => {
+                        // Cancellation makes the retained isolate unsafe to
+                        // reuse: the worker protocol may still have an
+                        // outstanding Execute response. Dispose the explicit
+                        // application context as well as stopping this request.
+                        let _ = self
+                            .application
+                            .context_close(ContextCloseArgs { context_id })
+                            .await;
+                        domain_error_result(
+                            "context_evicted",
+                            "request cancelled; execution context was disposed",
+                            false,
+                            None,
+                        )
+                    }
+                }
+            }
+            _ => Err(ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,
                 format!("unknown tool: {}", request.name),
                 None,
-            ))
-        } else if request
-            .arguments
-            .as_ref()
-            .is_some_and(|arguments| !arguments.is_empty())
-        {
-            Err(ErrorData::invalid_params(
-                "azmcp_status does not accept arguments",
-                None,
-            ))
-        } else {
-            Ok(CallToolResult::structured(status_value())
-                .with_meta(Some(server_info_meta()))
-                .into())
-        };
-        std::future::ready(result)
+            )),
+        }
     }
 
     fn get_info(&self) -> ServerInfo {
@@ -150,14 +209,14 @@ impl ServerHandler for AzmcpServer {
 /// request and then switches into stateless mode.  The executable server uses
 /// `serve_directly` instead, so there is no implicit initialize lifecycle and
 /// every request is checked here before rmcp dispatches it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct ModernService {
     server: AzmcpServer,
 }
 
 impl ModernService {
     /// Construct a modern-only service around an `AzmcpServer`.
-    pub const fn new(server: AzmcpServer) -> Self {
+    pub fn new(server: AzmcpServer) -> Self {
         Self { server }
     }
 }
@@ -196,8 +255,9 @@ impl Service<RoleServer> for ModernService {
 
 /// Run the modern-only server over stdio.
 pub async fn run_stdio() -> anyhow::Result<()> {
+    let application = runtime::production_application().await?;
     let service = rmcp::service::serve_directly(
-        AzmcpServer::new().modern_service(),
+        AzmcpServer::new(application)?.modern_service(),
         rmcp::transport::stdio(),
         None::<rmcp::model::ClientInfo>,
     );
@@ -205,70 +265,98 @@ pub async fn run_stdio() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn status_tool() -> Tool {
-    Tool::new(
-        STATUS_TOOL_NAME,
-        "Report azmcp's local MCP protocol status; this tool never contacts Azure.",
-        schema_object(json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        })),
-    )
-    .with_raw_output_schema(schema_object(status_output_schema()))
-    .with_annotations(
-        ToolAnnotations::new()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(true)
-            .open_world(false),
-    )
-}
-
-fn status_value() -> Value {
-    json!({
-        "protocolVersion": PROTOCOL_VERSION,
-        "server": {
-            "name": SERVER_NAME,
-            "version": SERVER_VERSION
-        },
-        "modernOnly": true,
-        "azureAccess": false
+fn parse_tool_args<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, ErrorData> {
+    serde_json::from_value(Value::Object(arguments.unwrap_or_default())).map_err(|_| {
+        ErrorData::invalid_params("tool arguments do not match the declared v0 schema", None)
     })
 }
 
-fn status_output_schema() -> Value {
+fn tool_result<T: Serialize>(result: Result<T, AppError>) -> Result<CallToolResponse, ErrorData> {
+    match result {
+        Ok(result) => {
+            let value = serde_json::to_value(result)
+                .map_err(|_| ErrorData::internal_error("tool result serialization failed", None))?;
+            let encoded_bytes = serde_json::to_vec(&value)
+                .map_err(|_| ErrorData::internal_error("tool result sizing failed", None))?
+                .len();
+            if encoded_bytes > MAX_TOOL_RESULT_BYTES {
+                return domain_error_result(
+                    "result_too_large",
+                    "tool result exceeds the 1 MiB transport limit",
+                    false,
+                    Some(result_too_large_details(&ResultTooLargeSummary::from_json(
+                        &value,
+                        encoded_bytes,
+                        MAX_TOOL_RESULT_BYTES,
+                    ))),
+                );
+            }
+            Ok(CallToolResult::structured(value)
+                .with_meta(Some(server_info_meta()))
+                .into())
+        }
+        Err(error) => {
+            let details = error
+                .result_too_large_summary()
+                .map(result_too_large_details);
+            domain_error_result(
+                error.code(),
+                app_error_message(&error).as_ref(),
+                matches!(error.code(), "upstream_error" | "worker_crashed"),
+                details,
+            )
+        }
+    }
+}
+
+fn domain_error_result(
+    code: &str,
+    message: &str,
+    retryable: bool,
+    details: Option<Value>,
+) -> Result<CallToolResponse, ErrorData> {
+    let correlation_id = app::correlation_id()
+        .map_err(|_| ErrorData::internal_error("correlation ID generation failed", None))?;
+    let mut value = json!({
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+        "correlationId": correlation_id,
+    });
+    if let Some(details) = details {
+        value["details"] = details;
+    }
+    Ok(CallToolResult::structured_error(value)
+        .with_meta(Some(server_info_meta()))
+        .into())
+}
+
+fn result_too_large_details(summary: &ResultTooLargeSummary) -> Value {
     json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "properties": {
-            "protocolVersion": {
-                "type": "string",
-                "const": PROTOCOL_VERSION
-            },
-            "server": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "const": SERVER_NAME},
-                    "version": {"type": "string", "const": SERVER_VERSION}
-                },
-                "required": ["name", "version"],
-                "additionalProperties": false
-            },
-            "modernOnly": {"type": "boolean", "const": true},
-            "azureAccess": {"type": "boolean", "const": false}
-        },
-        "required": ["protocolVersion", "server", "modernOnly", "azureAccess"],
-        "additionalProperties": false
+        "summary": summary,
+        "guidance": "Reduce the value in JavaScript before returning it: project needed fields, filter rows, or aggregate counts.",
     })
 }
 
-fn schema_object(value: Value) -> Arc<JsonObject> {
-    let Value::Object(object) = value else {
-        unreachable!("static schemas are JSON objects")
-    };
-    Arc::new(object)
+fn app_error_message(error: &AppError) -> Cow<'static, str> {
+    if let Some(message) = error.authentication_message() {
+        return Cow::Owned(message.to_owned());
+    }
+    Cow::Borrowed(match error.code() {
+        "invalid_request" => "request is outside the implemented v0 contract",
+        "account_ambiguous" => "Azure account binding is missing or ambiguous",
+        "authentication_required" => "Azure CLI account discovery is unavailable",
+        "subscription_mismatch" => "subscription binding validation failed",
+        "context_busy" => "another run is already active in this context",
+        "context_evicted" => "the execution context no longer exists",
+        "worker_crashed" => "the isolated JavaScript worker is unavailable",
+        "execution_timeout" => "JavaScript execution exceeded its deadline",
+        "result_too_large" => "the JavaScript result exceeds the v0 size limit",
+        "route_denied" => "the request is not in the reviewed route policy",
+        "capability_denied" => "the context does not authorize that operation scope",
+        "upstream_error" => "the upstream operation could not complete",
+        _ => "the tool could not complete",
+    })
 }
 
 fn server_info_meta() -> MetaObject {
@@ -317,6 +405,18 @@ fn validate_modern_metadata(meta: &RequestMetaObject) -> Result<(), ErrorData> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use azmcp_core::{
+        config::{Config, ResolvedCloudBinding},
+        context::Context,
+    };
     use rmcp::{
         model::{
             CallToolRequest, CallToolRequestParams, ClientCapabilities, ClientJsonRpcMessage,
@@ -325,8 +425,142 @@ mod tests {
         },
         transport::{IntoTransport, Transport},
     };
+    use tokio::sync::Notify;
 
     use super::*;
+    use crate::{
+        app::{
+            BindingValidator, BoxFuture, DependencyError, MemoryProfileSource, WorkerFactory,
+            WorkerHandle, default_registry,
+        },
+        audit::{AuditError, AuditSink},
+        host::CallRecord,
+        host::{ClientFactoryError, HttpClientFactory},
+        worker::{ExecutionResult, HostCallHandler, ResultTooLargeSummary},
+    };
+
+    struct AllowValidator;
+
+    impl BindingValidator for AllowValidator {
+        fn validate<'a>(
+            &'a self,
+            _binding: &'a ResolvedCloudBinding,
+            _identity_pin: &'a azmcp_core::credential::CredentialIdentityPin,
+        ) -> BoxFuture<'a, Result<(), DependencyError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct TestWorkerFactory;
+
+    impl WorkerFactory for TestWorkerFactory {
+        fn start<'a>(
+            &'a self,
+            _context: &'a Context,
+        ) -> BoxFuture<'a, Result<Box<dyn WorkerHandle>, DependencyError>> {
+            Box::pin(async { Ok(Box::new(TestWorker) as Box<dyn WorkerHandle>) })
+        }
+    }
+
+    struct CancelOpenWorkerFactory {
+        calls: AtomicUsize,
+        entered: Arc<Notify>,
+    }
+
+    impl WorkerFactory for CancelOpenWorkerFactory {
+        fn start<'a>(
+            &'a self,
+            _context: &'a Context,
+        ) -> BoxFuture<'a, Result<Box<dyn WorkerHandle>, DependencyError>> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.entered.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                Ok(Box::new(TestWorker) as Box<dyn WorkerHandle>)
+            })
+        }
+    }
+
+    struct TestWorker;
+
+    impl WorkerHandle for TestWorker {
+        fn execute<'a>(
+            &'a mut self,
+            code: &'a str,
+            _timeout: Duration,
+            _host_handler: Option<HostCallHandler>,
+        ) -> BoxFuture<'a, Result<ExecutionResult, DependencyError>> {
+            Box::pin(async move {
+                if code == "__wait_for_cancellation__" {
+                    std::future::pending::<()>().await;
+                }
+                if code == "__too_large__" {
+                    let shape = json!({"records": ["never-return-this-value"]});
+                    return Err(DependencyError::ResultTooLarge {
+                        summary: Box::new(ResultTooLargeSummary::from_json(&shape, 70_000, 65_536)),
+                    });
+                }
+                Ok(ExecutionResult {
+                    value: Value::String(code.to_owned()),
+                    logs: Vec::new(),
+                    logs_omitted: 0,
+                })
+            })
+        }
+
+        fn close<'a>(&'a mut self) -> BoxFuture<'a, Result<(), DependencyError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct NoClientFactory;
+
+    struct TestAudit;
+
+    impl AuditSink for TestAudit {
+        fn prepare(&self) -> Result<(), AuditError> {
+            Ok(())
+        }
+
+        fn append(&self, _record: &CallRecord) -> Result<(), AuditError> {
+            Ok(())
+        }
+    }
+
+    impl HttpClientFactory for NoClientFactory {
+        fn client_for(
+            &self,
+            _binding: &ResolvedCloudBinding,
+        ) -> Result<Arc<azmcp_core::http::HttpClient>, ClientFactoryError> {
+            Err(ClientFactoryError::Unavailable)
+        }
+    }
+
+    fn test_server_with(
+        registry: azmcp_core::context::ContextRegistry,
+        worker_factory: Arc<dyn WorkerFactory>,
+    ) -> AzmcpServer {
+        let application = Application::from_arcs_with_host_clients(
+            Config::empty(),
+            registry,
+            Arc::new(MemoryProfileSource::new(
+                br#"{"subscriptions":[{"id":"11111111-1111-1111-1111-111111111111","name":"synthetic","state":"Enabled","tenantId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","environmentName":"AzureCloud","user":{"name":"test@example.invalid"}}]}"#.to_vec(),
+            )),
+            Arc::new(AllowValidator),
+            worker_factory,
+            Arc::new(NoClientFactory),
+            "test-policy-hash",
+            "test-policy-version",
+        )
+        .unwrap()
+        .with_audit_sink(Arc::new(TestAudit));
+        AzmcpServer::new(application).unwrap()
+    }
+
+    fn test_server() -> AzmcpServer {
+        test_server_with(default_registry().unwrap(), Arc::new(TestWorkerFactory))
+    }
 
     fn modern_meta() -> RequestMetaObject {
         RequestMetaObject::with_client_context(
@@ -354,18 +588,19 @@ mod tests {
         let first = serde_json::to_value(AzmcpServer::tools()).unwrap();
         let second = serde_json::to_value(AzmcpServer::tools()).unwrap();
         assert_eq!(first, second);
-        let tool = &AzmcpServer::tools()[0];
-        assert_eq!(tool.name, STATUS_TOOL_NAME);
-        assert_eq!(
-            tool.input_schema["$schema"],
-            "https://json-schema.org/draft/2020-12/schema"
-        );
-        assert_eq!(
-            tool.output_schema.as_ref().unwrap()["$schema"],
-            "https://json-schema.org/draft/2020-12/schema"
-        );
-        let serialized = serde_json::to_string(tool).unwrap();
-        assert!(!serialized.contains("$ref"));
+        assert_eq!(AzmcpServer::tools().len(), 4);
+        assert_eq!(AzmcpServer::tools()[0].name, ACCOUNTS_TOOL);
+        for tool in AzmcpServer::tools() {
+            assert_eq!(
+                tool.input_schema["$schema"],
+                "https://json-schema.org/draft/2020-12/schema"
+            );
+            assert_eq!(
+                tool.output_schema.as_ref().unwrap()["$schema"],
+                "https://json-schema.org/draft/2020-12/schema"
+            );
+            assert!(!serde_json::to_string(&tool).unwrap().contains("$ref"));
+        }
     }
 
     async fn receive(client: &mut impl Transport<rmcp::RoleClient>) -> ServerJsonRpcMessage {
@@ -373,10 +608,11 @@ mod tests {
     }
 
     async fn run_server(
+        server: AzmcpServer,
         transport: tokio::io::DuplexStream,
     ) -> Result<rmcp::service::QuitReason, tokio::task::JoinError> {
         rmcp::service::serve_directly(
-            AzmcpServer::new().modern_service(),
+            server.modern_service(),
             transport,
             None::<rmcp::model::ClientInfo>,
         )
@@ -388,8 +624,17 @@ mod tests {
         impl Transport<rmcp::RoleClient>,
         tokio::task::JoinHandle<Result<rmcp::service::QuitReason, tokio::task::JoinError>>,
     ) {
+        modern_client_with(test_server()).await
+    }
+
+    async fn modern_client_with(
+        server: AzmcpServer,
+    ) -> (
+        impl Transport<rmcp::RoleClient>,
+        tokio::task::JoinHandle<Result<rmcp::service::QuitReason, tokio::task::JoinError>>,
+    ) {
         let (server_transport, client_transport) = tokio::io::duplex(16_384);
-        let server_task = tokio::spawn(run_server(server_transport));
+        let server_task = tokio::spawn(run_server(server, server_transport));
         let client = IntoTransport::<rmcp::RoleClient, _, _>::into_transport(client_transport);
         (client, server_task)
     }
@@ -409,8 +654,29 @@ mod tests {
         )
     }
 
+    fn call_tool_request(id: i64, name: &'static str, arguments: Value) -> ClientJsonRpcMessage {
+        let arguments = arguments.as_object().cloned().expect("object arguments");
+        let mut request =
+            CallToolRequest::new(CallToolRequestParams::new(name).with_arguments(arguments));
+        request.extensions.insert(modern_meta());
+        ClientJsonRpcMessage::request(
+            ClientRequest::CallToolRequest(request),
+            RequestId::Number(id),
+        )
+    }
+
+    async fn receive_tool_result(client: &mut impl Transport<rmcp::RoleClient>) -> CallToolResult {
+        let ServerJsonRpcMessage::Response(response) = receive(client).await else {
+            panic!("expected tool response")
+        };
+        let ServerResult::CallToolResult(result) = response.result else {
+            panic!("expected complete tool result")
+        };
+        result
+    }
+
     #[tokio::test]
-    async fn discover_list_and_status_are_modern_structured_results() {
+    async fn discover_list_and_accounts_are_modern_structured_results() {
         let (mut client, server_task) = modern_client().await;
 
         let mut discover = DiscoverRequest::new(DiscoverRequestParams {});
@@ -461,7 +727,7 @@ mod tests {
             })
         );
 
-        let mut call = CallToolRequest::new(CallToolRequestParams::new(STATUS_TOOL_NAME));
+        let mut call = CallToolRequest::new(CallToolRequestParams::new(ACCOUNTS_TOOL));
         call.extensions.insert(modern_meta());
         client
             .send(ClientJsonRpcMessage::request(
@@ -479,6 +745,7 @@ mod tests {
         assert_eq!(result.result_type, Some(ResultType::COMPLETE));
         assert_eq!(result.is_error, Some(false));
         let structured = result.structured_content.expect("structured content");
+        assert_eq!(structured["accounts"].as_array().unwrap().len(), 1);
         let text = result.content[0].as_text().expect("text content");
         assert_eq!(
             serde_json::from_str::<Value>(&text.text).unwrap(),
@@ -538,6 +805,232 @@ mod tests {
             panic!("expected unsupported metadata error")
         };
         assert_eq!(error.error.code, ErrorCode::UNSUPPORTED_PROTOCOL_VERSION);
+
+        drop(client);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn four_tool_lifecycle_is_explicit_and_structured() {
+        let (mut client, server_task) = modern_client().await;
+        client
+            .send(call_tool_request(1, CONTEXT_OPEN_TOOL, json!({})))
+            .await
+            .unwrap();
+        let opened = receive_tool_result(&mut client).await;
+        assert_eq!(opened.is_error, Some(false));
+        let context_id = opened.structured_content.unwrap()["contextId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        client
+            .send(call_tool_request(
+                2,
+                RUN_TOOL,
+                json!({"contextId": context_id, "code": "meaningful-value"}),
+            ))
+            .await
+            .unwrap();
+        let ran = receive_tool_result(&mut client).await;
+        assert_eq!(ran.is_error, Some(false));
+        let ran = ran.structured_content.unwrap();
+        assert_eq!(ran["value"], "meaningful-value");
+        assert_eq!(ran["context"]["identity"], "user");
+
+        client
+            .send(call_tool_request(
+                3,
+                CONTEXT_CLOSE_TOOL,
+                json!({"contextId": context_id}),
+            ))
+            .await
+            .unwrap();
+        let closed = receive_tool_result(&mut client).await;
+        assert_eq!(closed.structured_content.unwrap(), json!({"closed": true}));
+
+        client
+            .send(call_tool_request(
+                4,
+                RUN_TOOL,
+                json!({"contextId": context_id, "code": "cannot-run"}),
+            ))
+            .await
+            .unwrap();
+        let evicted = receive_tool_result(&mut client).await;
+        assert_eq!(evicted.is_error, Some(true));
+        assert_eq!(
+            evicted.structured_content.unwrap()["code"],
+            "context_evicted"
+        );
+
+        drop(client);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn result_too_large_is_a_shape_only_domain_error_with_reduction_guidance() {
+        let (mut client, server_task) = modern_client().await;
+        client
+            .send(call_tool_request(1, CONTEXT_OPEN_TOOL, json!({})))
+            .await
+            .unwrap();
+        let opened = receive_tool_result(&mut client).await;
+        let context_id = opened.structured_content.unwrap()["contextId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        client
+            .send(call_tool_request(
+                2,
+                RUN_TOOL,
+                json!({"contextId": context_id, "code": "__too_large__"}),
+            ))
+            .await
+            .unwrap();
+        let result = receive_tool_result(&mut client).await;
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], "result_too_large");
+        assert_eq!(structured["details"]["summary"]["type"], "object");
+        assert_eq!(structured["details"]["summary"]["encodedBytes"], 70_000);
+        assert_eq!(structured["details"]["summary"]["limitBytes"], 65_536);
+        assert_eq!(structured["details"]["summary"]["keyCount"], 1);
+        assert!(
+            structured["details"]["guidance"]
+                .as_str()
+                .unwrap()
+                .contains("project")
+        );
+        let serialized = serde_json::to_string(&structured).unwrap();
+        assert!(!serialized.contains("never-return-this-value"));
+
+        client
+            .send(call_tool_request(
+                3,
+                CONTEXT_CLOSE_TOOL,
+                json!({"contextId": context_id}),
+            ))
+            .await
+            .unwrap();
+        let closed = receive_tool_result(&mut client).await;
+        assert_eq!(closed.structured_content.unwrap(), json!({"closed": true}));
+
+        drop(client);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn modern_cancellation_disposes_the_execution_context() {
+        let (mut client, server_task) = modern_client().await;
+        client
+            .send(call_tool_request(1, CONTEXT_OPEN_TOOL, json!({})))
+            .await
+            .unwrap();
+        let opened = receive_tool_result(&mut client).await;
+        let context_id = opened.structured_content.unwrap()["contextId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        client
+            .send(call_tool_request(
+                2,
+                RUN_TOOL,
+                json!({
+                    "contextId": context_id,
+                    "code": "__wait_for_cancellation__",
+                    "timeoutMs": 60_000
+                }),
+            ))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        let cancelled: ClientJsonRpcMessage = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 2, "reason": "synthetic test cancellation"}
+        }))
+        .unwrap();
+        client.send(cancelled).await.unwrap();
+
+        client
+            .send(call_tool_request(
+                3,
+                RUN_TOOL,
+                json!({"contextId": context_id, "code": "must-not-run"}),
+            ))
+            .await
+            .unwrap();
+        let response = receive_tool_result(&mut client).await;
+        assert_eq!(response.is_error, Some(true));
+        assert_eq!(
+            response.structured_content.unwrap()["code"],
+            "context_evicted"
+        );
+
+        drop(client);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn modern_cancellation_rolls_back_context_open() {
+        let entered = Arc::new(Notify::new());
+        let registry =
+            azmcp_core::context::ContextRegistry::new(azmcp_core::context::RegistryConfig::new(
+                1,
+                Duration::from_secs(60),
+                Duration::from_secs(600),
+            ))
+            .unwrap();
+        let server = test_server_with(
+            registry,
+            Arc::new(CancelOpenWorkerFactory {
+                calls: AtomicUsize::new(0),
+                entered: Arc::clone(&entered),
+            }),
+        );
+        let (mut client, server_task) = modern_client_with(server).await;
+
+        client
+            .send(call_tool_request(1, CONTEXT_OPEN_TOOL, json!({})))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("context open entered worker startup");
+        let cancelled: ClientJsonRpcMessage = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 1, "reason": "synthetic open cancellation"}
+        }))
+        .unwrap();
+        client.send(cancelled).await.unwrap();
+
+        client
+            .send(call_tool_request(2, CONTEXT_OPEN_TOOL, json!({})))
+            .await
+            .unwrap();
+        let opened = tokio::time::timeout(Duration::from_secs(1), receive_tool_result(&mut client))
+            .await
+            .expect("cancelled open released registry capacity");
+        assert_eq!(opened.is_error, Some(false));
+        let context_id = opened.structured_content.unwrap()["contextId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        client
+            .send(call_tool_request(
+                3,
+                CONTEXT_CLOSE_TOOL,
+                json!({"contextId": context_id}),
+            ))
+            .await
+            .unwrap();
+        let closed = receive_tool_result(&mut client).await;
+        assert_eq!(closed.structured_content.unwrap(), json!({"closed": true}));
 
         drop(client);
         server_task.await.unwrap().unwrap();

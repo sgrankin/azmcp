@@ -27,9 +27,10 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::cloud::AzureCloud;
 use crate::config::{ResolvedCloudBinding, SubscriptionId, TenantId};
 use crate::credential::{
-    AccessToken, AzureCliBroker, CredentialError, TokenAudience, TokenRequest,
+    AccessToken, AzureCliBroker, CredentialError, CredentialIdentity, CredentialIdentityPin,
+    TokenAudience, TokenRequest,
 };
-use crate::policy::{HttpMethod, PolicyBundle, PolicyDenial};
+use crate::policy::{HttpMethod, PolicyBundle, PolicyDenial, RoutePurpose};
 use crate::target::{InvalidRequestTarget, RelativeRequestTarget};
 
 /// The default upper bound for a request body.
@@ -65,6 +66,7 @@ pub trait CredentialProvider: Send + Sync {
 #[derive(Clone)]
 pub struct BearerCredential {
     token: Zeroizing<String>,
+    identity: Option<CredentialIdentity>,
 }
 
 impl BearerCredential {
@@ -76,7 +78,23 @@ impl BearerCredential {
         }
         Ok(Self {
             token: Zeroizing::new(token),
+            identity: None,
         })
+    }
+
+    /// Construct an injected bearer credential with already validated
+    /// principal and client identifiers.
+    pub fn with_identity(
+        token: impl Into<String>,
+        principal_id: impl Into<String>,
+        client_id: impl Into<String>,
+    ) -> Result<Self, CredentialError> {
+        let mut credential = Self::new(token)?;
+        credential.identity = Some(crate::credential::CredentialIdentity::from_parts(
+            principal_id,
+            client_id,
+        )?);
+        Ok(credential)
     }
 
     /// Borrow the value for the short signing operation.
@@ -85,7 +103,13 @@ impl BearerCredential {
     }
 
     fn from_access_token(token: &AccessToken) -> Result<Self, CredentialError> {
-        Self::new(token.token())
+        let mut credential = Self::new(token.token())?;
+        credential.identity = Some(token.identity().clone());
+        Ok(credential)
+    }
+
+    fn identity(&self) -> Option<&CredentialIdentity> {
+        self.identity.as_ref()
     }
 }
 
@@ -285,6 +309,7 @@ pub fn manifest_origin(cloud: AzureCloud) -> Result<Url, HttpError> {
 /// A caller request crossing the ARM boundary.
 #[derive(Clone, Eq, PartialEq)]
 pub struct HttpRequest {
+    purpose: RoutePurpose,
     method: HttpMethod,
     target: RelativeRequestTarget,
     api_version: String,
@@ -299,9 +324,20 @@ impl HttpRequest {
         target: RelativeRequestTarget,
         api_version: impl Into<String>,
     ) -> Result<Self, HttpError> {
+        Self::for_purpose(RoutePurpose::Request, method, target, api_version)
+    }
+
+    /// Construct a request for a trusted, purpose-specific host operation.
+    pub fn for_purpose(
+        purpose: RoutePurpose,
+        method: HttpMethod,
+        target: RelativeRequestTarget,
+        api_version: impl Into<String>,
+    ) -> Result<Self, HttpError> {
         let api_version = api_version.into();
         validate_api_version(&api_version)?;
         Ok(Self {
+            purpose,
             method,
             target,
             api_version,
@@ -349,6 +385,11 @@ impl HttpRequest {
         self.method
     }
 
+    /// The trusted route entry point selected by the host.
+    pub const fn purpose(&self) -> RoutePurpose {
+        self.purpose
+    }
+
     /// The canonical relative target.
     pub fn target(&self) -> &RelativeRequestTarget {
         &self.target
@@ -369,6 +410,7 @@ impl fmt::Debug for HttpRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HttpRequest")
+            .field("purpose", &self.purpose)
             .field("method", &self.method)
             .field("target", &self.target.to_string())
             .field("api_version", &self.api_version)
@@ -613,6 +655,16 @@ impl HttpClient {
     /// checks.  Credential acquisition is deliberately after every denial
     /// which can be determined locally.
     pub async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.execute_with_identity_pin(request, None).await
+    }
+
+    /// Execute one request while pinning Azure CLI principal/client identity
+    /// to the supplied context lifetime.
+    pub async fn execute_with_identity_pin(
+        &self,
+        request: HttpRequest,
+        identity_pin: Option<&CredentialIdentityPin>,
+    ) -> Result<HttpResponse, HttpError> {
         validate_api_version(&request.api_version)?;
         if request.body.len() > self.config.limits.request_body_bytes() {
             return Err(HttpError::RequestBodyTooLarge {
@@ -627,6 +679,7 @@ impl HttpClient {
             .policy
             .classify(
                 self.config.cloud,
+                request.purpose,
                 request.method,
                 &request.target,
                 &request.api_version,
@@ -637,17 +690,26 @@ impl HttpClient {
 
         let url = build_request_url(&self.config.origin, &request.target, &request.api_version)?;
 
-        let token_request = TokenRequest::new(
+        let mut token_request = TokenRequest::new(
             self.config.cloud,
             self.config.tenant.clone(),
             self.config.subscription.clone(),
             self.config.audience,
         );
+        if let Some(identity_pin) = identity_pin {
+            token_request = token_request.with_identity_pin(identity_pin);
+        }
         let credential = self
             .credential_provider
-            .acquire(token_request)
+            .acquire(token_request.clone())
             .await
             .map_err(HttpError::Credential)?;
+        if let (Some(identity_pin), Some(identity)) = (identity_pin, credential.identity()) {
+            identity_pin
+                .check(&token_request, identity)
+                .await
+                .map_err(HttpError::Credential)?;
+        }
 
         let mut auth_bytes = Vec::with_capacity(b"Bearer ".len() + credential.secret().len());
         auth_bytes.extend_from_slice(b"Bearer ");
@@ -976,6 +1038,7 @@ mod tests {
             vec![
                 crate::policy::ReviewedRoute::new(
                     AzureCloud::AzureCloud,
+                    RoutePurpose::Request,
                     HttpMethod::Get,
                     "/subscriptions/{subscription}/resourceGroups/{group}",
                     [API_VERSION],
@@ -985,6 +1048,7 @@ mod tests {
                 .expect("valid route"),
                 crate::policy::ReviewedRoute::new(
                     AzureCloud::AzureCloud,
+                    RoutePurpose::ResourceGraph,
                     HttpMethod::Post,
                     "/subscriptions/{subscription}/providers/Microsoft.ResourceGraph/resources",
                     [API_VERSION],

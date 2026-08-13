@@ -1,0 +1,133 @@
+#![cfg(unix)]
+
+use std::{
+    fs,
+    io::Write as _,
+    os::unix::fs::PermissionsExt as _,
+    process::{Command, Stdio},
+};
+
+use serde_json::{Value, json};
+
+fn metadata() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "azmcp-test", "version": "0.1.0"},
+        "io.modelcontextprotocol/clientCapabilities": {}
+    })
+}
+
+#[test]
+fn built_server_completes_modern_discovery_and_synthetic_accounts() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let config = directory.path().join("azmcp.toml");
+    let profile = directory.path().join("azureProfile.json");
+    let audit = directory.path().join("audit/requests.jsonl");
+    let az_marker = directory.path().join("fake-az-invoked");
+    let fake_az = directory.path().join("fake-az");
+    fs::write(&config, "").expect("config");
+    fs::write(
+        &profile,
+        br#"{"subscriptions":[{"id":"11111111-1111-1111-1111-111111111111","name":"synthetic","state":"Enabled","tenantId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","environmentName":"AzureCloud","user":{"name":"test@example.invalid"}}]}"#,
+    )
+    .expect("profile");
+    fs::write(
+        &fake_az,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = version ]; then printf '{{\"azure-cli\":\"2.89.0\"}}'; exit 0; fi\nprintf invoked > '{}'\nexit 97\n",
+            az_marker.display()
+        ),
+    )
+    .expect("fake az");
+    let mut permissions = fs::metadata(&fake_az)
+        .expect("fake az metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fake_az, permissions).expect("fake az permissions");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_azmcp"))
+        .env_clear()
+        .env("HOME", directory.path())
+        .env("AZMCP_CONFIG", &config)
+        .env("AZMCP_AZURE_PROFILE", &profile)
+        .env("AZMCP_AZ_EXECUTABLE", &fake_az)
+        .env("AZMCP_AUDIT_LOG", &audit)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn azmcp");
+
+    let requests = [
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {"_meta": metadata()}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {"_meta": metadata()}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "azure_accounts", "arguments": {}, "_meta": metadata()}
+        }),
+    ];
+    {
+        let stdin = child.stdin.as_mut().expect("child stdin");
+        for request in requests {
+            serde_json::to_writer(&mut *stdin, &request).expect("write request");
+            stdin.write_all(b"\n").expect("request delimiter");
+        }
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("wait for azmcp");
+    assert!(
+        output.status.success(),
+        "azmcp stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = String::from_utf8(output.stdout)
+        .expect("UTF-8 responses")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("JSON-RPC response"))
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 3);
+    let responses = responses
+        .into_iter()
+        .map(|response| {
+            (
+                response["id"].as_u64().expect("numeric response ID"),
+                response,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        responses[&1]["result"]["supportedVersions"],
+        json!(["2026-07-28"])
+    );
+    assert_eq!(
+        responses[&2]["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tools/list response: {}", responses[&2]))
+            .len(),
+        4
+    );
+    assert_eq!(
+        responses[&3]["result"]["structuredContent"]["accounts"][0]["subscriptionId"],
+        "11111111-1111-1111-1111-111111111111"
+    );
+    assert!(
+        !az_marker.exists(),
+        "account discovery must not invoke Azure CLI"
+    );
+    assert!(
+        !audit.exists(),
+        "startup and profile-only discovery must not create request logs"
+    );
+}

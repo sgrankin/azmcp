@@ -399,6 +399,10 @@ mod tests {
             Err(AccountProfileError::InvalidUtf8)
         ));
         assert!(parse_azure_profile(b"not json").is_err());
+        assert!(matches!(
+            parse_azure_profile(&vec![b' '; MAX_PROFILE_BYTES + 1]),
+            Err(AccountProfileError::TooLarge)
+        ));
     }
 
     #[test]

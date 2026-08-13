@@ -346,4 +346,20 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn bounds_target_and_query_cardinality() {
+        assert_eq!(
+            RelativeRequestTarget::parse(&format!("/{}", "a".repeat(MAX_TARGET_BYTES))),
+            Err(InvalidRequestTarget::TooLarge)
+        );
+        let query = (0..=MAX_QUERY_PAIRS)
+            .map(|index| format!("p{index}=x"))
+            .collect::<Vec<_>>()
+            .join("&");
+        assert_eq!(
+            RelativeRequestTarget::parse(&format!("/path?{query}")),
+            Err(InvalidRequestTarget::TooManyQueryPairs)
+        );
+    }
 }

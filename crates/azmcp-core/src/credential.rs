@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
@@ -26,10 +27,12 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const REFRESH_SKEW: Duration = Duration::from_secs(5 * 60);
 const MAX_CLI_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 64;
+const MIN_AZURE_CLI_VERSION: (u64, u64, u64) = (2, 89, 0);
 const CLOUD_ENV: &str = "AZURE_CLOUD_NAME";
 const CORRELATION_ENV: &str = "COPILOT_AGENT_SESSION_ID";
 
 static CORRELATION_COUNTER: AtomicU64 = AtomicU64::new(1);
+static IDENTITY_PIN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BROKER_PROCESS_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn process_mutex() -> &'static Mutex<()> {
@@ -47,6 +50,9 @@ pub struct TokenRequest {
     pub subscription_id: SubscriptionId,
     /// A reviewed audience family resolved from the selected cloud manifest.
     pub audience: TokenAudience,
+    // Separates broker cache entries by explicit application-context
+    // lifetime. It is never forwarded to Azure CLI or emitted on the wire.
+    cache_scope: u64,
 }
 
 impl TokenRequest {
@@ -62,7 +68,13 @@ impl TokenRequest {
             tenant_id,
             subscription_id,
             audience,
+            cache_scope: 0,
         }
+    }
+
+    pub(crate) fn with_identity_pin(mut self, pin: &CredentialIdentityPin) -> Self {
+        self.cache_scope = pin.cache_scope;
+        self
     }
 
     /// The exact reviewed token resource for this cloud/audience pair.
@@ -93,8 +105,8 @@ impl TokenAudience {
 ///
 /// The bearer value is held in [`Zeroizing`], so it is overwritten when the
 /// token is dropped. It is intentionally excluded from `Debug` and is not
-/// serializable. The remaining fields are response provenance and expiry
-/// metadata, not secrets.
+/// serializable. The remaining fields are response provenance, expiry, and
+/// validated token identity metadata.
 #[derive(Clone)]
 pub struct AccessToken {
     token: Zeroizing<String>,
@@ -102,6 +114,7 @@ pub struct AccessToken {
     expires_on: String,
     tenant_id: String,
     subscription_id: String,
+    identity: CredentialIdentity,
     expires_at: Option<SystemTime>,
 }
 
@@ -112,6 +125,7 @@ impl AccessToken {
         expires_on: String,
         tenant_id: String,
         subscription_id: String,
+        identity: CredentialIdentity,
     ) -> Self {
         let expires_at = parse_expiration(&expires_on);
         Self {
@@ -120,6 +134,7 @@ impl AccessToken {
             expires_on,
             tenant_id,
             subscription_id,
+            identity,
             expires_at,
         }
     }
@@ -154,6 +169,20 @@ impl AccessToken {
         &self.subscription_id
     }
 
+    /// The `oid` principal identifier validated from the JWT payload.
+    pub fn principal_id(&self) -> &str {
+        &self.identity.oid
+    }
+
+    /// The `appid` or `azp` client identifier validated from the JWT payload.
+    pub fn client_id(&self) -> &str {
+        &self.identity.client_id
+    }
+
+    pub(crate) fn identity(&self) -> &CredentialIdentity {
+        &self.identity
+    }
+
     fn is_fresh(&self, now: SystemTime) -> bool {
         self.expires_at
             .and_then(|expires_at| expires_at.duration_since(now).ok())
@@ -170,6 +199,38 @@ impl fmt::Debug for AccessToken {
             .field("expires_on", &self.expires_on)
             .field("tenant_id", &self.tenant_id)
             .field("subscription_id", &self.subscription_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct CredentialIdentity {
+    oid: String,
+    client_id: String,
+}
+
+impl CredentialIdentity {
+    pub(crate) fn from_parts(
+        oid: impl Into<String>,
+        client_id: impl Into<String>,
+    ) -> Result<Self, CredentialError> {
+        let oid = oid.into();
+        let client_id = client_id.into();
+        let oid = normalized_identity_claim(&oid).ok_or(CredentialError::InvalidResponse {
+            field: "principalId",
+        })?;
+        let client_id = normalized_identity_claim(&client_id)
+            .ok_or(CredentialError::InvalidResponse { field: "clientId" })?;
+        Ok(Self { oid, client_id })
+    }
+}
+
+impl fmt::Debug for CredentialIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialIdentity")
+            .field("oid", &"<redacted>")
+            .field("client_id", &"<redacted>")
             .finish()
     }
 }
@@ -192,9 +253,11 @@ pub enum CredentialErrorCode {
     InvalidResponse,
     TenantMismatch,
     SubscriptionMismatch,
+    PrincipalMismatch,
     EmptyToken,
     InvalidTokenType,
     ExpiredToken,
+    UnsupportedCli,
 }
 
 impl CredentialErrorCode {
@@ -212,9 +275,11 @@ impl CredentialErrorCode {
             Self::InvalidResponse => "invalid_response",
             Self::TenantMismatch => "tenant_mismatch",
             Self::SubscriptionMismatch => "subscription_mismatch",
+            Self::PrincipalMismatch => "principal_mismatch",
             Self::EmptyToken => "empty_token",
             Self::InvalidTokenType => "invalid_token_type",
             Self::ExpiredToken => "expired_token",
+            Self::UnsupportedCli => "unsupported_cli",
         }
     }
 }
@@ -253,12 +318,16 @@ pub enum CredentialError {
     TenantMismatch,
     #[error("credential broker returned a token for a different subscription")]
     SubscriptionMismatch,
+    #[error("credential broker returned a different token principal or client identity")]
+    PrincipalMismatch,
     #[error("credential broker returned an empty access token")]
     EmptyToken,
     #[error("credential broker returned an unsupported token type")]
     InvalidTokenType,
     #[error("credential broker returned an expired or near-expiry token")]
     ExpiredToken,
+    #[error("Azure CLI is missing or does not meet the supported version and command requirements")]
+    UnsupportedCli,
 }
 
 impl CredentialError {
@@ -276,10 +345,98 @@ impl CredentialError {
             Self::InvalidResponse { .. } => CredentialErrorCode::InvalidResponse,
             Self::TenantMismatch => CredentialErrorCode::TenantMismatch,
             Self::SubscriptionMismatch => CredentialErrorCode::SubscriptionMismatch,
+            Self::PrincipalMismatch => CredentialErrorCode::PrincipalMismatch,
             Self::EmptyToken => CredentialErrorCode::EmptyToken,
             Self::InvalidTokenType => CredentialErrorCode::InvalidTokenType,
             Self::ExpiredToken => CredentialErrorCode::ExpiredToken,
+            Self::UnsupportedCli => CredentialErrorCode::UnsupportedCli,
         }
+    }
+}
+
+/// The identity pinning scope deliberately excludes subscription ID. A broker
+/// must not silently switch principals when it refreshes a token for another
+/// subscription in the same cloud, tenant, and audience.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct PrincipalPinKey {
+    cloud: AzureCloud,
+    tenant_id: TenantId,
+    audience: TokenAudience,
+}
+
+impl From<&TokenRequest> for PrincipalPinKey {
+    fn from(request: &TokenRequest) -> Self {
+        Self {
+            cloud: request.cloud,
+            tenant_id: request.tenant_id.clone(),
+            audience: request.audience,
+        }
+    }
+}
+
+/// Context-owned token identity state.
+///
+/// The handle is cloneable so one context can share its pin across sequential
+/// host calls while distinct contexts retain independent identity state. The
+/// key deliberately excludes subscription ID: a context cannot silently switch
+/// principals when it acquires a token for another subscription in the same
+/// cloud, tenant, and audience.
+#[derive(Clone)]
+pub struct CredentialIdentityPin {
+    identities: Arc<Mutex<BTreeMap<PrincipalPinKey, CredentialIdentity>>>,
+    cache_scope: u64,
+}
+
+impl Default for CredentialIdentityPin {
+    fn default() -> Self {
+        Self {
+            identities: Arc::new(Mutex::new(BTreeMap::new())),
+            cache_scope: IDENTITY_PIN_COUNTER.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+impl CredentialIdentityPin {
+    /// Construct an empty context identity pin.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) async fn check(
+        &self,
+        request: &TokenRequest,
+        identity: &CredentialIdentity,
+    ) -> Result<(), CredentialError> {
+        let key = PrincipalPinKey::from(request);
+        let mut identities = self.identities.lock().await;
+        if let Some(pinned) = identities.get(&key) {
+            if pinned != identity {
+                return Err(CredentialError::PrincipalMismatch);
+            }
+        } else {
+            identities.insert(key, identity.clone());
+        }
+        Ok(())
+    }
+}
+
+/// The validated Azure CLI capabilities required by the production broker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AzureCliProbe {
+    version: String,
+    agent_session_attribution_active: bool,
+}
+
+impl AzureCliProbe {
+    /// The exact `azure-cli` version reported by the startup probe.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Whether this CLI supports the agent-session attribution environment
+    /// value forwarded by the broker.
+    pub const fn agent_session_attribution_active(&self) -> bool {
+        self.agent_session_attribution_active
     }
 }
 
@@ -352,6 +509,50 @@ impl AzureCliBroker {
         &self.correlation_id
     }
 
+    /// Probe the configured Azure CLI without reading account state or
+    /// acquiring a token.
+    ///
+    /// The probe validates the exact command shape used by this broker and
+    /// gates production startup on Azure CLI 2.89.0 or newer, which is the
+    /// first reviewed release with agent-session attribution support.
+    pub async fn probe(&self) -> Result<AzureCliProbe, CredentialError> {
+        let mut command = self.base_command();
+        command
+            .args(["version", "--output", "json", "--only-show-errors"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let child = command
+            .spawn()
+            .map_err(|error| CredentialError::SpawnFailed { kind: error.kind() })?;
+        let (status, mut stdout, mut stderr) = self.wait_for_child(child).await?;
+        if !status.success() {
+            stdout.0.zeroize();
+            stderr.0.zeroize();
+            return Err(CredentialError::UnsupportedCli);
+        }
+
+        let parsed = serde_json::from_slice::<CliVersionResponse>(&stdout.0);
+        stdout.0.zeroize();
+        stderr.0.zeroize();
+        let response = parsed.map_err(|_| CredentialError::UnsupportedCli)?;
+        let version = response
+            .azure_cli
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(CredentialError::UnsupportedCli)?;
+        let parsed_version = parse_cli_version(&version).ok_or(CredentialError::UnsupportedCli)?;
+        if parsed_version < MIN_AZURE_CLI_VERSION {
+            return Err(CredentialError::UnsupportedCli);
+        }
+
+        Ok(AzureCliProbe {
+            version,
+            agent_session_attribution_active: true,
+        })
+    }
+
     /// Acquire a token for an explicit cloud, tenant, subscription, and
     /// audience.
     pub async fn acquire(&self, request: TokenRequest) -> Result<AccessToken, CredentialError> {
@@ -416,7 +617,7 @@ impl AzureCliBroker {
         &self,
         request: &TokenRequest,
     ) -> Result<AccessToken, CredentialError> {
-        let mut command = Command::new(&self.executable);
+        let mut command = self.base_command();
         command
             .args([
                 "account",
@@ -429,25 +630,8 @@ impl AzureCliBroker {
                 "json",
                 "--only-show-errors",
             ])
-            .env_clear();
-        for name in [
-            "HOME",
-            "PATH",
-            "LANG",
-            "LC_ALL",
-            "TMPDIR",
-            "USERPROFILE",
-            "SystemRoot",
-            "SSL_CERT_FILE",
-            "AZURE_CONFIG_DIR",
-        ] {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
-            }
-        }
+            .env(CLOUD_ENV, request.cloud.as_str());
         command
-            .env(CLOUD_ENV, request.cloud.as_str())
-            .env(CORRELATION_ENV, &self.correlation_id)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -481,6 +665,8 @@ impl AzureCliBroker {
         {
             return Err(CredentialError::EmptyToken);
         }
+
+        let identity = parse_token_identity(token.as_str(), request.tenant_id.as_str())?;
 
         let tenant_id = response
             .tenant
@@ -533,7 +719,30 @@ impl AzureCliBroker {
             expires_on,
             tenant_id,
             subscription_id,
+            identity,
         ))
+    }
+
+    fn base_command(&self) -> Command {
+        let mut command = Command::new(&self.executable);
+        command.env_clear();
+        for name in [
+            "HOME",
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "TMPDIR",
+            "USERPROFILE",
+            "SystemRoot",
+            "SSL_CERT_FILE",
+            "AZURE_CONFIG_DIR",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command.env(CORRELATION_ENV, &self.correlation_id);
+        command
     }
 
     async fn wait_for_child(
@@ -621,6 +830,12 @@ struct CliTokenResponse {
     token_type: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CliVersionResponse {
+    #[serde(rename = "azure-cli", default)]
+    azure_cli: Option<String>,
+}
+
 #[derive(Debug)]
 struct SensitiveBytes(Vec<u8>);
 
@@ -659,6 +874,106 @@ where
             Expiry::Integer(value) => value.to_string(),
         })
     })
+}
+
+fn parse_cli_version(value: &str) -> Option<(u64, u64, u64)> {
+    let mut components = value.trim().split('.');
+    let major = components.next()?.parse().ok()?;
+    let minor = components.next()?.parse().ok()?;
+    let patch = components.next()?.parse().ok()?;
+    if components.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+#[derive(Deserialize)]
+struct JwtClaims {
+    #[serde(default)]
+    tid: Option<String>,
+    #[serde(default)]
+    oid: Option<String>,
+    #[serde(default)]
+    appid: Option<String>,
+    #[serde(default)]
+    azp: Option<String>,
+}
+
+fn parse_token_identity(
+    token: &str,
+    requested_tenant: &str,
+) -> Result<CredentialIdentity, CredentialError> {
+    let mut segments = token.split('.');
+    let (Some(header), Some(payload), Some(signature)) =
+        (segments.next(), segments.next(), segments.next())
+    else {
+        return Err(invalid_token_claims());
+    };
+    if header.is_empty() || payload.is_empty() || signature.is_empty() || segments.next().is_some()
+    {
+        return Err(invalid_token_claims());
+    }
+
+    let mut decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| invalid_token_claims())?;
+    let claims = serde_json::from_slice::<JwtClaims>(&decoded);
+    decoded.zeroize();
+    let claims = claims.map_err(|_| invalid_token_claims())?;
+
+    let tenant_id = required_claim(claims.tid, "accessToken.tid")?;
+    if !tenant_id.eq_ignore_ascii_case(requested_tenant) {
+        return Err(CredentialError::TenantMismatch);
+    }
+
+    let oid = required_identity_claim(claims.oid, "accessToken.oid")?;
+    let client_id = claims
+        .appid
+        .and_then(|value| normalized_identity_claim(&value))
+        .or_else(|| {
+            claims
+                .azp
+                .and_then(|value| normalized_identity_claim(&value))
+        })
+        .ok_or_else(|| invalid_token_claims_for("accessToken.appidOrAzp"))?;
+
+    Ok(CredentialIdentity { oid, client_id })
+}
+
+fn required_identity_claim(
+    value: Option<String>,
+    field: &'static str,
+) -> Result<String, CredentialError> {
+    value
+        .as_deref()
+        .and_then(normalized_identity_claim)
+        .ok_or_else(|| invalid_token_claims_for(field))
+}
+
+fn normalized_identity_claim(value: &str) -> Option<String> {
+    TenantId::new(value.to_owned())
+        .ok()
+        .map(|value| value.as_str().to_owned())
+}
+
+fn required_claim(value: Option<String>, field: &'static str) -> Result<String, CredentialError> {
+    let value = value.ok_or_else(|| invalid_token_claims_for(field))?;
+    if !valid_claim(&value) {
+        return Err(invalid_token_claims_for(field));
+    }
+    Ok(value)
+}
+
+fn valid_claim(value: &str) -> bool {
+    !value.trim().is_empty() && value == value.trim() && !value.chars().any(char::is_control)
+}
+
+fn invalid_token_claims() -> CredentialError {
+    invalid_token_claims_for("accessTokenClaims")
+}
+
+fn invalid_token_claims_for(field: &'static str) -> CredentialError {
+    CredentialError::InvalidResponse { field }
 }
 
 fn validate_request(request: &TokenRequest) -> Result<(), CredentialError> {
@@ -835,7 +1150,44 @@ mod tests {
     use tempfile::TempDir;
 
     const SUBSCRIPTION_A: &str = "11111111-1111-1111-1111-111111111111";
+    const SUBSCRIPTION_B: &str = "22222222-2222-2222-2222-222222222222";
     const TENANT_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const TENANT_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    const OID_A: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    const OID_B: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    const CLIENT_A: &str = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    const CLIENT_B: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+
+    fn jwt_token(tenant: &str, oid: &str, client_id: &str) -> String {
+        jwt_token_with_claims(serde_json::json!({
+            "tid": tenant,
+            "oid": oid,
+            "appid": client_id,
+        }))
+    }
+
+    fn jwt_token_with_claims(claims: serde_json::Value) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
+        format!("eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.{payload}.synthetic-signature")
+    }
+
+    fn jwt_token_with_raw_payload(payload: &str) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(payload);
+        format!("eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.{payload}.synthetic-signature")
+    }
+
+    fn cli_body(token: &str, subscription: &str, tenant: &str, token_type: Option<&str>) -> String {
+        let mut body = serde_json::json!({
+            "accessToken": token,
+            "expiresOn": "2099-01-01 00:00:00.000000",
+            "subscription": subscription,
+            "tenant": tenant,
+        });
+        if let Some(token_type) = token_type {
+            body["tokenType"] = serde_json::json!(token_type);
+        }
+        body.to_string()
+    }
 
     fn fake_az(
         directory: &TempDir,
@@ -862,11 +1214,52 @@ mod tests {
         executable
     }
 
+    fn fake_az_by_subscription(
+        directory: &TempDir,
+        first_subscription: &str,
+        first_body: &str,
+        second_subscription: &str,
+        second_body: &str,
+    ) -> PathBuf {
+        let executable = directory.path().join("fake-az-by-subscription");
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in\n*{first_subscription}*) printf '%s' '{first_body}' ;;\n*{second_subscription}*) printf '%s' '{second_body}' ;;\n*) exit 1 ;;\nesac\n",
+            first_body = first_body.replace('\'', "'\\''"),
+            second_body = second_body.replace('\'', "'\\''"),
+        );
+        fs::write(&executable, script).expect("write fake executable");
+        let mut permissions = fs::metadata(&executable)
+            .expect("stat fake executable")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).expect("chmod fake executable");
+        executable
+    }
+
+    fn fake_az_version(directory: &TempDir, body: &str, exit_code: i32) -> PathBuf {
+        let executable = directory.path().join("fake-az-version");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = version ]; then printf '%s' '{body}'; else exit 99; fi\nexit {exit_code}\n",
+            body = body.replace('\'', "'\\''"),
+        );
+        fs::write(&executable, script).expect("write fake version executable");
+        let mut permissions = fs::metadata(&executable)
+            .expect("stat fake version executable")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).expect("chmod fake version executable");
+        executable
+    }
+
     fn request() -> TokenRequest {
+        request_for_subscription(SUBSCRIPTION_A)
+    }
+
+    fn request_for_subscription(subscription_id: &str) -> TokenRequest {
         TokenRequest::new(
             AzureCloud::AzureCloud,
             TenantId::new(TENANT_A).expect("valid tenant"),
-            SubscriptionId::new(SUBSCRIPTION_A).expect("valid subscription"),
+            SubscriptionId::new(subscription_id).expect("valid subscription"),
             TokenAudience::Arm,
         )
     }
@@ -875,9 +1268,10 @@ mod tests {
     async fn uses_exact_argv_child_only_environment_and_validates_response() {
         let directory = tempfile::tempdir().expect("temporary fake directory");
         let log = directory.path().join("argv.log");
+        let access_token = jwt_token(TENANT_A, OID_A, CLIENT_A);
         let executable = fake_az(
             &directory,
-            r#"{"accessToken":"secret-token","expiresOn":"2099-01-01 00:00:00.000000","subscription":"11111111-1111-1111-1111-111111111111","tenant":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","tokenType":"Bearer"}"#,
+            &cli_body(&access_token, SUBSCRIPTION_A, TENANT_A, Some("Bearer")),
             "",
             0,
             None,
@@ -890,11 +1284,16 @@ mod tests {
             .acquire(request())
             .await
             .expect("fake token succeeds");
-        assert_eq!(token.token(), "secret-token");
+        assert_eq!(token.token(), access_token);
         assert_eq!(token.tenant_id(), TENANT_A);
         assert_eq!(token.subscription_id(), SUBSCRIPTION_A);
+        assert_eq!(token.principal_id(), OID_A);
+        assert_eq!(token.client_id(), CLIENT_A);
         assert_eq!(token.token_type(), "Bearer");
-        assert!(!format!("{token:?}").contains("secret-token"));
+        let debug = format!("{token:?}");
+        assert!(!debug.contains(&access_token));
+        assert!(!debug.contains(OID_A));
+        assert!(!debug.contains(CLIENT_A));
 
         let invocation = fs::read_to_string(&log).expect("fake saw invocation");
         assert!(invocation.contains(
@@ -906,9 +1305,10 @@ mod tests {
     async fn token_cache_is_single_flight_for_one_request() {
         let directory = tempfile::tempdir().expect("temporary fake directory");
         let log = directory.path().join("argv.log");
+        let access_token = jwt_token(TENANT_A, OID_A, CLIENT_A);
         let executable = fake_az(
             &directory,
-            r#"{"accessToken":"cached-token","expiresOn":"2099-01-01 00:00:00.000000","subscription":"11111111-1111-1111-1111-111111111111","tenant":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}"#,
+            &cli_body(&access_token, SUBSCRIPTION_A, TENANT_A, None),
             "",
             0,
             None,
@@ -918,8 +1318,8 @@ mod tests {
                 .expect("valid correlation id");
 
         let (first, second) = tokio::join!(broker.acquire(request()), broker.acquire(request()));
-        assert_eq!(first.expect("first token").token(), "cached-token");
-        assert_eq!(second.expect("second token").token(), "cached-token");
+        assert_eq!(first.expect("first token").token(), access_token);
+        assert_eq!(second.expect("second token").token(), access_token);
         assert_eq!(
             fs::read_to_string(&log).expect("fake log").lines().count(),
             1
@@ -927,11 +1327,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mismatch_and_cli_failures_are_sanitized() {
+    async fn token_cache_does_not_cross_context_identity_pins() {
         let directory = tempfile::tempdir().expect("temporary fake directory");
+        let log = directory.path().join("argv.log");
+        let access_token = jwt_token(TENANT_A, OID_A, CLIENT_A);
         let executable = fake_az(
             &directory,
-            r#"{"accessToken":"must-not-leak","expiresOn":"2099-01-01 00:00:00.000000","subscription":"22222222-2222-2222-2222-222222222222","tenant":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}"#,
+            &cli_body(&access_token, SUBSCRIPTION_A, TENANT_A, None),
+            "",
+            0,
+            None,
+        );
+        let broker =
+            AzureCliBroker::with_correlation_id(&executable, DEFAULT_TIMEOUT, "scope-test")
+                .expect("valid correlation id");
+        let first_context = CredentialIdentityPin::new();
+        let second_context = CredentialIdentityPin::new();
+
+        broker
+            .acquire(request().with_identity_pin(&first_context))
+            .await
+            .expect("first context token");
+        broker
+            .acquire(request().with_identity_pin(&second_context))
+            .await
+            .expect("second context obtains its own token");
+
+        assert_eq!(
+            fs::read_to_string(&log).expect("fake log").lines().count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatch_and_cli_failures_are_sanitized() {
+        let directory = tempfile::tempdir().expect("temporary fake directory");
+        let access_token = jwt_token(TENANT_A, OID_A, CLIENT_A);
+        let executable = fake_az(
+            &directory,
+            &cli_body(&access_token, SUBSCRIPTION_B, TENANT_A, None),
             "super-secret-diagnostic",
             1,
             None,
@@ -946,7 +1380,7 @@ mod tests {
 
         let mismatch_executable = fake_az(
             &directory,
-            r#"{"accessToken":"must-not-leak","expiresOn":"2099-01-01 00:00:00.000000","subscription":"22222222-2222-2222-2222-222222222222","tenant":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}"#,
+            &cli_body(&access_token, SUBSCRIPTION_B, TENANT_A, None),
             "",
             0,
             None,
@@ -961,15 +1395,16 @@ mod tests {
         .await
         .expect_err("mismatched subscription fails closed");
         assert_eq!(mismatch.code(), CredentialErrorCode::SubscriptionMismatch);
-        assert!(!mismatch.to_string().contains("must-not-leak"));
+        assert!(!mismatch.to_string().contains(access_token.as_str()));
     }
 
     #[tokio::test]
     async fn timeout_kills_fake_child() {
         let directory = tempfile::tempdir().expect("temporary fake directory");
+        let access_token = jwt_token(TENANT_A, OID_A, CLIENT_A);
         let executable = fake_az(
             &directory,
-            r#"{"accessToken":"too-late","expiresOn":"2099-01-01 00:00:00.000000","subscription":"11111111-1111-1111-1111-111111111111","tenant":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}"#,
+            &cli_body(&access_token, SUBSCRIPTION_A, TENANT_A, None),
             "",
             0,
             Some(30),
@@ -987,6 +1422,232 @@ mod tests {
         assert_eq!(error.code(), CredentialErrorCode::Timeout);
     }
 
+    #[tokio::test]
+    async fn rejects_expired_tokens_and_non_bearer_types() {
+        let directory = tempfile::tempdir().expect("temporary fake directory");
+        let access_token = jwt_token(TENANT_A, OID_A, CLIENT_A);
+        let expired = fake_az(
+            &directory,
+            &format!(
+                r#"{{"accessToken":"{access_token}","expires_on":1,"subscription":"{SUBSCRIPTION_A}","tenant":"{TENANT_A}"}}"#
+            ),
+            "",
+            0,
+            None,
+        );
+        let error = AzureCliBroker::with_correlation_id(&expired, DEFAULT_TIMEOUT, "expired-test")
+            .expect("valid correlation id")
+            .acquire(request())
+            .await
+            .expect_err("expired token fails closed");
+        assert_eq!(error.code(), CredentialErrorCode::ExpiredToken);
+        assert!(!format!("{error:?}").contains(access_token.as_str()));
+
+        let invalid_type_token = jwt_token(TENANT_A, OID_A, CLIENT_A);
+        let invalid_type = fake_az(
+            &directory,
+            &cli_body(&invalid_type_token, SUBSCRIPTION_A, TENANT_A, Some("Basic")),
+            "",
+            0,
+            None,
+        );
+        let error =
+            AzureCliBroker::with_correlation_id(&invalid_type, DEFAULT_TIMEOUT, "type-test")
+                .expect("valid correlation id")
+                .acquire(request())
+                .await
+                .expect_err("non-bearer token fails closed");
+        assert_eq!(error.code(), CredentialErrorCode::InvalidTokenType);
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_or_incomplete_jwt_claims() {
+        let malformed = [
+            jwt_token_with_raw_payload("not-json"),
+            jwt_token_with_raw_payload("[]"),
+            jwt_token_with_claims(serde_json::json!({
+                "oid": OID_A,
+                "appid": CLIENT_A,
+            })),
+            jwt_token_with_claims(serde_json::json!({
+                "tid": TENANT_A,
+                "appid": CLIENT_A,
+            })),
+            jwt_token_with_claims(serde_json::json!({
+                "tid": TENANT_A,
+                "oid": OID_A,
+            })),
+        ];
+
+        for access_token in malformed {
+            let directory = tempfile::tempdir().expect("temporary fake directory");
+            let executable = fake_az(
+                &directory,
+                &cli_body(&access_token, SUBSCRIPTION_A, TENANT_A, None),
+                "",
+                0,
+                None,
+            );
+            let error =
+                AzureCliBroker::with_correlation_id(&executable, DEFAULT_TIMEOUT, "claims-test")
+                    .expect("valid correlation id")
+                    .acquire(request())
+                    .await
+                    .expect_err("malformed or incomplete claims fail closed");
+            assert_eq!(error.code(), CredentialErrorCode::InvalidResponse);
+            assert!(!error.to_string().contains(access_token.as_str()));
+        }
+
+        let directory = tempfile::tempdir().expect("temporary fake directory");
+        let access_token = jwt_token_with_claims(serde_json::json!({
+            "tid": TENANT_A,
+            "oid": OID_A,
+            "azp": CLIENT_A,
+        }));
+        let executable = fake_az(
+            &directory,
+            &cli_body(&access_token, SUBSCRIPTION_A, TENANT_A, None),
+            "",
+            0,
+            None,
+        );
+        let token = AzureCliBroker::with_correlation_id(&executable, DEFAULT_TIMEOUT, "azp-test")
+            .expect("valid correlation id")
+            .acquire(request())
+            .await
+            .expect("azp satisfies the client identity requirement");
+        assert_eq!(token.client_id(), CLIENT_A);
+    }
+
+    #[tokio::test]
+    async fn rejects_jwt_tenant_claim_mismatch() {
+        let directory = tempfile::tempdir().expect("temporary fake directory");
+        let access_token = jwt_token(TENANT_B, OID_A, CLIENT_A);
+        let executable = fake_az(
+            &directory,
+            &cli_body(&access_token, SUBSCRIPTION_A, TENANT_A, None),
+            "",
+            0,
+            None,
+        );
+        let error =
+            AzureCliBroker::with_correlation_id(&executable, DEFAULT_TIMEOUT, "tenant-claim-test")
+                .expect("valid correlation id")
+                .acquire(request())
+                .await
+                .expect_err("JWT tenant mismatch fails closed");
+        assert_eq!(error.code(), CredentialErrorCode::TenantMismatch);
+        assert!(!error.to_string().contains(access_token.as_str()));
+    }
+
+    #[tokio::test]
+    async fn pins_identity_across_subscriptions() {
+        let directory = tempfile::tempdir().expect("temporary fake directory");
+        let first_token = jwt_token(TENANT_A, OID_A, CLIENT_A);
+        let second_token = jwt_token(TENANT_A, OID_B, CLIENT_B);
+        let executable = fake_az_by_subscription(
+            &directory,
+            SUBSCRIPTION_A,
+            &cli_body(&first_token, SUBSCRIPTION_A, TENANT_A, None),
+            SUBSCRIPTION_B,
+            &cli_body(&second_token, SUBSCRIPTION_B, TENANT_A, None),
+        );
+        let broker =
+            AzureCliBroker::with_correlation_id(&executable, DEFAULT_TIMEOUT, "principal-pin-test")
+                .expect("valid correlation id");
+
+        let first = broker
+            .acquire(request_for_subscription(SUBSCRIPTION_A))
+            .await
+            .expect("first subscription token succeeds");
+        assert_eq!(first.principal_id(), OID_A);
+        assert_eq!(first.client_id(), CLIENT_A);
+        let pin = CredentialIdentityPin::new();
+        pin.check(&request_for_subscription(SUBSCRIPTION_A), first.identity())
+            .await
+            .expect("first subscription identity pins");
+
+        let second = broker
+            .acquire(request_for_subscription(SUBSCRIPTION_B))
+            .await
+            .expect("second subscription token acquisition succeeds");
+        let error = pin
+            .check(&request_for_subscription(SUBSCRIPTION_B), second.identity())
+            .await
+            .expect_err("principal switch across subscriptions fails closed");
+        assert_eq!(error.code(), CredentialErrorCode::PrincipalMismatch);
+        assert!(!error.to_string().contains(first_token.as_str()));
+        assert!(!error.to_string().contains(second_token.as_str()));
+    }
+
+    #[tokio::test]
+    async fn identity_pins_are_independent_per_context() {
+        let request = request();
+        let first_identity = CredentialIdentity {
+            oid: OID_A.to_owned(),
+            client_id: CLIENT_A.to_owned(),
+        };
+        let second_identity = CredentialIdentity {
+            oid: OID_B.to_owned(),
+            client_id: CLIENT_B.to_owned(),
+        };
+        let first_context = CredentialIdentityPin::new();
+        let second_context = CredentialIdentityPin::new();
+
+        let (first_result, second_result) = tokio::join!(
+            first_context.check(&request, &first_identity),
+            second_context.check(&request, &second_identity),
+        );
+        first_result.expect("first context establishes its principal");
+        second_result.expect("second context establishes its principal");
+
+        let error = first_context
+            .check(&request, &second_identity)
+            .await
+            .expect_err("one context rejects an identity change");
+        assert_eq!(error.code(), CredentialErrorCode::PrincipalMismatch);
+        second_context
+            .check(&request, &second_identity)
+            .await
+            .expect("second context retains its independent principal");
+    }
+
+    #[tokio::test]
+    async fn startup_probe_requires_supported_cli_and_never_requests_a_token() {
+        let directory = tempfile::tempdir().expect("temporary fake directory");
+        let executable = fake_az_version(
+            &directory,
+            r#"{"azure-cli":"2.89.0","azure-cli-core":"2.89.0"}"#,
+            0,
+        );
+        let broker =
+            AzureCliBroker::with_correlation_id(&executable, DEFAULT_TIMEOUT, "probe-test")
+                .expect("valid correlation id");
+        let probe = broker.probe().await.expect("supported CLI probe");
+        assert_eq!(probe.version(), "2.89.0");
+        assert!(probe.agent_session_attribution_active());
+
+        let old = fake_az_version(&directory, r#"{"azure-cli":"2.88.0"}"#, 0);
+        let error = AzureCliBroker::with_correlation_id(&old, DEFAULT_TIMEOUT, "old-test")
+            .expect("valid correlation id")
+            .probe()
+            .await
+            .expect_err("old CLI is rejected");
+        assert_eq!(error.code(), CredentialErrorCode::UnsupportedCli);
+
+        let malformed = fake_az_version(&directory, r#"{"azure-cli":"not-a-version"}"#, 0);
+        let error = AzureCliBroker::with_correlation_id(
+            &malformed,
+            DEFAULT_TIMEOUT,
+            "malformed-probe-test",
+        )
+        .expect("valid correlation id")
+        .probe()
+        .await
+        .expect_err("malformed version is rejected");
+        assert_eq!(error.code(), CredentialErrorCode::UnsupportedCli);
+    }
+
     #[test]
     fn expiration_parser_handles_cli_and_epoch_shapes() {
         assert!(parse_expiration("2099-01-01 00:00:00.000000").is_some());
@@ -995,5 +1656,6 @@ mod tests {
         assert!(parse_expiration("not-a-date").is_none());
         assert!(parse_expiration("2099-02-29 00:00:00").is_none());
         assert!(parse_expiration("2099-01-01T00:00:00-05:00").is_some());
+        assert!(parse_expiration("2099-01-01T00:00:00+99:00").is_none());
     }
 }

@@ -6,15 +6,18 @@
 //! authority, and one active lease at a time.  This module does not execute
 //! JavaScript; the lease is the boundary a future worker can use to do so.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::config::ResolvedCloudBinding;
 pub use crate::policy::ArmTier;
+use crate::{
+    cloud::AzureCloud,
+    config::{ResolvedCloudBinding, SubscriptionId},
+};
 
 const HANDLE_BYTES: usize = 32;
 const HANDLE_LENGTH: usize = 43;
@@ -31,6 +34,30 @@ pub enum Identity {
     User,
 }
 
+/// How a context's primary cloud binding was selected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BindingSource {
+    /// The binding came from the server's immutable configuration.
+    Config,
+    /// The context-open request supplied the binding explicitly.
+    ContextOverride,
+    /// Exactly one cached account candidate was selected automatically.
+    Auto,
+}
+
+/// The Resource Graph scope fixed for one cloud in a context.
+///
+/// An explicit list is restricted to subscriptions in the context's ordinary
+/// allowlist. `AllAccessible` is separate because it widens only Resource
+/// Graph and must never make an `az.request` target valid.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GraphScope {
+    /// Query only this non-empty, explicitly authorized subscription set.
+    Subscriptions(Vec<SubscriptionId>),
+    /// Permit Resource Graph's explicit `allAccessible` mode for this cloud.
+    AllAccessible,
+}
+
 /// A validated v0 context-open request.
 ///
 /// `data_planes` is retained as an explicit input so later versions can add
@@ -43,6 +70,8 @@ pub struct ContextOptions {
     arm_tier: ArmTier,
     data_planes: Vec<String>,
     resolved_bindings: Vec<ResolvedCloudBinding>,
+    binding_sources: BTreeMap<AzureCloud, BindingSource>,
+    graph_scopes: BTreeMap<AzureCloud, GraphScope>,
     policy_hash: String,
     policy_version: String,
 }
@@ -57,16 +86,55 @@ impl ContextOptions {
         policy_hash: impl Into<String>,
         policy_version: impl Into<String>,
     ) -> Result<Self, ContextOptionsError> {
+        let graph_scopes = resolved_bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.cloud(),
+                    GraphScope::Subscriptions(vec![binding.subscription().clone()]),
+                )
+            })
+            .collect();
+        let binding_sources = resolved_bindings
+            .iter()
+            .map(|binding| (binding.cloud(), BindingSource::ContextOverride))
+            .collect();
         let options = Self {
             identity,
             arm_tier,
             data_planes,
             resolved_bindings,
+            binding_sources,
+            graph_scopes,
             policy_hash: policy_hash.into(),
             policy_version: policy_version.into(),
         };
         options.validate()?;
         Ok(options)
+    }
+
+    /// Replace the default explicit-source markers with the application's
+    /// exact per-cloud binding provenance.
+    pub fn with_binding_sources(
+        mut self,
+        binding_sources: BTreeMap<AzureCloud, BindingSource>,
+    ) -> Result<Self, ContextOptionsError> {
+        self.binding_sources = binding_sources;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Replace the default binding-only Resource Graph scopes.
+    ///
+    /// Callers must supply exactly one scope for every resolved cloud. The
+    /// returned value is still validated when the registry opens it.
+    pub fn with_graph_scopes(
+        mut self,
+        graph_scopes: BTreeMap<AzureCloud, GraphScope>,
+    ) -> Result<Self, ContextOptionsError> {
+        self.graph_scopes = graph_scopes;
+        self.validate()?;
+        Ok(self)
     }
 
     /// Validate the closed v0 option set.
@@ -86,11 +154,46 @@ impl ContextOptions {
         if self.policy_version.is_empty() {
             return Err(ContextOptionsError::EmptyPolicyVersion);
         }
+        if self.resolved_bindings.is_empty() {
+            return Err(ContextOptionsError::MissingCloudBinding);
+        }
 
         let mut clouds = HashSet::with_capacity(self.resolved_bindings.len());
         for binding in &self.resolved_bindings {
             if !clouds.insert(binding.cloud()) {
                 return Err(ContextOptionsError::DuplicateCloudBinding);
+            }
+        }
+        if self.graph_scopes.len() != self.resolved_bindings.len() {
+            return Err(ContextOptionsError::GraphScopeCloudMismatch);
+        }
+        if self.binding_sources.len() != self.resolved_bindings.len()
+            || self
+                .resolved_bindings
+                .iter()
+                .any(|binding| !self.binding_sources.contains_key(&binding.cloud()))
+        {
+            return Err(ContextOptionsError::BindingSourceCloudMismatch);
+        }
+        for binding in &self.resolved_bindings {
+            let Some(scope) = self.graph_scopes.get(&binding.cloud()) else {
+                return Err(ContextOptionsError::GraphScopeCloudMismatch);
+            };
+            if let GraphScope::Subscriptions(subscriptions) = scope {
+                if subscriptions.is_empty() {
+                    return Err(ContextOptionsError::EmptyGraphSubscriptionScope);
+                }
+                let mut seen = HashSet::with_capacity(subscriptions.len());
+                for subscription in subscriptions {
+                    if !seen.insert(subscription)
+                        || !binding
+                            .allowed_subscriptions()
+                            .iter()
+                            .any(|pair| pair.subscription() == subscription)
+                    {
+                        return Err(ContextOptionsError::GraphSubscriptionNotAllowed);
+                    }
+                }
             }
         }
         Ok(())
@@ -114,6 +217,16 @@ impl ContextOptions {
     /// Resolved per-cloud bindings captured at open.
     pub fn resolved_bindings(&self) -> &[ResolvedCloudBinding] {
         &self.resolved_bindings
+    }
+
+    /// Fixed primary-binding provenance for every resolved cloud.
+    pub fn binding_sources(&self) -> &BTreeMap<AzureCloud, BindingSource> {
+        &self.binding_sources
+    }
+
+    /// Fixed Resource Graph scopes, one for every resolved cloud.
+    pub fn graph_scopes(&self) -> &BTreeMap<AzureCloud, GraphScope> {
+        &self.graph_scopes
     }
 
     /// The immutable policy content hash.
@@ -145,9 +258,24 @@ pub enum ContextOptionsError {
     /// Audit records require a policy bundle version.
     #[error("context policy version must not be empty")]
     EmptyPolicyVersion,
+    /// A context without an explicit cloud binding cannot issue an Azure call.
+    #[error("context requires at least one resolved cloud binding")]
+    MissingCloudBinding,
     /// A context may contain at most one resolved binding per cloud.
     #[error("context cannot contain duplicate cloud bindings")]
     DuplicateCloudBinding,
+    /// Binding provenance keys must exactly match resolved cloud bindings.
+    #[error("context binding sources must exactly match resolved cloud bindings")]
+    BindingSourceCloudMismatch,
+    /// Graph scope keys must exactly match the resolved cloud bindings.
+    #[error("context graph scopes must exactly match resolved cloud bindings")]
+    GraphScopeCloudMismatch,
+    /// An explicit Resource Graph subscription scope cannot be empty.
+    #[error("context graph subscription scope must not be empty")]
+    EmptyGraphSubscriptionScope,
+    /// Explicit Resource Graph subscriptions must be in the cloud allowlist.
+    #[error("context graph subscription is not in the cloud allowlist")]
+    GraphSubscriptionNotAllowed,
 }
 
 /// Limits and expiry policy for a [`ContextRegistry`].
@@ -229,7 +357,7 @@ impl AsRef<str> for ContextId {
 
 impl fmt::Display for ContextId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+        formatter.write_str("<redacted-context-id>")
     }
 }
 
@@ -255,6 +383,8 @@ pub struct Context {
     arm_tier: ArmTier,
     data_planes: Vec<String>,
     resolved_bindings: Vec<ResolvedCloudBinding>,
+    binding_sources: BTreeMap<AzureCloud, BindingSource>,
+    graph_scopes: BTreeMap<AzureCloud, GraphScope>,
     policy_hash: String,
     policy_version: String,
     created_at: Instant,
@@ -288,6 +418,16 @@ impl Context {
     /// The resolved cloud bindings fixed at open.
     pub fn resolved_bindings(&self) -> &[ResolvedCloudBinding] {
         &self.resolved_bindings
+    }
+
+    /// Fixed primary-binding provenance for every resolved cloud.
+    pub fn binding_sources(&self) -> &BTreeMap<AzureCloud, BindingSource> {
+        &self.binding_sources
+    }
+
+    /// The immutable Resource Graph scopes fixed at open.
+    pub fn graph_scopes(&self) -> &BTreeMap<AzureCloud, GraphScope> {
+        &self.graph_scopes
     }
 
     /// The policy content hash fixed at open.
@@ -344,6 +484,8 @@ impl fmt::Debug for Context {
             .field("arm_tier", &self.arm_tier)
             .field("data_planes", &self.data_planes)
             .field("resolved_bindings", &self.resolved_bindings)
+            .field("binding_sources", &self.binding_sources)
+            .field("graph_scopes", &self.graph_scopes)
             .field("policy_hash", &self.policy_hash)
             .field("policy_version", &self.policy_version)
             .field("created_at", &self.created_at)
@@ -409,7 +551,7 @@ impl ContextRegistry {
             .map_err(ContextRegistryError::InvalidOptions)?;
 
         let mut state = self.lock_state();
-        evict_expired_locked(&self.inner.config, &mut state, now);
+        let _ = evict_expired_locked(&self.inner.config, &mut state, now);
         if state.contexts.len() >= self.inner.config.max_contexts {
             return Err(ContextRegistryError::Capacity);
         }
@@ -426,6 +568,8 @@ impl ContextRegistry {
             arm_tier: options.arm_tier,
             data_planes: options.data_planes,
             resolved_bindings: options.resolved_bindings,
+            binding_sources: options.binding_sources,
+            graph_scopes: options.graph_scopes,
             policy_hash: options.policy_hash,
             policy_version: options.policy_version,
             created_at: now,
@@ -525,8 +669,38 @@ impl ContextRegistry {
     /// invalidating an in-flight worker operation; the next acquisition then
     /// observes the expiry and evicts it before returning.
     pub fn evict_expired(&self, now: Instant) -> usize {
+        self.evict_expired_ids(now).len()
+    }
+
+    /// Remove expired contexts and return their opaque handles to the
+    /// application lifecycle owner so it can terminate associated workers.
+    pub fn evict_expired_ids(&self, now: Instant) -> Vec<ContextId> {
         let mut state = self.lock_state();
         evict_expired_locked(&self.inner.config, &mut state, now)
+            .into_iter()
+            .map(ContextId)
+            .collect()
+    }
+
+    /// Return the current idle-or-absolute deadline without acquiring a lease.
+    ///
+    /// Application lifecycle owners use this to arm worker disposal. A
+    /// successful lease can move the idle deadline, so callers must query
+    /// again after waking rather than treating this value as immutable.
+    pub fn expiration<H: AsRef<str>>(&self, handle: H) -> Result<Instant, ContextRegistryError> {
+        let handle = handle.as_ref();
+        let state = self.lock_state();
+        state
+            .contexts
+            .get(handle)
+            .map(|entry| entry.context.expires_at())
+            .ok_or_else(|| {
+                if state.evicted_handles.iter().any(|known| known == handle) {
+                    ContextRegistryError::ContextEvicted
+                } else {
+                    ContextRegistryError::NotFound
+                }
+            })
     }
 
     fn lock_state(&self) -> MutexGuard<'_, RegistryState> {
@@ -618,7 +792,11 @@ fn deadline(now: Instant, duration: Duration) -> Instant {
     now.checked_add(duration).unwrap_or(now)
 }
 
-fn evict_expired_locked(config: &RegistryConfig, state: &mut RegistryState, now: Instant) -> usize {
+fn evict_expired_locked(
+    config: &RegistryConfig,
+    state: &mut RegistryState,
+    now: Instant,
+) -> Vec<String> {
     let expired = state
         .contexts
         .iter()
@@ -626,12 +804,11 @@ fn evict_expired_locked(config: &RegistryConfig, state: &mut RegistryState, now:
             (!entry.busy && entry.context.is_expired(now)).then_some(handle.clone())
         })
         .collect::<Vec<_>>();
-    let count = expired.len();
-    for handle in expired {
-        state.contexts.remove(&handle);
-        remember_evicted(config, state, &handle);
+    for handle in &expired {
+        state.contexts.remove(handle);
+        remember_evicted(config, state, handle);
     }
-    count
+    expired
 }
 
 fn remember_evicted(config: &RegistryConfig, state: &mut RegistryState, handle: &str) {
@@ -666,9 +843,10 @@ fn encode_handle(bytes: &[u8; HANDLE_BYTES]) -> String {
 mod tests {
     use super::*;
     use crate::cloud::AzureCloud;
-    use crate::config::{CloudBinding, SubscriptionId, TenantId};
+    use crate::config::{CloudBinding, SubscriptionId, SubscriptionTenantPair, TenantId};
 
     const SUBSCRIPTION: &str = "11111111-1111-1111-1111-111111111111";
+    const OTHER_SUBSCRIPTION: &str = "22222222-2222-2222-2222-222222222222";
     const TENANT: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 
     fn options() -> ContextOptions {
@@ -708,12 +886,81 @@ mod tests {
         assert_eq!(context.arm_tier(), ArmTier::Inspect);
         assert!(context.data_planes().is_empty());
         assert_eq!(context.resolved_bindings().len(), 1);
+        assert_eq!(
+            context.graph_scopes(),
+            &BTreeMap::from([(
+                AzureCloud::AzureCloud,
+                GraphScope::Subscriptions(vec![
+                    SubscriptionId::new(SUBSCRIPTION).expect("valid subscription")
+                ])
+            )])
+        );
         assert_eq!(context.policy_hash(), "sha256:test");
         assert_eq!(context.policy_version(), "policy-v0");
         assert_eq!(context.created_at(), now);
         assert_eq!(context.last_used_at(), now);
         assert_eq!(context.idle_expires_at(), now + Duration::from_secs(10));
         assert_eq!(context.absolute_expires_at(), now + Duration::from_secs(60));
+    }
+
+    #[test]
+    fn graph_scopes_are_context_fixed_and_cannot_widen_request_allowlists() {
+        let primary = SubscriptionId::new(SUBSCRIPTION).expect("valid subscription");
+        let other = SubscriptionId::new(OTHER_SUBSCRIPTION).expect("valid subscription");
+        let tenant = TenantId::new(TENANT).expect("valid tenant");
+        let binding = CloudBinding::with_allowed_subscriptions(
+            primary,
+            Some(tenant.clone()),
+            vec![SubscriptionTenantPair::new(other.clone(), tenant)],
+        )
+        .expect("valid allowlist")
+        .resolve(AzureCloud::AzureCloud, &[])
+        .expect("resolved binding");
+        let explicit = ContextOptions::new(
+            Identity::User,
+            ArmTier::Inspect,
+            Vec::new(),
+            vec![binding.clone()],
+            "hash",
+            "version",
+        )
+        .expect("base options")
+        .with_graph_scopes(BTreeMap::from([(
+            AzureCloud::AzureCloud,
+            GraphScope::Subscriptions(vec![other]),
+        )]))
+        .expect("allowlisted graph subscription");
+        let context = registry(1, Duration::from_secs(30), Duration::from_secs(60))
+            .open(explicit, Instant::now())
+            .expect("context opens");
+        assert_eq!(
+            context.graph_scopes().get(&AzureCloud::AzureCloud),
+            Some(&GraphScope::Subscriptions(vec![
+                SubscriptionId::new(OTHER_SUBSCRIPTION).expect("valid subscription")
+            ]))
+        );
+        assert_eq!(context.resolved_bindings()[0], binding);
+
+        let denied = options()
+            .with_graph_scopes(BTreeMap::from([(
+                AzureCloud::AzureCloud,
+                GraphScope::Subscriptions(vec![
+                    SubscriptionId::new(OTHER_SUBSCRIPTION).expect("valid subscription"),
+                ]),
+            )]))
+            .expect_err("graph scope cannot exceed the ordinary allowlist");
+        assert_eq!(denied, ContextOptionsError::GraphSubscriptionNotAllowed);
+
+        let all_accessible = options()
+            .with_graph_scopes(BTreeMap::from([(
+                AzureCloud::AzureCloud,
+                GraphScope::AllAccessible,
+            )]))
+            .expect("allAccessible is an explicit graph-only scope");
+        assert_eq!(
+            all_accessible.graph_scopes().get(&AzureCloud::AzureCloud),
+            Some(&GraphScope::AllAccessible)
+        );
     }
 
     #[test]
@@ -829,6 +1076,7 @@ mod tests {
                 ContextId::parse(id.as_str()).expect("generated handle"),
                 *id
             );
+            assert_eq!(id.to_string(), "<redacted-context-id>");
         }
     }
 
@@ -858,6 +1106,18 @@ mod tests {
             )
             .expect_err("data planes are not v0"),
             ContextOptionsError::DataPlanesNotSupported
+        );
+        assert_eq!(
+            ContextOptions::new(
+                Identity::User,
+                ArmTier::Inspect,
+                Vec::new(),
+                Vec::new(),
+                "hash",
+                "version",
+            )
+            .expect_err("a context needs a cloud"),
+            ContextOptionsError::MissingCloudBinding
         );
     }
 
