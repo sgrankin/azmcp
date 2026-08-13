@@ -41,9 +41,10 @@ ambient profile-selection semantics.**
 
 - **Cloud is explicit on every call.** One token to write, and the axis where a mistake is
   most expensive.
-- **Subscription and tenant are bound per-cloud, once, immutably** — declared at session
-  open or in config, never mutated mid-session, always echoed in the call log.
-- One session can address multiple clouds concurrently.
+- **Subscription and tenant are bound per-cloud, once, immutably** — declared when an
+  execution context opens or in config, never mutated mid-context, always echoed in the
+  call log.
+- One execution context can address multiple clouds concurrently.
 - Reuse credentials the user already has cached via `az login` without running Azure
   resource commands or mutating Azure CLI profile state.
 - Default to the fail-closed `inspect` tier; recommend a read-scoped principal when the
@@ -88,7 +89,7 @@ there is no sensible tiebreak between two clouds a user is logged into.
 ### 2.2 Subscription binding
 
 Subscription and tenant *are* defaulted — per cloud, declared once, immutable for the
-session.
+execution context.
 
 ```toml
 # ~/.config/armctl/config.toml
@@ -100,7 +101,7 @@ tenant       = "…"
 subscription = "…"
 ```
 
-Overridable at session open, and per-call within the session's fixed subscription
+Overridable when the execution context opens, and per-call within its fixed subscription
 allowlist for the exceptional case:
 
 ```js
@@ -108,10 +109,10 @@ await az.gov.list({ type: 'Microsoft.Sql/servers' })
 await az.gov.sub(OTHER).list({ type: 'Microsoft.Sql/servers' })
 ```
 
-By default the allowlist contains only each cloud's binding. A session may declare more
-subscription/tenant pairs. Resource Graph's broader `allAccessible` mode is a separate
-session option and does not widen L0/L1. `.sub(OTHER)` never widens the allowlist at
-runtime.
+By default the allowlist contains only each cloud's binding. An execution context may
+declare more subscription/tenant pairs. Resource Graph's broader `allAccessible` mode is
+a separate context option and does not widen L0/L1. `.sub(OTHER)` never widens the
+allowlist at runtime.
 
 **Auto-binding:** if a cloud has exactly one enabled cached subscription candidate in
 `azureProfile.json`, bind it automatically with no configuration. A candidate is keyed by
@@ -121,7 +122,7 @@ tenant-level pseudo-accounts, and more than one candidate are ambiguous and requ
 configuration.
 
 A pleasant side effect: generated code can use bindings rather than reproducing GUIDs.
-Resolved IDs still appear in structured session results and audit records, but the model
+Resolved IDs still appear in structured context results and audit records, but the model
 does not need to invent or copy them into every call.
 
 #### 2.2.1 Invariants that make this safe
@@ -131,7 +132,7 @@ This is not the `az` failure mode, and the difference is mechanical rather than 
 | `az` | Here |
 |---|---|
 | Single `isDefault` flag shared across all clouds | One binding **per cloud**, no shared slot |
-| Mutated by any concurrent process writing `~/.azure` | Immutable for the session's lifetime |
+| Mutated by any concurrent process writing `~/.azure` | Immutable for the context's lifetime |
 | Effective value invisible at call time | Resolved subscription in every call-log entry |
 | Cloud and subscription can silently disagree | Binding is keyed by cloud; disagreement is unrepresentable |
 | Requires `_set_active_subscription()` reconciliation | Nothing to reconcile — one source |
@@ -149,8 +150,8 @@ Enforced rules:
    authority. Before the first arbitrary request for a binding, acquire a token using the
    binding's cloud and tenant and call `GET /subscriptions/{id}` on that cloud's ARM
    endpoint. A missing, inaccessible, or wrong-cloud subscription is a hard error. Cache
-   successful validation for the session.
-5. **Explicit overrides are explicit triples.** The GUID must be in the session's fixed
+   successful validation for the execution context.
+5. **Explicit overrides are explicit triples.** The GUID must be in the context's fixed
    allowlist. `.sub(guid)` may reuse a unique cached
    tenant for that cloud. If the cache has no match or multiple tenant routes, require
    `.sub(guid, { tenant })`; never guess a tenant.
@@ -166,7 +167,7 @@ await az.gov.graph(q, { subscriptions: [SUB_A, SUB_B] });
 await az.gov.graph(q, { scope: 'allAccessible' });
 ```
 
-`allAccessible` is logged distinctly and is available only when the session's
+`allAccessible` is logged distinctly and is available only when the context's
 `graphScopes` declared that scope for the cloud. This preserves ARG's fleet-query value
 without making an omitted argument mean "the whole estate."
 
@@ -209,8 +210,15 @@ sets, and Government often receives versions later. A version literal that works
 
 ### 3.1 Choice
 
-**Rust + `deno_core`.** One `JsRuntime` (V8 isolate) per session, hosted in a worker
-process behind the MCP front end.
+**Rust + `deno_core`.** One `JsRuntime` (V8 isolate) per execution context, hosted in a
+worker process behind the MCP front end.
+
+Use the official `rmcp` 3.0 line for the `2026-07-28` JSON-RPC types, stdio transport,
+per-request metadata, discovery, caching fields, and MRTR plumbing. The first reviewed
+baseline is `rmcp` 3.0.1; pin the exact crate and Rust toolchain in the implementation.
+The SDK is currently Tier 2, so its abstraction is not the conformance boundary: run the
+official MCP server suite against the built binary and keep Azure policy and V8 lifecycle
+outside SDK handler state.
 
 Rationale:
 
@@ -225,7 +233,7 @@ Rationale:
 
 The process boundary is for crash containment, not for treating generated code as hostile.
 The front end owns credentials, policy, plans, and durable logs. The worker receives only
-normalized request intents and opaque session-scoped handles; it never receives a token.
+normalized request intents and opaque context-scoped handles; it never receives a token.
 
 Rejected: raw `rusty_v8` (rebuild all the plumbing); Node + `isolated-vm` (workable, but
 Node hosting and fiddlier per-isolate heap accounting); Go + `goja` (ES5.1-era, slow);
@@ -239,12 +247,12 @@ invocation, which the ergonomics do not justify).
 | Wall-clock timeout | Per `azure_run` call, default 60s; cancel host ops and call V8 `TerminateExecution` |
 | CPU / runaway loops | Worker watchdog terminates execution; kills the worker if V8 does not yield |
 | Heap ceiling | Per-isolate heap limits plus an OS RSS limit on the worker process |
-| Session lifetime | Idle TTL (default 30m) + absolute max, LRU eviction under memory pressure |
-| Concurrent sessions | Configurable cap; each is a full isolate |
+| Context lifetime | Idle TTL (default 30m) + absolute max, LRU eviction under memory pressure |
+| Concurrent contexts | Configurable cap; each is a full isolate |
 | Host-op input | Per-request path/header/body limits before allocation or network I/O |
 
-An ordinary timeout kills the session and returns a structured error. A V8 fatal OOM may
-kill the worker; the front end reports all sessions in that worker as evicted and starts a
+An ordinary timeout kills the context and returns a structured error. A V8 fatal OOM may
+kill the worker; the front end reports all contexts in that worker as evicted and starts a
 fresh worker. An in-process isolate alone cannot honestly promise that a V8 OOM leaves its
 host process healthy.
 
@@ -266,7 +274,7 @@ evaluation.
 ### 4.1 Two identities, resolved by availability
 
 ```js
-azure_session_open({
+azure_context_open({
   identity: 'reader' | 'user',
   armTier: 'inspect' | 'read' | 'write',
   dataPlanes: [],
@@ -282,19 +290,19 @@ azure_session_open({
 | `user` | MSAL cache from `az login` | Zero-config default; scopes the SP lacks |
 
 If identity is omitted, resolve `reader` only when a reader principal is configured for
-every requested cloud/tenant binding; otherwise resolve `user` for the whole session.
-Report the resolution and reason before opening the session. An explicitly requested but
+every requested cloud/tenant binding; otherwise resolve `user` for the whole context.
+Report the resolution and reason before opening the context. An explicitly requested but
 incomplete identity is an error. Never fall back from `reader` to `user` for one request or
 one cloud.
 
 The resolved principal mapping by `(cloud, tenant)` and all capability ceilings are
-**session-fixed**. A persistent isolate may retain
+**context-fixed**. A persistent isolate may retain
 globals, closures, console output, and refs derived from earlier calls. Allowing a later
 call to claim a lower tier or a different identity does not unsee those values and creates
-a privilege-laundering path. Open a separate session to use another principal or capability
+a privilege-laundering path. Open a separate context to use another principal or capability
 profile.
 
-The resolved identity, ARM tier, data-plane grants, and reason are reported at session open
+The resolved identity, ARM tier, data-plane grants, and reason are reported at context open
 and echoed in every `azure_run` result:
 
 ```
@@ -309,17 +317,17 @@ Both identities default to ARM tier `inspect` with no data-plane grants. The dif
 | | `reader` | `user` |
 |---|---|---|
 | Default tier | `inspect` | `inspect` |
-| `read` (secrets) | opt-in per session | opt-in per session, **flagged** |
+| `read` (secrets) | opt-in per context | opt-in per context, **flagged** |
 | `write` | opt-in + plan/apply, bounded by the SP's RBAC | opt-in + plan/apply, bounded by **nothing but the interceptor** |
 | Backstop if the interceptor has a bug | Azure RBAC denies | Nothing |
 
 So the escalation ceremony scales with `(tier × identity)`. Under `reader`, opening a
-`read` session is routine — RBAC will deny anything the interceptor mistakenly allows.
+`read` context is routine — RBAC will deny anything the interceptor mistakenly allows.
 Under `user`, the same request is the moment a policy bug can become a real `listKeys`
 against production, so it is opt-in, logged distinctly, and surfaced in every result
 summary rather than buried in the call log.
 
-Opening a `read` session also authorizes secret-bearing response data to enter the isolate
+Opening a `read` context also authorizes secret-bearing response data to enter the isolate
 and, if generated code returns or prints it, the MCP result and model context. The
 interceptor is not a confidentiality boundary. Secret routes suppress automatic previews
 and durable response logging, but they cannot make a string secret after arbitrary JS has
@@ -329,7 +337,7 @@ handled it. Use `read` only when that exposure is intended.
 front of every mutation, and blocking it outright would just send people back to `az` with
 no interceptor and no audit trail at all — strictly worse.
 
-### 4.3 Privilege disclosure at session open
+### 4.3 Privilege disclosure at context open
 
 When resolving to `user`, decode the token's tenant and object ID and make a best-effort
 query for visible role assignments at each bound subscription scope. Surface only what was
@@ -413,7 +421,7 @@ Requirements:
   attribution via `COPILOT_AGENT_SESSION_ID` is version-gated; report whether it is active.
 - Forward a validated inherited `COPILOT_AGENT_SESSION_ID` when the MCP host supplied one;
   otherwise generate a separate non-secret agent correlation ID. Never expose or reuse the
-  bearer `sessionId` as telemetry or an environment value passed to another process.
+  bearer `contextId` as telemetry or an environment value passed to another process.
 - Apply a short subprocess timeout. Treat stdout and stderr as sensitive, parse the
   documented JSON fields, zero buffers after parsing where practical, and never include raw
   subprocess output or the token in an error or log. Map known CLI errors to sanitized
@@ -424,9 +432,9 @@ Requirements:
   ARM requests remain concurrent. Cache access tokens in memory until five minutes before
   `expires_on`.
 - Verify that the returned tenant and subscription match the requested binding before
-  using the token. Pin the token's principal and client claims in the session's resolved
+  using the token. Pin the token's principal and client claims in the context's resolved
   principal mapping. Every refresh must match; if `az login` changed the account
-  mid-session, evict the session rather than switching identity silently.
+  mid-context, evict the context rather than switching identity silently.
 - On authentication failure, return a targeted
   `AZURE_CLOUD_NAME=<cloud> az login --tenant <tenant>` instruction. Do not start an
   interactive login from the MCP server.
@@ -502,7 +510,8 @@ read that surrenders a storage account.
 | `write` | Mutations, gated by two-phase plan/apply (§6.5) |
 
 `isDataAction: true` is a **separate axis**, not a tier. Data-plane operations are where
-customer data actually lives. A session therefore has two fixed capability dimensions:
+customer data actually lives. An execution context therefore has two fixed capability
+dimensions:
 
 ```text
 armTier: inspect | read | write
@@ -511,7 +520,7 @@ dataPlanes: [] | [logs.query, keyvault.metadata, keyvault.secrets,
 ```
 
 ARM tiers authorize only ARM routes. Every data-plane route names an exact required grant;
-all such requests are denied unless that grant was named when the session opened. A
+all such requests are denied unless that grant was named when the context opened. A
 data-plane mutation additionally requires `armTier: 'write'` and uses the same plan/apply
 ceremony. The familiar `inspect` / `read` / `write` labels remain useful risk descriptions,
 but they do not silently grant another data plane.
@@ -541,7 +550,7 @@ Classification pipeline for producing a candidate policy bundle:
      `listCallbackUrl` (Logic Apps callback URLs embed a SAS)
    - mutating → `write`: `^(start|stop|restart|failover|restore|export|import|move|regenerate|rotate|purge|cancel|approve|reject|deploy|scale|set|create|update|write|generate|invoke|run|execute)`
 4. **Unmatched → deny.** Unmatched operations enter a review queue. Treating them as
-   `write` would make them executable in a write session before review.
+   `write` would make them executable in a write context before review.
 5. **Override file** — hand-maintained, layered last.
 
 The generator never publishes its output directly. The shipped policy bundle is a
@@ -568,7 +577,7 @@ receiving explicit review.
 air-gapped clouds from first run; optionally fetch **signed, reviewed release bundles** in
 the background on a TTL and swap atomically to the newest trusted version. Never turn live
 provider metadata directly into an allow decision. Never block startup on a fetch or
-hard-fail on a fetch error. The policy hash is fixed per session and recorded in the call
+hard-fail on a fetch error. The policy hash is fixed per context and recorded in the call
 log so a surprising denial can be explained against a specific table rather than a moving
 target.
 
@@ -594,7 +603,7 @@ The shipped row is conceptually:
 
 At runtime, parse and canonicalize the URL, match the most-specific reviewed route, and
 then enforce its capability. **No reviewed route means deny**, including in a `write`
-session. The path-shape algorithm remains useful for generating candidates and diagnostics,
+context. The path-shape algorithm remains useful for generating candidates and diagnostics,
 not for granting access.
 
 Known edge cases requiring route fixtures and explicit handling:
@@ -666,10 +675,10 @@ generator, default to built-ins.
 
 - **RBAC on the `reader` SP is the boundary.** It is what actually holds.
 - **The interceptor is a guardrail.** Its value is fast, legible, pre-flight failures
-  ("`listKeys` is tier `read`, session is `inspect`") instead of an opaque
+  ("`listKeys` is tier `read`, context is `inspect`") instead of an opaque
   `AuthorizationFailed` forty seconds into a fan-out — and it is the *only* protection in
   `identity: 'user'` mode — which, since that is the zero-config default (§4.1), is the
-  mode most sessions will actually run in.
+  mode most contexts will actually run in.
 
 Because `user` has no RBAC backstop, only reviewed routes are executable. A new provider
 operation appearing in live metadata does not become available automatically, even when
@@ -683,17 +692,51 @@ State this in the README. Do not let it read as a security boundary.
 
 ### 6.1 MCP and deployment contract
 
-Target the stable MCP protocol revision `2025-11-25`. v0 serves stdio only and assumes one
-local OS user. Every tool has an `inputSchema`, `outputSchema`, and structured result;
-domain failures are returned as stable error codes rather than prose parsing.
+Target the stable MCP protocol revision `2026-07-28` as a modern-only server. This revision
+has no `initialize` handshake, protocol session, or `Mcp-Session-Id`. Every request is
+self-describing: it carries `io.modelcontextprotocol/protocolVersion` and
+`io.modelcontextprotocol/clientCapabilities` in `_meta`. Reject missing metadata with
+`-32602`, unsupported revisions with `-32022`, and missing required client capabilities
+with `-32021` as specified by MCP. `clientInfo` is diagnostic input, not identity or an
+authorization fact.
+
+Implement `server/discover` and advertise only `2026-07-28`, the `tools` capability, server
+identity, `cacheScope: "public"`, and a positive `ttlMs`. A legacy `initialize` request
+receives an actionable error that names the supported modern revision; v0 does not carry a
+second legacy protocol stack.
+`tools/list` is deterministic, identical for all v0 callers, and returned with
+`cacheScope: "public"` and a positive `ttlMs`. The list does not vary with an execution
+context, and v0 does not advertise `listChanged`. Every result includes
+`io.modelcontextprotocol/serverInfo` in `_meta`.
+
+v0 serves stdio only and assumes one local OS user. The stdio process is a transport, not a
+conversation boundary: unrelated calls may be interleaved on it and no request inherits
+metadata or application state from an earlier request. Every tool has JSON Schema 2020-12
+`inputSchema` and `outputSchema` definitions and a structured result. Schemas are bounded
+for validator cost and never cause automatic network dereferencing of `$ref` URIs.
+Domain failures are returned as stable error codes rather than prose parsing.
 
 Tool annotations are descriptive hints, not authorization. Mark discovery and inspect-only
 tools `readOnlyHint: true`; mark `azure_apply` destructive and non-idempotent. A client may
 use those hints to choose an approval UI, but the server does not rely on it.
 
-Remote Streamable HTTP is out of scope until the design has authenticated users, session
-tenancy, CSRF/origin controls, and a plan-approval binding appropriate for a multi-user
-server.
+The Tasks extension is not needed for v0: `azure_run` is a bounded tool call and a retained
+V8 execution context is an application handle, not a task. Add Tasks only for a measured
+long-running use case and negotiate it through the extensions capability.
+
+Do not advertise the deprecated Roots, Sampling, or MCP Logging features. v0 needs none of
+them: configuration is explicit, it does not call an LLM, operational diagnostics go to
+`stderr`, and structured observability uses the audit log plus OpenTelemetry.
+
+Remote Streamable HTTP is out of scope until the design has authenticated callers,
+per-request tenancy, CSRF/origin controls, and a plan-approval binding appropriate for a
+multi-user server. A future HTTP design must be POST-only; validate `Origin`; require and
+cross-check `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name` against the body; and never
+place bearer `contextId`, `planId`, resource IDs, code, or other sensitive arguments in
+`x-mcp-header` fields. Its authorization design must implement Protected Resource Metadata,
+resource indicators and token audience validation, issuer validation, and Client ID
+Metadata Documents or pre-registration rather than starting new work on deprecated Dynamic
+Client Registration.
 
 ### 6.2 Tool surface
 
@@ -701,39 +744,45 @@ Deliberately small — the API surface lives in the code, not in the tool list.
 
 | Tool | Purpose |
 |---|---|
-| `azure_session_open` | Resolve immutable identity, capability, and cloud bindings |
-| `azure_session_close` | Dispose the isolate and all session refs immediately |
-| `azure_run` | Execute JS in a session isolate; returns value + logs + call log |
+| `azure_context_open` | Resolve immutable identity, capability, and cloud bindings; return an application handle |
+| `azure_context_close` | Dispose the isolate and all context refs immediately |
+| `azure_run` | Execute JS in a context isolate; returns value + logs + call log |
 | `azure_accounts` | Enumerate cached subscription/account candidates across all clouds |
 | `azure_schema_search` | Keyword search over resource types / operations |
 | `azure_schema_get` | Full request/response schema for a type + api-version |
 | `azure_apply` | Elicit human approval, then replay an immutable mutation plan |
 
-### 6.3 Sessions are persistent
+### 6.3 Application execution contexts are explicit
 
-A session holds a live isolate. Globals persist across `azure_run` calls, so the model can
-fetch once and interrogate repeatedly without re-paying for the ARM round trip.
+MCP is stateless; the application is intentionally stateful. An execution context holds a
+live isolate. Globals persist across `azure_run` calls, so the model can fetch once and
+interrogate repeatedly without re-paying for the ARM round trip. That state is reached only
+through an explicit handle in every call:
 
 ```
-azure_session_open({ identity?, armTier?, dataPlanes?, bindings?,
+azure_context_open({ identity?, armTier?, dataPlanes?, bindings?,
                      allowedSubscriptions?, graphScopes? })
-  → { sessionId, identity, armTier, dataPlanes, resolvedBindings,
-      allowedSubscriptions, graphScopes }
-azure_run({ sessionId, code, timeoutMs? })
-azure_session_close({ sessionId })
+  → { contextId, identity, armTier, dataPlanes, resolvedBindings,
+      allowedSubscriptions, graphScopes, expiresAt }
+azure_run({ contextId, code, timeoutMs? })
+azure_context_close({ contextId })
 ```
 
-Sessions are evicted on idle TTL, absolute max age, or memory pressure. Eviction is
-reported so the model knows its state is gone rather than silently observing `undefined`.
+Contexts are evicted on idle TTL, absolute max age, process restart, or memory pressure.
+Eviction is reported so the model knows its state is gone rather than silently observing
+`undefined`.
 
-Session IDs are at least 256 bits of cryptographic randomness and are bearer capabilities.
-They are scoped to the originating MCP connection in v0, never written to logs, and become
-invalid on close or eviction. One run may execute at a time in an isolate; concurrent calls
-to the same session return `session_busy` rather than interleave JavaScript turns.
+Context IDs are at least 256 bits of cryptographic randomness and are bearer capabilities
+in the local unauthenticated v0. They are ordinary MCP tool arguments, never written to
+logs, and become invalid on close or eviction. They are not scoped to an MCP connection:
+the protocol has no connection-level identity and a stdio process may carry unrelated
+threads or conversations. Every context call validates the handle and its retained policy
+record independently. One run may execute at a time in an isolate; concurrent calls to the
+same context return `context_busy` rather than interleave JavaScript turns.
 
 Identity, ARM tier, data-plane grants, bindings, subscription allowlist, graph scopes, and
-policy bundle are fixed when the session opens. Refs and persistent JS state inherit that
-context. There is no per-call downgrade claim: a value fetched in a `read` session remains
+policy bundle are fixed when the context opens. Refs and persistent JS state inherit that
+context. There is no per-call downgrade claim: a value fetched in a `read` context remains
 read-sensitive even if later code only performs arithmetic.
 
 ### 6.4 Return protocol: refs, not truncation
@@ -759,13 +808,13 @@ There are two related mechanisms:
 
 - Values retained in JS globals stay in the isolate and can be queried by later runs.
 - An oversized value crossing the MCP boundary is serialized once into an immutable,
-  session-scoped host ref. `await az.ref('ref_7Jm2…')` rehydrates it into the isolate when
+  context-scoped host ref. `await az.ref('ref_7Jm2…')` rehydrates it into the isolate when
   the original JS value was not retained. `az.peek(x)` forces a structural summary on
   demand.
 
 Ref IDs are random opaque handles, not sequential authority. Stored values carry content
 labels such as `secret` or `customerData`; secret-labeled values receive shape-only
-previews with no samples. Rehydrating one is allowed only in the same `read` session and
+previews with no samples. Rehydrating one is allowed only in the same `read` context and
 marks the whole run secret-sensitive. Cyclic or non-serializable values return a typed
 summary or a serialization error, never partial JSON.
 
@@ -779,22 +828,35 @@ caller to reduce the value in JS. It never returns a truncated success value.
 
 The model never holds the write capability.
 
-1. `azure_run` in a session opened with `armTier: 'write'` executes but **intercepts
+1. `azure_run` in a context opened with `armTier: 'write'` executes but **intercepts
    mutations**, collecting exact canonical request intents as a plan rather than issuing
    them. Read dependencies may execute normally.
 2. The plan is returned as a rendered diff (scope, action, target, body delta) with a
    `planId`.
-3. `azure_apply({ planId })` requests structured MCP elicitation from the client and shows
-   the exact plan hash, identity, cloud, subscriptions, operations, and material body
-   changes. It replays only after an `accept` response tied to that tool call.
-4. If the client lacks elicitation, `azure_apply` returns `approval_unavailable`. The only
-   fallback is a separate local operator command that renders and applies the stored plan;
-   the model cannot mint or relay an approval token.
-5. Apply performs no JS execution and no re-planning. It revalidates the plan and replays
-   the recorded requests.
+3. On the first `azure_apply({ planId })` call, inspect that request's declared client
+   capabilities. If form elicitation is supported, return MCP
+   `resultType: "input_required"` with an `elicitation/create` entry in `inputRequests`.
+   The form message shows the exact plan hash, identity, cloud, subscriptions, operations,
+   and material body changes; its schema requires an explicit approval boolean.
+4. Return an AEAD-protected `requestState` binding the tool name, canonical argument hash,
+   plan hash, context, identity, policy hash, expiry, and one-time nonce. The client retries
+   `azure_apply` with a new JSON-RPC ID, the same arguments, the exact `requestState`, and
+   `inputResponses`. Treat all returned state and responses as attacker-controlled; apply
+   only when the retry independently declares form elicitation support, integrity
+   verification succeeds, and the elicitation action is `accept` with approval `true`.
+5. If the client lacks form elicitation, do not emit `inputRequests`; return MCP
+   `MissingRequiredClientCapabilityError` (`-32021`) with
+   `requiredCapabilities: { elicitation: { form: {} } }`. The only fallback is a separate
+   local operator command that renders and applies the stored plan. The model never
+   receives a server approval secret. MCP necessarily trusts the client to truthfully
+   mediate the human interaction; it cannot prove that a human clicked the UI.
+6. Apply performs no JS execution and no re-planning. It revalidates the plan and replays
+   the recorded requests. The nonce is consumed server-side before mutation begins so an
+   accepted retry cannot be replayed; decline invalidates the plan and cancel performs no
+   mutation.
 
 MCP tool annotations alone are never approval. Plans expire (default 15m), are one-shot,
-and are bound to the session, identity, cloud manifest, policy hash, subscriptions, and
+and are bound to the context, identity, cloud manifest, policy hash, subscriptions, and
 canonical request hash that produced them. Store plan bodies with user-only permissions;
 they may contain secrets even when logs do not.
 
@@ -855,17 +917,22 @@ still explicit (§2.2.2). L1 is the fallback for what ARG does not index.
 
 ### 6.7 v0 result and error contract
 
-Successful tools return `structuredContent` conforming to their declared output schema.
-`azure_run` returns:
+Completed tool calls return `resultType: "complete"` and `structuredContent` conforming to
+their declared output schema. For client compatibility, they also include a bounded text
+content block containing the same JSON. `azure_run` returns:
 
 ```text
 {
-  value | summary,
-  console: [...],
-  calls: [...],
-  session: { identity, armTier, dataPlanes, bindings, policyHash },
-  sensitivity: public | customerData | secret,
-  correlationId
+  resultType: "complete",
+  content: [{ type: "text", text: "<bounded JSON mirror>" }],
+  structuredContent: {
+    value | summary,
+    console: [...],
+    calls: [...],
+    context: { identity, armTier, dataPlanes, bindings, policyHash },
+    sensitivity: public | customerData | secret,
+    correlationId
+  }
 }
 ```
 
@@ -874,12 +941,16 @@ secret-sensitive run is labeled even when its final value is innocuous; labels a
 conservative and never treated as proof that an unlabeled arbitrary JS string is safe.
 
 Expected domain failures return an MCP tool result with `isError: true` and structured
-`{ code, message, retryable, details?, correlationId }`. v0 reserves at least:
+`{ code, message, retryable, details?, correlationId }`; the enclosing result is still
+`resultType: "complete"`. v0 reserves at least:
 `invalid_request`, `account_ambiguous`, `authentication_required`,
-`subscription_mismatch`, `route_denied`, `capability_denied`, `session_busy`,
-`session_evicted`, `execution_timeout`, `worker_crashed`, `result_too_large`, and
-`upstream_error`. JSON-RPC errors are reserved for malformed protocol messages and server
-failures outside the tool's domain contract.
+`subscription_mismatch`, `route_denied`, `capability_denied`, `context_busy`,
+`context_evicted`, `approval_declined`, `execution_timeout`, `worker_crashed`,
+`result_too_large`, and `upstream_error`.
+
+`azure_apply` alone may first return `resultType: "input_required"` (§6.5). JSON-RPC errors
+are reserved for malformed protocol messages, unsupported protocol versions, missing
+required per-request capabilities, and server failures outside the tool's domain contract.
 
 ---
 
@@ -940,10 +1011,10 @@ matched to a reviewed route (§5.5), classified, and only then signed. Responsib
 - **Rate-limit accounting** — surface `x-ms-ratelimit-remaining-subscription-reads` in the
   call log. A naive `Promise.all` across many subscriptions can exhaust service budgets
   while ordinary latency still looks healthy.
-- **Concurrency cap** — default 8 in-flight requests per session, adjustable only up to a
+- **Concurrency cap** — default 8 in-flight requests per context, adjustable only up to a
   server ceiling. Prevents 429 storms and bounds host memory.
 - **Long-running operations** — `Azure-AsyncOperation` / `Location` polling, only reachable
-  in a session opened with `armTier: 'write'`.
+  in a context opened with `armTier: 'write'`.
 
 ### 8.1 Request-target safety
 
@@ -966,9 +1037,14 @@ body limits apply before logging or ref conversion.
 ### 8.2 Call log
 
 Every request records: correlation ID, cloud, subscription and provenance, tenant,
-identity, session capability, method, redacted path template, resolved RBAC action, policy
+identity, context capability, method, redacted path template, resolved RBAC action, policy
 bundle hash, API version and source, decision (allow/deny + reason), HTTP status, duration,
 retry count, and remaining rate limit.
+
+When a request supplies valid MCP `traceparent`, `tracestate`, or `baggage` metadata, create
+child spans and attach the trace ID to the audit record. Treat every value as
+attacker-controlled observability data; it never selects an identity, context, subscription,
+policy, or route.
 
 Because subscription resolution happens here and is recorded per request, the invisibility
 that makes `az`'s ambient state dangerous does not reproduce: every call states which
@@ -1064,7 +1140,7 @@ data-plane grant is enabled:
 
 Secret **values returned into the isolate must never enter ref previews or the call log** —
 log the identifier and a hash, never the value. A value may exist in the read-capable
-isolate or a session-scoped ref labeled `secret`, but is never persisted beyond session
+isolate or a context-scoped ref labeled `secret`, but is never persisted beyond context
 close and is never sampled into a structural summary.
 
 ### 9.4 Azure SQL — deliberately out of scope for v1
@@ -1112,18 +1188,21 @@ unrecognized method/path/version is denied — the same fail-closed rule as §5.
 | Stale/expired cached tokens | Explicit Azure CLI credential broker; targeted `az login` instruction on failure (§4.7) |
 | Azure CLI profile race | Never invoke profile-mutating commands; child cloud and subscription are explicit (§4.7) |
 | Azure CLI token-cache contention | Process-wide serialization of broker subprocesses; ARM traffic remains concurrent (§4.7) |
-| User runs `az login` during a session | Pin principal/client claims; evict on refresh mismatch (§4.7) |
+| User runs `az login` during a context | Pin principal/client claims; evict on refresh mismatch (§4.7) |
 | Credential subprocess leaks a token | Treat stdout as secret; parse, zero, and exclude it from every error/log path |
 | Reader grants no blob/KV data access | Additive built-in roles documented in §5.6; denial message names the missing role |
 | KQL result explosion | Byte + row caps into the ref store; no query rewriting (§9.1) |
-| Automatic secret leakage through request logs or ref previews | Content labels + shape-only secret previews; JS output remains an explicit `read`-session exposure (§4.2, §9.3) |
+| Automatic secret leakage through request logs or ref previews | Content labels + shape-only secret previews; JS output remains an explicit `read`-context exposure (§4.2, §9.3) |
 | Unknown or ambiguous route | Fail closed in every tier, including `write` (§5.5) |
 | Redirect/continuation credential theft | Exact-origin allowlists and revalidation for every service-provided URL (§8.1) |
 | Wrong cloud assumed | Cloud is never defaulted; an omitted cloud is an error, not a fallback |
 | Wrong subscription assumed | Immutable per-cloud binding, live validation, and provenance in every request (§2.2.1) |
-| Late principal or capability switch | Resolved principal mapping and capabilities are fixed per isolate/session (§6.3) |
-| Running under Owner without noticing | Identity + incomplete-role warning disclosed at session open (§4.3) |
-| Session evicted mid-workflow | Explicit eviction notice in the next call's result |
+| Protocol state leaks across calls | Require modern per-request metadata; treat stdio as a multiplexed transport (§6.1) |
+| Context handle is reused by another conversation | v0 treats it honestly as a bearer: fixed authority, bounded lifetime, explicit close; remote mode must bind an authenticated caller (§6.3) |
+| Forged or replayed apply retry | AEAD-bound MRTR state plus a server-side one-shot nonce ledger (§6.5) |
+| Late principal or capability switch | Resolved principal mapping and capabilities are fixed per isolate/context (§6.3) |
+| Running under Owner without noticing | Identity + incomplete-role warning disclosed at context open (§4.3) |
+| Context evicted mid-workflow | Explicit eviction notice in the next call's result |
 | V8 fatal OOM takes down runtime | Isolate runs in a replaceable worker process (§3.2) |
 | Model calls apply without human review | Elicitation-bound approval or separate local operator command; hints are insufficient (§6.5) |
 | Partial mutation apply | Ordered one-shot replay, stop-on-failure, exact partial ledger (§6.5) |
@@ -1134,9 +1213,11 @@ unrecognized method/path/version is denied — the same fail-closed rule as §5.
 
 **v0 — prove the core**
 
-- Local stdio MCP server targeting protocol revision `2025-11-25`.
-- `azure_accounts`, `azure_session_open`, `azure_session_close`, and `azure_run` with
-  persistent isolates; no refs yet.
+- Modern-only local stdio MCP server targeting protocol revision `2026-07-28`, with
+  `server/discover`, per-request metadata validation, deterministic cacheable `tools/list`,
+  and no `initialize` or protocol session.
+- `azure_accounts`, `azure_context_open`, `azure_context_close`, and `azure_run` with
+  explicit persistent execution contexts; no refs yet.
 - Reviewed `AzureCloud` and `AzureUSGovernment` manifests.
 - Per-cloud subscription binding from config plus unambiguous single-subscription
   auto-binding and live validation.
@@ -1157,14 +1238,23 @@ unrecognized method/path/version is denied — the same fail-closed rule as §5.
    parallel and asserts each request's origin, tenant, subscription, and audience.
 4. The integration test snapshots `config`, `azureProfile.json`, and `clouds.config` before
    and after. They remain byte-identical. Azure CLI's own token cache may change.
-5. A session cannot change identity, ARM tier, data-plane grants, binding, subscription
+5. A context cannot change identity, ARM tier, data-plane grants, binding, subscription
    allowlist, graph scope, or policy hash.
 6. Unknown hosts, absolute user URLs, redirects, unknown routes, and mismatched
    subscription validation are denied before signing.
-7. Infinite-loop, wall-timeout, and heap-pressure tests evict the affected session or
+7. Infinite-loop, wall-timeout, and heap-pressure tests evict the affected context or
    worker and leave the MCP front end responsive.
 8. A real inventory scenario returns a correct small result from a much larger ARM/ARG
    response without truncating JSON.
+9. The official MCP `2026-07-28` server conformance suite passes. Focused regression tests
+   additionally cover `server/discover`, required request `_meta`, `resultType`, JSON Schema
+   2020-12, deterministic `tools/list` caching fields, stdio cancellation, and rejection of
+   `initialize` with an actionable supported-version error.
+10. Interleaved calls from unrelated logical conversations prove that no ambient current
+    context, client capabilities, protocol version, or identity leaks across requests.
+11. The intended MCP host completes `server/discover`, `tools/list`, context open, and a
+    run using `2026-07-28`. If the host is still legacy-only, dual-era compatibility is a
+    separate explicit scope decision rather than hidden fallback behavior in the core.
 
 **v1 — usable**
 
@@ -1174,7 +1264,7 @@ unrecognized method/path/version is denied — the same fail-closed rule as §5.
 - Full reviewed route-policy generator, schema search index, and coverage report
 - L1 reviewed-route API and auto-paging
 - `identity: 'reader'` SP support (certificate credential) + setup-guidance emission
-- Privilege disclosure at session open (§4.3)
+- Privilege disclosure at context open (§4.3)
 - `read` tier; explicit Log Analytics and Key Vault grants (§9.3)
 
 **v2 — mutations and hardening**
@@ -1195,7 +1285,7 @@ unrecognized method/path/version is denied — the same fail-closed rule as §5.
 
 ## 12. Open Questions
 
-Cache ownership, session/identity mixing, API-version drift, KQL size limits,
+Cache ownership, context/identity mixing, API-version drift, KQL size limits,
 cross-workspace scope, and data-plane fail-closed behavior are resolved above. What remains:
 
 ### 12.1 Route-policy coverage
@@ -1229,10 +1319,10 @@ guessing DNS suffixes from public or Government cloud.
 
 ### 12.4 Worker containment
 
-Is one worker process per session acceptable, or should several isolates share a worker
+Is one worker process per context acceptable, or should several isolates share a worker
 with an OS RSS ceiling? Measure V8 startup snapshot size, steady-state isolate RSS, and
 worker restart latency before choosing. Crash containment is required; one-process-per-
-session is not assumed without measurement.
+context is not assumed without measurement.
 
 ### 12.5 Direct authentication backend
 
@@ -1248,8 +1338,17 @@ formats is not that API.
 - [Azure CLI `az account get-access-token`](https://learn.microsoft.com/cli/azure/account#az-account-get-access-token)
 - [Azure CLI 2.89 agent-session handling](https://github.com/Azure/azure-cli/blob/azure-cli-2.89.0/src/azure-cli-core/azure/cli/core/auth/agentic_session.py)
 - [Azure CLI 2.89 user credential flow](https://github.com/Azure/azure-cli/blob/azure-cli-2.89.0/src/azure-cli-core/azure/cli/core/auth/msal_credentials.py)
-- [MCP 2025-11-25 tool schema and annotations](https://modelcontextprotocol.io/specification/2025-11-25/schema)
-- [MCP elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation)
+- [Official Rust MCP SDK releases](https://github.com/modelcontextprotocol/rust-sdk/releases)
+- [MCP 2026-07-28 base protocol and statelessness](https://modelcontextprotocol.io/specification/2026-07-28/basic)
+- [MCP versioning and compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)
+- [MCP server discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)
+- [MCP tools and explicit state handles](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
+- [MCP multi round-trip requests](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr)
+- [MCP elicitation](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation)
+- [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http)
+- [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
+- [MCP caching](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching)
+- [MCP deprecated features](https://modelcontextprotocol.io/specification/2026-07-28/deprecated)
 - [Azure provider-operations metadata](https://learn.microsoft.com/rest/api/authorization/provider-operations-metadata/list)
 - [Azure resource-provider types and API versions](https://learn.microsoft.com/azure/azure-resource-manager/management/resource-providers-and-types)
 - [Azure Resource Graph scope behavior](https://learn.microsoft.com/azure/governance/resource-graph/samples/starter)
