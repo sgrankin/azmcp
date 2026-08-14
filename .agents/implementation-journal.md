@@ -19,7 +19,8 @@
   `azure_accounts` requests over real stdio using a synthetic temporary home, the standard
   config/profile/state paths, and an explicitly injected fake Azure executable.
 - The core test suite uses only synthetic profiles, fake executables, and loopback HTTP.
-  The current workspace gate is 151 tests plus formatting and warning-free clippy.
+  The latest isolated phase gate is 162 tests plus formatting and warning-free clippy;
+  the final combined-stack gate remains pending.
 - The six modern tools are now the exact advertised catalog. A modern-protocol lifecycle test
   covers accounts, context open, persistent run, close, and structured domain failure.
 - `azure_schema_search` and `azure_schema_get` are implemented as context-scoped,
@@ -43,6 +44,16 @@
   malformed, stale, unjoined, purpose-confused, referenced, or non-canonical schemas.
   Its policy hash is a verified SHA-256 digest of canonical content, and every entry exposes
   a closed, cloud-specific argument schema under its actual execution surface.
+- The bounded-paging checkpoint is change `qzvlxprn`. It follows only upstream-provided
+  `nextLink` values from a reviewed initial GET, revalidates exact origin, API version,
+  route identity, subscription policy, signing, and retries on every page, and enforces
+  page, item, aggregate-byte, continuation-length, cycle, and elapsed-time limits before
+  returning any data. No caller-supplied continuation URL or paging helper is advertised.
+- The synthetic observability E2E checkpoint is changes `rtsvotzk` and `qmwspokw`.
+  A real modern MCP duplex service and worker subprocess execute concurrent metrics and
+  Logs Query calls against loopback-only clients with a synthetic profile and credentials.
+  A response barrier proves both host calls overlap; the test also checks audiences,
+  returned and durable audit redaction, retained context state, close, and eviction.
 - One current-thread V8 worker process is retained per context. Subprocess tests cover
   persistence, hard close and MCP cancellation, abort poisoning, timeout poisoning, heap/RSS
   pressure, TTL disposal, and an eight-call concurrency bound under `Promise.all`.
@@ -124,8 +135,10 @@
   metadata, and Resource Graph until real ARM scenario rows have golden tests.
 - Portable process-tree termination for timed-out credential subprocess descendants remains
   unresolved; the direct child is killed and pipe readers are bounded/aborted.
-- Generic paging, exact-origin continuation handling, large-result references, and automatic
-  first-real-scenario ARM route generation from pinned upstream sources are not implemented.
+- Bounded exact-origin continuation handling exists in the core HTTP layer, but no current
+  advertised helper consumes a reviewed `nextLink` route. Large-result references and the
+  offline upstream importer are implemented in isolated workspaces and remain unintegrated
+  until their adversarial lifecycle and provenance regressions pass.
 - Helper argument and request-body schemas are checked in and closed, while response bodies
   remain `metadataOnly`. Generic `az.request` still exposes only the Commercial/Government
   subscription and provider metadata routes; the current `azmcp-routegen` canonicalizes and
