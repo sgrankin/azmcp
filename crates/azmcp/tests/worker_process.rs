@@ -178,8 +178,12 @@ async fn subprocess_streams_a_json_array_larger_than_32_mib_in_bounded_frames() 
             let mut stats = stats.lock().await;
             stats.maximum_frame_bytes = stats.maximum_frame_bytes.max(frame_bytes);
             match phase {
-                ArtifactWriteJsonStreamArguments::Begin { name } => {
+                ArtifactWriteJsonStreamArguments::Begin { name, compression } => {
                     assert_eq!(name, "large-rows.json");
+                    assert_eq!(
+                        compression,
+                        azmcp::worker::ArtifactWriteCompression::Identity
+                    );
                     HostCallResult::success(&request, json!({"streamId": "stream_large_rows"}))
                 }
                 ArtifactWriteJsonStreamArguments::Append {
@@ -268,8 +272,9 @@ async fn subprocess_streams_json_lines_as_normalized_values() {
             .expect("closed stream phase");
             phase.validate().expect("bounded stream phase");
             match phase {
-                ArtifactWriteJsonStreamArguments::Begin { name } => {
-                    assert_eq!(name, "rows.jsonl");
+                ArtifactWriteJsonStreamArguments::Begin { name, compression } => {
+                    assert_eq!(name, "rows.jsonl.lz4");
+                    assert_eq!(compression, azmcp::worker::ArtifactWriteCompression::Lz4);
                     HostCallResult::success(&request, json!({"streamId": "stream_json_lines"}))
                 }
                 ArtifactWriteJsonStreamArguments::Append {
@@ -302,7 +307,8 @@ async fn subprocess_streams_json_lines_as_normalized_values() {
     let result = worker
         .execute_with_host_handler(
             r#"az.artifacts.writeJsonLines({
-                name: "rows.jsonl",
+                name: "rows.jsonl.lz4",
+                compression: "lz4",
                 values: (async function* () {
                     yield {index: 0, toJSON() { return {index: this.index}; }};
                     yield ["nested", true];

@@ -57,9 +57,9 @@ pub const MAX_HOST_CALL_FRAME_BYTES: usize = MAX_INPUT_BYTES;
 /// sequence number, and any escaping differences between V8 and serde_json.
 pub const MAX_ARTIFACT_STREAM_CHUNK_BYTES: usize = 384 * 1024;
 /// Bound one streamed artifact below the worker's global per-execution call cap.
-/// This permits more than 32 MiB of JSON while retaining headroom for other
+/// This permits a 64 MiB logical artifact while retaining headroom for other
 /// calls and for begin, finish, or best-effort abort.
-pub const MAX_ARTIFACT_STREAM_CHUNKS: u16 = 128;
+pub const MAX_ARTIFACT_STREAM_CHUNKS: u16 = 192;
 pub const MAX_ARTIFACT_STREAM_ID_BYTES: usize = 128;
 /// Maximum resident set size for one isolated worker process.
 ///
@@ -397,7 +397,10 @@ pub struct HostCallRequest {
 #[serde(tag = "phase", deny_unknown_fields)]
 pub enum ArtifactWriteJsonStreamArguments {
     #[serde(rename = "begin")]
-    Begin { name: String },
+    Begin {
+        name: String,
+        compression: ArtifactWriteCompression,
+    },
     #[serde(rename = "append")]
     Append {
         #[serde(rename = "streamId")]
@@ -417,6 +420,14 @@ pub enum ArtifactWriteJsonStreamArguments {
         #[serde(rename = "streamId")]
         stream_id: String,
     },
+}
+
+/// Stored encoding requested by a JavaScript streamed-artifact helper.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactWriteCompression {
+    Identity,
+    Lz4,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -440,7 +451,7 @@ pub struct ArtifactWriteJsonStreamAbortResult {
 impl ArtifactWriteJsonStreamArguments {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
-            Self::Begin { name } => {
+            Self::Begin { name, .. } => {
                 if name.is_empty() {
                     return Err("artifact stream name is empty");
                 }
@@ -1989,7 +2000,7 @@ const WORKER_BOOTSTRAP: &str = r#"
   const asyncIteratorSymbol = Symbol.asyncIterator;
   const iteratorSymbol = Symbol.iterator;
   const ARTIFACT_STREAM_CHUNK_BYTES = 384 * 1024;
-  const ARTIFACT_STREAM_CHUNKS = 128;
+  const ARTIFACT_STREAM_CHUNKS = 192;
   const ARTIFACT_ARRAY_METHOD = "az.artifacts.writeJsonArray";
   const ARTIFACT_LINES_METHOD = "az.artifacts.writeJsonLines";
   const utf8Length = (text) => {
@@ -2017,16 +2028,23 @@ const WORKER_BOOTSTRAP: &str = r#"
   const hasOwn = (value, key) => apply(hasOwnProperty, value, [key]);
   const writeJsonStream = async (helperName, method, arguments) => {
     if (arguments === null || typeof arguments !== "object" || arrayIsArray(arguments)) {
-      throw new TypeError(`${helperName} expects {name, values}`);
+      throw new TypeError(`${helperName} expects {name, values, compression?}`);
     }
     const keys = objectKeys(arguments);
-    if (keys.length !== 2 || !hasOwn(arguments, "name") || !hasOwn(arguments, "values")) {
-      throw new TypeError(`${helperName} expects only name and values`);
+    if ((keys.length !== 2 && keys.length !== 3)
+      || !hasOwn(arguments, "name")
+      || !hasOwn(arguments, "values")
+      || (keys.length === 3 && !hasOwn(arguments, "compression"))) {
+      throw new TypeError(`${helperName} expects only name, values, and optional compression`);
     }
     const name = arguments.name;
     const values = arguments.values;
+    const compression = hasOwn(arguments, "compression") ? arguments.compression : "identity";
     if (typeof name !== "string" || name.length === 0) {
       throw new TypeError(`${helperName} name must be a non-empty string`);
+    }
+    if (compression !== "identity" && compression !== "lz4") {
+      throw new TypeError(`${helperName} compression must be identity or lz4`);
     }
     const iterable = values !== null
       && (typeof values === "object" || typeof values === "function")
@@ -2038,7 +2056,7 @@ const WORKER_BOOTSTRAP: &str = r#"
 
     let streamId = null;
     try {
-      const opened = await hostCall(method, {phase: "begin", name});
+      const opened = await hostCall(method, {phase: "begin", name, compression});
       const openedKeys = opened !== null && typeof opened === "object" && !arrayIsArray(opened)
         ? objectKeys(opened)
         : [];
@@ -2672,7 +2690,7 @@ mod tests {
         };
         let stream_id = "stream_0123456789abcdef";
         let valid_arguments = [
-            json!({"phase": "begin", "name": "rows.json"}),
+            json!({"phase": "begin", "name": "rows.json", "compression": "identity"}),
             json!({
                 "phase": "append",
                 "streamId": stream_id,
@@ -2701,7 +2719,8 @@ mod tests {
         }
 
         let invalid_arguments = [
-            json!({"phase": "begin", "name": "rows.json", "extra": true}),
+            json!({"phase": "begin", "name": "rows.json", "compression": "identity", "extra": true}),
+            json!({"phase": "begin", "name": "rows.json", "compression": "zstd"}),
             json!({
                 "phase": "append",
                 "streamId": stream_id,
@@ -3041,8 +3060,9 @@ mod tests {
                         .expect("closed stream phase");
                     phase.validate().expect("valid stream phase");
                     let value = match phase {
-                        ArtifactWriteJsonStreamArguments::Begin { name } => {
+                        ArtifactWriteJsonStreamArguments::Begin { name, compression } => {
                             assert_eq!(name, "rows.json");
+                            assert_eq!(compression, ArtifactWriteCompression::Identity);
                             json!({"streamId": "stream_13"})
                         }
                         ArtifactWriteJsonStreamArguments::Append { sequence, values, .. } => {
@@ -3086,7 +3106,8 @@ mod tests {
         let mut runtime = WorkerRuntime::new_with_host_bridge(bridge.clone()).unwrap();
         let mut execution = Box::pin(runtime.execute(
             r#"az.artifacts.writeJsonLines({
-                name: "rows.jsonl",
+                name: "rows.jsonl.lz4",
+                compression: "lz4",
                 values: [
                     {toJSON() { return {normalized: true}; }},
                     "text",
@@ -3108,8 +3129,9 @@ mod tests {
                         .expect("closed stream phase");
                     phase.validate().expect("valid stream phase");
                     let value = match phase {
-                        ArtifactWriteJsonStreamArguments::Begin { name } => {
-                            assert_eq!(name, "rows.jsonl");
+                        ArtifactWriteJsonStreamArguments::Begin { name, compression } => {
+                            assert_eq!(name, "rows.jsonl.lz4");
+                            assert_eq!(compression, ArtifactWriteCompression::Lz4);
                             json!({"streamId": "stream_16"})
                         }
                         ArtifactWriteJsonStreamArguments::Append { sequence, values, .. } => {

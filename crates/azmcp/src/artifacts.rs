@@ -11,7 +11,7 @@ use std::{
     fmt,
     fs::{self, File, OpenOptions},
     future::Future,
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -28,7 +28,7 @@ pub const DEFAULT_MAX_ARTIFACT_BYTES: usize = 480 * 1024;
 /// Maximum uncompressed bytes in one streamed artifact, including framing.
 pub const DEFAULT_MAX_STREAM_LOGICAL_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum stored bytes in one streamed artifact, including compression framing.
-pub const DEFAULT_MAX_STREAM_STORED_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_STREAM_STORED_BYTES: usize = 65 * 1024 * 1024;
 /// Maximum encoded bytes accepted in one append operation.
 pub const MAX_STREAM_APPEND_BYTES: usize = 400 * 1024;
 /// Maximum artifacts retained in one context namespace.
@@ -44,6 +44,7 @@ const NAMESPACE_RANDOM_BYTES: usize = 32;
 const NAMESPACE_PREFIX: &str = "ctx_";
 const MAX_FILE_NAME_BYTES: usize = 128;
 const JSON_MEDIA_TYPE: &str = "application/json";
+const JSON_LINES_MEDIA_TYPE: &str = "application/x-ndjson";
 const CUSTOMER_DATA_SENSITIVITY: &str = "customerData";
 const ROOT_LOCK_FILE: &str = ".azmcp.lock";
 const ROOT_LOCK_CONTENT: &[u8] = b"azmcp-artifacts-v1\n";
@@ -73,6 +74,15 @@ impl ArtifactCompression {
 pub enum ArtifactStreamFormat {
     JsonArray,
     JsonLines,
+}
+
+impl ArtifactStreamFormat {
+    const fn media_type(self) -> &'static str {
+        match self {
+            Self::JsonArray => JSON_MEDIA_TYPE,
+            Self::JsonLines => JSON_LINES_MEDIA_TYPE,
+        }
+    }
 }
 
 /// An opaque, context-bound handle for an incomplete streamed artifact.
@@ -370,7 +380,7 @@ pub struct ArtifactReceipt {
 
 impl ArtifactReceipt {
     pub(crate) fn new(path: PathBuf, bytes: usize, sha256: String) -> Self {
-        Self::new_with_metadata(path, bytes, sha256, bytes, None)
+        Self::new_with_metadata(path, bytes, sha256, bytes, None, JSON_MEDIA_TYPE)
     }
 
     fn new_with_metadata(
@@ -379,6 +389,7 @@ impl ArtifactReceipt {
         sha256: String,
         logical_bytes: usize,
         content_encoding: Option<&'static str>,
+        media_type: &'static str,
     ) -> Self {
         Self {
             path,
@@ -386,7 +397,7 @@ impl ArtifactReceipt {
             sha256,
             logical_bytes,
             content_encoding,
-            media_type: JSON_MEDIA_TYPE,
+            media_type,
             sensitivity: CUSTOMER_DATA_SENSITIVITY,
         }
     }
@@ -741,22 +752,22 @@ impl FileArtifactStore {
             reject_existing_destination(&destination)?;
             let temporary_path = unique_temporary_path(&namespace_path)?;
             let file = open_private_new(&temporary_path)?;
-            let writer = match compression {
-                ArtifactCompression::Identity => {
-                    let mut file = file;
-                    if matches!(format, ArtifactStreamFormat::JsonArray)
-                        && file.write_all(b"[").and_then(|_| file.sync_all()).is_err()
-                    {
-                        drop(file);
-                        let _ = fs::remove_file(&temporary_path);
-                        return Err(ArtifactError::Unavailable);
-                    }
-                    StreamWriter::Identity(file)
-                }
+            let mut writer = match compression {
+                ArtifactCompression::Identity => StreamWriter::Identity(file),
                 ArtifactCompression::Lz4Frame => {
                     StreamWriter::Lz4Frame(FrameEncoder::with_frame_info(stream_frame_info(), file))
                 }
             };
+            if matches!(format, ArtifactStreamFormat::JsonArray)
+                && writer
+                    .write_all(b"[")
+                    .and_then(|_| writer.flush_and_sync())
+                    .is_err()
+            {
+                drop(writer);
+                let _ = fs::remove_file(&temporary_path);
+                return Err(ArtifactError::Unavailable);
+            }
             let identity = match stream_writer_identity(&writer) {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -949,6 +960,7 @@ impl FileArtifactStore {
             file_name,
             staging_path,
             identity,
+            format,
             compression,
             writer,
             ..
@@ -995,18 +1007,11 @@ impl FileArtifactStore {
                 ArtifactError::RootCapacity,
             );
         }
-        let bytes = match fs::read(&staging_path) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return finish_stream_error(
-                    &mut state,
-                    staging_path,
-                    identity,
-                    ArtifactError::Unavailable,
-                );
-            }
+        let (hashed_bytes, sha256) = match hash_exact_file(&staging_path, identity) {
+            Ok(result) => result,
+            Err(error) => return finish_stream_error(&mut state, staging_path, identity, error),
         };
-        if bytes.len() != stored_bytes {
+        if hashed_bytes != stored_bytes {
             return finish_stream_error(
                 &mut state,
                 staging_path,
@@ -1021,9 +1026,10 @@ impl FileArtifactStore {
         let receipt = ArtifactReceipt::new_with_metadata(
             destination.clone(),
             stored_bytes,
-            sha256_hex(&bytes),
+            sha256,
             logical_bytes,
             compression.content_encoding(),
+            format.media_type(),
         );
         state.reservations.insert(
             destination,
@@ -1545,7 +1551,7 @@ fn stream_frame_info() -> FrameInfo {
         .block_size(BlockSize::Max256KB)
         .block_mode(BlockMode::Independent)
         .block_checksums(false)
-        .content_checksum(false)
+        .content_checksum(true)
 }
 
 fn stream_writer_identity(writer: &StreamWriter) -> Result<FileIdentity, ArtifactError> {
@@ -2002,20 +2008,41 @@ fn file_identity_if_regular(path: &Path) -> Result<Option<FileIdentity>, Artifac
     Ok(Some(file_identity(&metadata)?))
 }
 
-fn require_exact_file(path: &Path, identity: FileIdentity) -> Result<(), ArtifactError> {
-    if file_identity_if_regular(path)? != Some(identity) {
+fn require_exact_artifact(path: &Path, stage: &ArtifactStage) -> Result<(), ArtifactError> {
+    let (bytes, sha256) = hash_exact_file(path, stage.identity)?;
+    if bytes != stage.receipt.bytes || sha256 != stage.receipt.sha256 {
         return Err(ArtifactError::ReceiptMismatch);
     }
     Ok(())
 }
 
-fn require_exact_artifact(path: &Path, stage: &ArtifactStage) -> Result<(), ArtifactError> {
-    require_exact_file(path, stage.identity)?;
-    let bytes = fs::read(path).map_err(|_| ArtifactError::Unavailable)?;
-    if bytes.len() != stage.receipt.bytes || sha256_hex(&bytes) != stage.receipt.sha256 {
+fn hash_exact_file(path: &Path, identity: FileIdentity) -> Result<(usize, String), ArtifactError> {
+    let mut file = open_private_read(path)?;
+    let metadata = file.metadata().map_err(|_| ArtifactError::Unavailable)?;
+    validate_private_owned_file(&metadata, ArtifactError::UnsafeDestination)?;
+    if file_identity(&metadata)? != identity {
         return Err(ArtifactError::ReceiptMismatch);
     }
-    Ok(())
+
+    let mut digest = Sha256::new();
+    let mut bytes = 0_usize;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| ArtifactError::Unavailable)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes.checked_add(read).ok_or(ArtifactError::RootCapacity)?;
+        digest.update(&buffer[..read]);
+    }
+    if file_identity(&file.metadata().map_err(|_| ArtifactError::Unavailable)?)? != identity
+        || file_identity_if_regular(path)? != Some(identity)
+    {
+        return Err(ArtifactError::ReceiptMismatch);
+    }
+    Ok((bytes, hex_digest(digest.finalize())))
 }
 
 fn remove_exact_file(path: &Path, identity: FileIdentity) -> Result<(), ArtifactError> {
@@ -2211,7 +2238,11 @@ fn random_name(prefix: &str) -> Result<String, ArtifactError> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
+    hex_digest(Sha256::digest(bytes))
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    let digest = digest.as_ref();
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write as _;
@@ -2286,6 +2317,22 @@ fn open_private_new(path: &Path) -> Result<File, ArtifactError> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|_| ArtifactError::Unavailable)
+}
+
+#[cfg(unix)]
+fn open_private_read(path: &Path) -> Result<File, ArtifactError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| ArtifactError::Unavailable)
+}
+
+#[cfg(not(unix))]
+fn open_private_read(_path: &Path) -> Result<File, ArtifactError> {
+    Err(ArtifactError::UnsupportedPlatform)
 }
 
 #[cfg(not(unix))]
@@ -3153,6 +3200,7 @@ mod tests {
         );
         assert_eq!(array_receipt.logical_bytes(), array_receipt.bytes());
         assert_eq!(array_receipt.content_encoding(), None);
+        assert_eq!(array_receipt.media_type(), JSON_MEDIA_TYPE);
 
         let lines_namespace = store.allocate_namespace().unwrap();
         let lines_stream = store
@@ -3192,6 +3240,7 @@ mod tests {
         );
         assert_eq!(lines_receipt.logical_bytes(), lines_receipt.bytes());
         assert_eq!(lines_receipt.content_encoding(), None);
+        assert_eq!(lines_receipt.media_type(), JSON_LINES_MEDIA_TYPE);
     }
 
     #[tokio::test]
@@ -3235,6 +3284,14 @@ mod tests {
         assert_eq!(&bytes[..4], &[0x04, 0x22, 0x4d, 0x18]);
         assert_eq!(receipt.bytes(), bytes.len());
         assert_eq!(receipt.sha256(), sha256_hex(&bytes));
+        assert_eq!(receipt.media_type(), JSON_MEDIA_TYPE);
+        let mut decoded = Vec::new();
+        lz4_flex::frame::FrameDecoder::new(bytes.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded.first(), Some(&b'['));
+        assert_eq!(decoded.last(), Some(&b'\n'));
+        assert!(DEFAULT_MAX_STREAM_STORED_BYTES > DEFAULT_MAX_STREAM_LOGICAL_BYTES);
         assert_eq!(
             serde_json::to_value(&receipt).unwrap()["contentEncoding"],
             json!("lz4")
