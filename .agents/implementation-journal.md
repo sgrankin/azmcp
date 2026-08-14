@@ -2,8 +2,8 @@
 
 ## Current plan
 
-1. Build the v1 reviewed-route generator and broaden the compact offline schema index.
-2. Add bounded paging, retries, result caps, and large-result references.
+1. Broaden `az.request` from pinned Azure specifications and provider-operation data.
+2. Add bounded paging and large-result references; keep existing result caps and retries.
 3. Preserve the synthetic-only local test boundary and run the complete modern MCP gate.
 4. Run authenticated Commercial/Government acceptance only in a separately authorized
    non-production environment.
@@ -19,7 +19,7 @@
   `azure_accounts` requests over real stdio using a synthetic temporary home, the standard
   config/profile/state paths, and an explicitly injected fake Azure executable.
 - The core test suite uses only synthetic profiles, fake executables, and loopback HTTP.
-  The current workspace gate is 133 tests plus formatting and warning-free clippy.
+  The current workspace gate is 149 tests plus formatting and warning-free clippy.
 - The six modern tools are now the exact advertised catalog. A modern-protocol lifecycle test
   covers accounts, context open, persistent run, close, and structured domain failure.
 - `azure_schema_search` and `azure_schema_get` are implemented as context-scoped,
@@ -34,6 +34,13 @@
   Government workspace queries with exact data-plane audiences, explicit context grants,
   bounded table responses, and redacted audit records. The integrated observability gate is
   133 tests plus formatting and warning-free clippy.
+- The retry checkpoint is change `qwpoksmw`. It retries only reviewed read routes on
+  HTTP 429 and 5xx responses, with hard attempt, elapsed-time, and backoff ceilings.
+  Retry counts are preserved in both helper and context-validation audit records.
+- The reviewed-manifest checkpoint is change `wxtpqzxx`. The checked-in canonical
+  fixture is now the runtime source for all 16 executable routes and all 10 discoverable
+  Commercial/Government request, metrics, and Logs Query entries. The checker rejects
+  malformed, stale, unjoined, purpose-confused, referenced, or non-canonical schemas.
 - One current-thread V8 worker process is retained per context. Subprocess tests cover
   persistence, hard close and MCP cancellation, abort poisoning, timeout poisoning, heap/RSS
   pressure, TTL disposal, and an eight-call concurrency bound under `Promise.all`.
@@ -73,10 +80,11 @@
 
 - v0 is modern-only. Legacy MCP is deferred until a concrete host requirement justifies a
   second lifecycle.
-- Schema discovery searches only executable `RoutePurpose::Request` rows and leases the
-  caller's context without starting a worker, acquiring a credential, or making an HTTP
-  request. Search results report non-executable rows when the context tier or data-plane
-  grant is insufficient.
+- Schema discovery covers `az.request`, `az.metrics.single`, `az.metrics.batch`, and
+  `az.logs.query` under their exact execution surfaces. It leases the caller's context
+  without starting a worker, acquiring a credential, or making an HTTP request. Search
+  results report non-executable rows when the context tier, data-plane grant, or scope is
+  insufficient.
 - The first metrics surface will expose explicit `az.metrics.single` and
   `az.metrics.batch` helpers. Batch requires an explicit reviewed region, groups at most
   50 resources from one subscription/region/resource type, and uses the regional Monitor
@@ -114,11 +122,12 @@
   metadata, and Resource Graph until real ARM scenario rows have golden tests.
 - Portable process-tree termination for timed-out credential subprocess descendants remains
   unresolved; the direct child is killed and pipe readers are bounded/aborted.
-- Generic paging, exact-origin continuation handling, idempotent retry/backoff, and automatic
-  first-real-scenario ARM route generation are not implemented in this v0 checkpoint.
-- Schema bodies remain `metadataOnly` until pinned, generated fixtures are checked in.
-  The current index covers only the four existing Commercial/Government subscription and
-  provider metadata routes; broad API discovery depends on the v1 route generator.
+- Generic paging, exact-origin continuation handling, large-result references, and automatic
+  first-real-scenario ARM route generation from pinned upstream sources are not implemented.
+- Helper argument and request-body schemas are checked in and closed, while response bodies
+  remain `metadataOnly`. Generic `az.request` still exposes only the Commercial/Government
+  subscription and provider metadata routes; the current `azmcp-routegen` canonicalizes and
+  validates the reviewed fixture but does not yet ingest the Azure REST specification corpus.
 - The RSS implementation currently targets macOS and Linux through `sysinfo`; other targets
   must add an equivalent OS process sampler before relying on the documented ceiling.
 - The local Codex repository contains a pinned official MCP client-conformance driver, not an
