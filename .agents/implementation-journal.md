@@ -19,7 +19,7 @@
   `azure_accounts` requests over real stdio using a synthetic temporary home, the standard
   config/profile/state paths, and an explicitly injected fake Azure executable.
 - The core test suite uses only synthetic profiles, fake executables, and loopback HTTP.
-  The current workspace gate is 149 tests plus formatting and warning-free clippy.
+  The current workspace gate is 151 tests plus formatting and warning-free clippy.
 - The six modern tools are now the exact advertised catalog. A modern-protocol lifecycle test
   covers accounts, context open, persistent run, close, and structured domain failure.
 - `azure_schema_search` and `azure_schema_get` are implemented as context-scoped,
@@ -41,6 +41,8 @@
   fixture is now the runtime source for all 16 executable routes and all 10 discoverable
   Commercial/Government request, metrics, and Logs Query entries. The checker rejects
   malformed, stale, unjoined, purpose-confused, referenced, or non-canonical schemas.
+  Its policy hash is a verified SHA-256 digest of canonical content, and every entry exposes
+  a closed, cloud-specific argument schema under its actual execution surface.
 - One current-thread V8 worker process is retained per context. Subprocess tests cover
   persistence, hard close and MCP cancellation, abort poisoning, timeout poisoning, heap/RSS
   pressure, TTL disposal, and an eight-call concurrency bound under `Promise.all`.

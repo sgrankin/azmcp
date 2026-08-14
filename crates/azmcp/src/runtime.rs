@@ -39,7 +39,7 @@ pub async fn production_application() -> anyhow::Result<Application> {
     let validator = Arc::new(
         HttpBindingValidator::new(Arc::clone(&clients)).with_audit_sink(
             Arc::clone(&audit),
-            routes::V0_POLICY_VERSION,
+            routes::V0_POLICY_HASH,
             policy.version(),
         ),
     );
@@ -51,7 +51,7 @@ pub async fn production_application() -> anyhow::Result<Application> {
         Arc::new(worker),
         clients,
         schema_index,
-        routes::V0_POLICY_VERSION,
+        routes::V0_POLICY_HASH,
         policy.version(),
     )?
     .with_audit_sink(audit);

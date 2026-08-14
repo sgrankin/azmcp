@@ -945,7 +945,19 @@ mod tests {
         assert_eq!(found["schema"]["audience"], "https://management.azure.com/");
         assert_eq!(found["schema"]["dataPlane"], Value::Null);
         assert_eq!(found["schema"]["dataScope"], Value::Null);
-        assert_eq!(found["schema"]["argumentSchema"], Value::Null);
+        assert_eq!(
+            found["schema"]["argumentSchema"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            found["schema"]["argumentSchema"]["properties"]["method"]["const"],
+            "GET"
+        );
+        assert!(
+            found["schema"]["argumentSchema"]["properties"]
+                .get("headers")
+                .is_none()
+        );
 
         client
             .send(call_tool_request(

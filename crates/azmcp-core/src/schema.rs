@@ -405,11 +405,11 @@ fn validate_source(source: &SchemaSource) -> Result<(), SchemaError> {
     if source
         .argument_schema
         .as_ref()
-        .is_some_and(|schema| !valid_schema(schema))
+        .is_none_or(|schema| !valid_closed_object_schema(schema))
         || source
             .request_body_schema
             .as_ref()
-            .is_some_and(|schema| !valid_schema(schema))
+            .is_some_and(|schema| !valid_closed_object_schema(schema))
         || source
             .response_body_schema
             .as_ref()
@@ -441,9 +441,34 @@ fn valid_schema(schema: &Value) -> bool {
         && serde_json::to_vec(schema).is_ok_and(|json| json.len() <= MAX_SCHEMA_BYTES)
 }
 
+fn valid_closed_object_schema(schema: &Value) -> bool {
+    if !valid_schema(schema)
+        || schema.get("type").and_then(Value::as_str) != Some("object")
+        || schema.get("additionalProperties").and_then(Value::as_bool) != Some(false)
+    {
+        return false;
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(required) = schema.get("required").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut seen = BTreeSet::new();
+    required.iter().all(|name| {
+        name.as_str()
+            .is_some_and(|name| properties.contains_key(name) && seen.insert(name))
+    })
+}
+
 fn contains_ref(value: &Value) -> bool {
     match value {
-        Value::Object(values) => values.contains_key("$ref") || values.values().any(contains_ref),
+        Value::Object(values) => {
+            values
+                .keys()
+                .any(|key| matches!(key.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef"))
+                || values.values().any(contains_ref)
+        }
         Value::Array(values) => values.iter().any(contains_ref),
         _ => false,
     }
@@ -829,6 +854,28 @@ mod tests {
             json!(["cloud", "resourceId", "metricNames"])
         );
         assert_eq!(single_arguments["additionalProperties"], json!(false));
+        assert_eq!(
+            single_arguments["properties"]["cloud"]["enum"],
+            json!(["AzureCloud"])
+        );
+
+        let request = index
+            .get(
+                &inspect,
+                "AzureCloud.providers.get",
+                crate::routes::PROVIDERS_API_VERSION,
+            )
+            .expect("request details");
+        let request_arguments = request.argument_schema.expect("az.request arguments");
+        assert_eq!(request.execution_surface, "az.request");
+        assert_eq!(request_arguments["additionalProperties"], json!(false));
+        assert_eq!(request_arguments["properties"]["method"]["const"], "GET");
+        assert_eq!(
+            request_arguments["properties"]["apiVersion"]["const"],
+            "2021-04-01"
+        );
+        assert!(request_arguments["properties"].get("headers").is_none());
+        assert!(request_arguments["properties"].get("body").is_none());
 
         let batch = index
             .get(

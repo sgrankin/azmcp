@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "manifestId": "v1-observability-1",
   "policyVersion": "v1-observability-1",
-  "policyHash": "v1-observability-1",
+  "policyHash": "sha256:d3655b57f92a18efdfc375446425e9e8d6ade644c2036c333e2f276cbd45c8bf",
   "source": {
     "kind": "checked-in-reviewed-fixture",
     "revision": "d13b7291813c0a17ebcfa0a0eca5f3dcaf71eb48"
@@ -274,8 +274,7 @@
         "properties": {
           "cloud": {
             "enum": [
-              "AzureCloud",
-              "AzureUSGovernment"
+              "AzureCloud"
             ]
           },
           "query": {
@@ -361,8 +360,7 @@
           },
           "cloud": {
             "enum": [
-              "AzureCloud",
-              "AzureUSGovernment"
+              "AzureCloud"
             ]
           },
           "endTime": {
@@ -500,8 +498,7 @@
           },
           "cloud": {
             "enum": [
-              "AzureCloud",
-              "AzureUSGovernment"
+              "AzureCloud"
             ]
           },
           "filter": {
@@ -593,7 +590,41 @@
       "rbacAction": "Microsoft.Resources/subscriptions/providers/read",
       "armTier": "inspect",
       "dataPlaneGrant": null,
-      "argumentSchema": null,
+      "argumentSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "apiVersion": {
+            "const": "2021-04-01"
+          },
+          "cloud": {
+            "enum": [
+              "AzureCloud"
+            ]
+          },
+          "method": {
+            "const": "GET"
+          },
+          "path": {
+            "description": "Relative az.request path matching /providers/{namespace}; the host prepends the selected subscription.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          },
+          "subscription": {
+            "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cloud",
+          "method",
+          "path",
+          "apiVersion"
+        ],
+        "title": "az.request arguments for provider metadata",
+        "type": "object"
+      },
       "requestBodySchema": null,
       "responseBodySchema": null
     },
@@ -615,7 +646,38 @@
       "rbacAction": "Microsoft.Resources/subscriptions/read",
       "armTier": "inspect",
       "dataPlaneGrant": null,
-      "argumentSchema": null,
+      "argumentSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "apiVersion": {
+            "const": "2020-01-01"
+          },
+          "cloud": {
+            "enum": [
+              "AzureCloud"
+            ]
+          },
+          "method": {
+            "const": "GET"
+          },
+          "path": {
+            "const": "/"
+          },
+          "subscription": {
+            "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cloud",
+          "method",
+          "path",
+          "apiVersion"
+        ],
+        "title": "az.request arguments for subscription metadata",
+        "type": "object"
+      },
       "requestBodySchema": null,
       "responseBodySchema": null
     },
@@ -643,7 +705,6 @@
         "properties": {
           "cloud": {
             "enum": [
-              "AzureCloud",
               "AzureUSGovernment"
             ]
           },
@@ -730,7 +791,6 @@
           },
           "cloud": {
             "enum": [
-              "AzureCloud",
               "AzureUSGovernment"
             ]
           },
@@ -869,7 +929,6 @@
           },
           "cloud": {
             "enum": [
-              "AzureCloud",
               "AzureUSGovernment"
             ]
           },
@@ -962,7 +1021,41 @@
       "rbacAction": "Microsoft.Resources/subscriptions/providers/read",
       "armTier": "inspect",
       "dataPlaneGrant": null,
-      "argumentSchema": null,
+      "argumentSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "apiVersion": {
+            "const": "2021-04-01"
+          },
+          "cloud": {
+            "enum": [
+              "AzureUSGovernment"
+            ]
+          },
+          "method": {
+            "const": "GET"
+          },
+          "path": {
+            "description": "Relative az.request path matching /providers/{namespace}; the host prepends the selected subscription.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          },
+          "subscription": {
+            "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cloud",
+          "method",
+          "path",
+          "apiVersion"
+        ],
+        "title": "az.request arguments for provider metadata",
+        "type": "object"
+      },
       "requestBodySchema": null,
       "responseBodySchema": null
     },
@@ -984,7 +1077,38 @@
       "rbacAction": "Microsoft.Resources/subscriptions/read",
       "armTier": "inspect",
       "dataPlaneGrant": null,
-      "argumentSchema": null,
+      "argumentSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "apiVersion": {
+            "const": "2020-01-01"
+          },
+          "cloud": {
+            "enum": [
+              "AzureUSGovernment"
+            ]
+          },
+          "method": {
+            "const": "GET"
+          },
+          "path": {
+            "const": "/"
+          },
+          "subscription": {
+            "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cloud",
+          "method",
+          "path",
+          "apiVersion"
+        ],
+        "title": "az.request arguments for subscription metadata",
+        "type": "object"
+      },
       "requestBodySchema": null,
       "responseBodySchema": null
     }

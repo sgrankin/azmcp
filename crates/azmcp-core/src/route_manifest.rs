@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -30,7 +31,8 @@ pub const V1_MANIFEST_ID: &str = "v1-observability-1";
 /// The policy version emitted by this manifest.
 pub const V1_POLICY_VERSION: &str = "v1-observability-1";
 /// The policy hash recorded with the checked-in review.
-pub const V1_POLICY_HASH: &str = "v1-observability-1";
+pub const V1_POLICY_HASH: &str =
+    "sha256:d3655b57f92a18efdfc375446425e9e8d6ade644c2036c333e2f276cbd45c8bf";
 /// The source fixture is pinned to the review's parent revision.
 pub const V1_SOURCE_KIND: &str = "checked-in-reviewed-fixture";
 /// Revision from which this initial v1 route fixture was reviewed.
@@ -153,6 +155,8 @@ pub enum ManifestError {
     UnsupportedFormat,
     #[error("route manifest identity is not pinned")]
     UnpinnedIdentity,
+    #[error("route manifest policyHash does not match its canonical content; expected {expected}")]
+    PolicyHashMismatch { expected: String },
     #[error("route manifest source is not pinned")]
     UnpinnedSource,
     #[error("route manifest contains no routes or too many routes")]
@@ -195,7 +199,6 @@ pub fn validate_manifest(manifest: &RouteManifest) -> Result<(), ManifestError> 
     if manifest.format_version != V1_MANIFEST_FORMAT
         || manifest.manifest_id != V1_MANIFEST_ID
         || manifest.policy_version != V1_POLICY_VERSION
-        || manifest.policy_hash != V1_POLICY_HASH
     {
         return Err(ManifestError::UnpinnedIdentity);
     }
@@ -274,6 +277,13 @@ pub fn validate_manifest(manifest: &RouteManifest) -> Result<(), ManifestError> 
     if matched_routes.len() != discoverable_routes.len() {
         return Err(ManifestError::MissingSchema);
     }
+    if manifest.policy_hash != V1_POLICY_HASH {
+        return Err(ManifestError::UnpinnedIdentity);
+    }
+    let expected = computed_policy_hash(manifest)?;
+    if manifest.policy_hash != expected {
+        return Err(ManifestError::PolicyHashMismatch { expected });
+    }
     Ok(())
 }
 
@@ -303,6 +313,21 @@ pub fn canonical_manifest_bytes(manifest: &RouteManifest) -> Result<Vec<u8>, Man
         .map_err(|error| ManifestError::Serialization(error.to_string()))?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+/// Compute the content-bound policy identity over a canonical manifest with
+/// its self-referential `policyHash` field cleared.
+pub fn computed_policy_hash(manifest: &RouteManifest) -> Result<String, ManifestError> {
+    let mut normalized = manifest.clone();
+    normalized.policy_hash.clear();
+    normalized.routes.sort_by_key(route_sort_key);
+    normalized
+        .schemas
+        .sort_by(|left, right| left.entry_id.cmp(&right.entry_id));
+    let bytes = serde_json::to_vec(&normalized)
+        .map_err(|error| ManifestError::Serialization(error.to_string()))?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("sha256:{digest:x}"))
 }
 
 /// Build the executable route policy from the validated source rows.
@@ -406,11 +431,11 @@ fn validate_schema(schema: &ManifestSchema) -> Result<(), String> {
     if schema
         .argument_schema
         .as_ref()
-        .is_some_and(|value| !valid_schema(value))
+        .is_none_or(|value| !valid_closed_object_schema(value))
         || schema
             .request_body_schema
             .as_ref()
-            .is_some_and(|value| !valid_schema(value))
+            .is_some_and(|value| !valid_closed_object_schema(value))
         || schema
             .response_body_schema
             .as_ref()
@@ -418,16 +443,15 @@ fn validate_schema(schema: &ManifestSchema) -> Result<(), String> {
     {
         return Err("schema must be an inline bounded JSON object without references".to_owned());
     }
-    let helper = schema.purpose != ManifestRoutePurpose::Request;
     let expected_grant =
         (schema.purpose == ManifestRoutePurpose::LogsQuery).then_some("logs.query");
-    if helper != schema.argument_schema.is_some()
-        || (schema.purpose == ManifestRoutePurpose::MetricsBatch
-            || schema.purpose == ManifestRoutePurpose::LogsQuery)
-            != schema.request_body_schema.is_some()
+    if (schema.purpose == ManifestRoutePurpose::MetricsBatch
+        || schema.purpose == ManifestRoutePurpose::LogsQuery)
+        != schema.request_body_schema.is_some()
         || schema.data_plane_grant.as_deref() != expected_grant
+        || !schema_cloud_is_exact(schema)
     {
-        return Err("helper schema shape does not match its execution surface".to_owned());
+        return Err("argument schema shape does not match its execution surface".to_owned());
     }
     Ok(())
 }
@@ -438,9 +462,47 @@ fn valid_schema(schema: &Value) -> bool {
         && serde_json::to_vec(schema).is_ok_and(|bytes| bytes.len() <= MAX_SCHEMA_BYTES)
 }
 
+fn valid_closed_object_schema(schema: &Value) -> bool {
+    if !valid_schema(schema)
+        || schema.get("type").and_then(Value::as_str) != Some("object")
+        || schema.get("additionalProperties").and_then(Value::as_bool) != Some(false)
+    {
+        return false;
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(required) = schema.get("required").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut seen = BTreeSet::new();
+    required.iter().all(|name| {
+        name.as_str()
+            .is_some_and(|name| properties.contains_key(name) && seen.insert(name))
+    })
+}
+
+fn schema_cloud_is_exact(schema: &ManifestSchema) -> bool {
+    schema
+        .argument_schema
+        .as_ref()
+        .and_then(|schema| schema.get("properties"))
+        .and_then(|properties| properties.get("cloud"))
+        .and_then(|cloud| cloud.get("enum"))
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values.as_slice() == [Value::String(schema.cloud.as_str().to_owned())]
+        })
+}
+
 fn contains_ref(value: &Value) -> bool {
     match value {
-        Value::Object(values) => values.contains_key("$ref") || values.values().any(contains_ref),
+        Value::Object(values) => {
+            values
+                .keys()
+                .any(|key| matches!(key.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef"))
+                || values.values().any(contains_ref)
+        }
         Value::Array(values) => values.iter().any(contains_ref),
         _ => false,
     }
@@ -587,13 +649,59 @@ mod tests {
             .iter_mut()
             .find(|schema| schema.purpose == ManifestRoutePurpose::MetricsSingle)
             .expect("metrics helper");
-        helper.argument_schema = Some(serde_json::json!({
-            "type": "object",
-            "properties": {"value": {"$ref": "https://example.invalid/schema"}}
-        }));
+        helper.argument_schema.as_mut().expect("arguments")["properties"]["cloud"]["enum"] =
+            serde_json::json!(["AzureCloud", "AzureUSGovernment"]);
         assert!(matches!(
             validate_manifest(&manifest),
             Err(ManifestError::InvalidSchema { .. })
+        ));
+
+        let mut manifest = checked_in_manifest().expect("fixture");
+        let helper = manifest
+            .schemas
+            .iter_mut()
+            .find(|schema| schema.purpose == ManifestRoutePurpose::MetricsSingle)
+            .expect("metrics helper");
+        helper.argument_schema.as_mut().expect("arguments")["properties"]["resourceId"]["$dynamicRef"] =
+            serde_json::json!("https://example.invalid/schema");
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ManifestError::InvalidSchema { .. })
+        ));
+
+        let mut manifest = checked_in_manifest().expect("fixture");
+        let helper = manifest
+            .schemas
+            .iter_mut()
+            .find(|schema| schema.purpose == ManifestRoutePurpose::MetricsSingle)
+            .expect("metrics helper");
+        helper
+            .argument_schema
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("argument object")
+            .insert("additionalProperties".to_owned(), Value::Bool(true));
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ManifestError::InvalidSchema { .. })
+        ));
+    }
+
+    #[test]
+    fn policy_hash_is_bound_to_route_and_schema_content() {
+        let mut manifest = checked_in_manifest().expect("fixture");
+        manifest.schemas[0].display_name.push_str(" changed");
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ManifestError::PolicyHashMismatch { .. })
+        ));
+
+        let mut manifest = checked_in_manifest().expect("fixture");
+        manifest.routes[0].rbac_action.push_str("/changed");
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ManifestError::SchemaNotDiscoverable { .. })
+                | Err(ManifestError::PolicyHashMismatch { .. })
         ));
     }
 
@@ -610,7 +718,7 @@ mod tests {
             "formatVersion": 1,
             "manifestId": "v1-observability-1",
             "policyVersion": "v1-observability-1",
-            "policyHash": "v1-observability-1",
+            "policyHash": "sha256:d3655b57f92a18efdfc375446425e9e8d6ade644c2036c333e2f276cbd45c8bf",
             "source": {"kind": "checked-in-reviewed-fixture", "revision": "d13b7291813c0a17ebcfa0a0eca5f3dcaf71eb48"},
             "routes": [],
             "schemas": [],
