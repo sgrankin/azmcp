@@ -84,7 +84,16 @@ The workspace pins Rust 1.97.1 and `rmcp` 3.0.1.
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release
+cargo run -p azmcp-routegen -- --check
 ```
+
+The reviewed route and offline schema rows share the pinned source fixture at
+`fixtures/reviewed-routes/v1-observability-1.json`. `azmcp-routegen --check`
+rejects malformed, unpinned, non-canonical, or incomplete route/schema data;
+`--write` canonicalizes the reviewed fixture deterministically. Request,
+metrics, and Logs Query rows feed schema discovery under their exact execution
+surfaces. Resource Graph and internal rows remain undiscoverable, and helper
+routes are never advertised as generic `az.request` capabilities.
 
 Tests use synthetic Azure profiles, fake `az` executables, and loopback HTTP
 servers. They must not use an ambient Azure login.

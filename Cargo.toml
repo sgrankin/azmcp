@@ -2,6 +2,7 @@
 members = [
     "crates/azmcp",
     "crates/azmcp-core",
+    "crates/azmcp-routegen",
 ]
 resolver = "3"
 

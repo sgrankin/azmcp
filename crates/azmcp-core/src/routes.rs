@@ -1,128 +1,40 @@
-//! Small, reviewed Azure route bundle.
+//! Reviewed Azure route bundle built from the checked-in v1 manifest.
 
-use crate::cloud::AzureCloud;
-use crate::policy::{
-    ArmTier, HttpMethod, InvalidPolicyBundle, InvalidRoute, PolicyBundle, ReviewedRoute,
-    RoutePurpose,
-};
+use crate::policy::{InvalidPolicyBundle, InvalidRoute, PolicyBundle};
+use crate::route_manifest::{self, ManifestError};
 
 /// Version of the checked-in observability route review.
-pub const V0_POLICY_VERSION: &str = "v1-observability-1";
+pub const V1_POLICY_VERSION: &str = route_manifest::V1_POLICY_VERSION;
+/// Stable identity of the checked-in observability policy contents.
+pub const V1_POLICY_HASH: &str = route_manifest::V1_POLICY_HASH;
+/// Compatibility alias for callers that still use the v0 route accessor.
+pub const V0_POLICY_VERSION: &str = V1_POLICY_VERSION;
 
 pub const SUBSCRIPTIONS_API_VERSION: &str = "2020-01-01";
 pub const PROVIDERS_API_VERSION: &str = "2021-04-01";
 pub const RESOURCE_GRAPH_API_VERSION: &str = "2022-10-01";
-/// Stable identity of the checked-in observability policy contents.
-pub const V0_POLICY_HASH: &str = "v1-observability-1";
+/// Compatibility alias for callers that still use the v0 policy identity.
+pub const V0_POLICY_HASH: &str = V1_POLICY_HASH;
 /// Pinned ARM metrics API version from azure-rest-api-specs commit
 /// f05d9ee6113a6536cc39c374608c8daf007b1d38.
 pub const METRICS_API_VERSION: &str = "2023-10-01";
 
-/// Query controls reviewed from the 2023-10-01 ARM metrics operation.
-const METRICS_SINGLE_QUERY_PARAMETERS: &[&str] = &[
-    "timespan",
-    "interval",
-    "metricnames",
-    "aggregation",
-    "top",
-    "orderby",
-    "$filter",
-    "resultType",
-    "metricnamespace",
-    "AutoAdjustTimegrain",
-    "ValidateDimensions",
-    "rollupby",
-];
-
-/// Query controls reviewed from the 2023-10-01 metrics:getBatch operation in
-/// azure-rest-api-specs commit
-/// 3c0811c51be6cb34f4e151ee333439bfbfac354e.
-const METRICS_BATCH_QUERY_PARAMETERS: &[&str] = &[
-    "starttime",
-    "endtime",
-    "interval",
-    "metricnamespace",
-    "metricnames",
-    "aggregation",
-    "top",
-    "orderby",
-    "filter",
-    "rollupby",
-];
 pub const LOGS_QUERY_API_VERSION: &str = "v1";
 pub const LOGS_QUERY_RBAC_ACTION: &str = "Microsoft.OperationalInsights/workspaces/query/read";
 
-/// Construct the deliberately small route bundle used by the first v0 scenarios.
+/// Construct the route bundle from the checked-in, pinned v1 source manifest.
 ///
-/// Resource Graph has its own purpose so caller-authored `az.request` cannot reach
-/// the tenant-scoped POST without the graph operation's separate body/scope checks.
+/// Resource Graph, metrics, and Logs Query rows retain distinct purposes in the
+/// manifest. They therefore cannot become caller-authored `az.request` rows
+/// merely because their paths happen to be valid ARM targets.
+pub fn v1_policy() -> Result<PolicyBundle, V0PolicyError> {
+    let manifest = route_manifest::checked_in_manifest()?;
+    Ok(route_manifest::policy(&manifest)?)
+}
+
+/// Compatibility accessor for the v1 policy while existing callers migrate.
 pub fn v0_policy() -> Result<PolicyBundle, V0PolicyError> {
-    let mut routes = Vec::new();
-    for cloud in [AzureCloud::AzureCloud, AzureCloud::AzureUSGovernment] {
-        for purpose in [RoutePurpose::Request, RoutePurpose::Internal] {
-            routes.push(ReviewedRoute::new(
-                cloud,
-                purpose,
-                HttpMethod::Get,
-                "/subscriptions/{subscription}",
-                [SUBSCRIPTIONS_API_VERSION],
-                "Microsoft.Resources/subscriptions/read",
-                ArmTier::Inspect,
-            )?);
-            routes.push(ReviewedRoute::new(
-                cloud,
-                purpose,
-                HttpMethod::Get,
-                "/subscriptions/{subscription}/providers/{namespace}",
-                [PROVIDERS_API_VERSION],
-                "Microsoft.Resources/subscriptions/providers/read",
-                ArmTier::Inspect,
-            )?);
-        }
-        routes.push(ReviewedRoute::new(
-            cloud,
-            RoutePurpose::ResourceGraph,
-            HttpMethod::Post,
-            "/providers/Microsoft.ResourceGraph/resources",
-            [RESOURCE_GRAPH_API_VERSION],
-            "Microsoft.ResourceGraph/resources/read",
-            ArmTier::Inspect,
-        )?);
-        routes.push(
-            ReviewedRoute::new(
-                cloud,
-                RoutePurpose::MetricsSingle,
-                HttpMethod::Get,
-                "/{resourceUri}/providers/Microsoft.Insights/metrics",
-                [METRICS_API_VERSION],
-                "Microsoft.Insights/Metrics/Read",
-                ArmTier::Inspect,
-            )?
-            .with_query_parameters(METRICS_SINGLE_QUERY_PARAMETERS.iter().copied())?,
-        );
-        routes.push(
-            ReviewedRoute::new(
-                cloud,
-                RoutePurpose::MetricsBatch,
-                HttpMethod::Post,
-                "/subscriptions/{subscription}/metrics:getBatch",
-                [METRICS_API_VERSION],
-                "Microsoft.Insights/Metrics/Read",
-                ArmTier::Inspect,
-            )?
-            .with_query_parameters(METRICS_BATCH_QUERY_PARAMETERS.iter().copied())?,
-        );
-        routes.push(ReviewedRoute::new(
-            cloud,
-            RoutePurpose::LogsQuery,
-            HttpMethod::Post,
-            "/v1/workspaces/{workspaceId}/query",
-            [LOGS_QUERY_API_VERSION],
-            LOGS_QUERY_RBAC_ACTION,
-            ArmTier::Inspect,
-        )?);
-    }
-    Ok(PolicyBundle::new(V0_POLICY_VERSION, routes)?)
+    v1_policy()
 }
 
 /// A checked-in route bundle invariant failed during construction.
@@ -132,13 +44,18 @@ pub enum V0PolicyError {
     Route(#[from] InvalidRoute),
     #[error("invalid reviewed v0 policy bundle: {0}")]
     Bundle(#[from] InvalidPolicyBundle),
+    #[error("invalid checked-in reviewed route manifest: {0}")]
+    Manifest(#[from] ManifestError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::PolicyDenial;
-    use crate::target::RelativeRequestTarget;
+    use crate::{
+        cloud::AzureCloud,
+        policy::{HttpMethod, PolicyDenial, RoutePurpose},
+        target::RelativeRequestTarget,
+    };
 
     #[test]
     fn exact_routes_are_available_in_both_clouds() {

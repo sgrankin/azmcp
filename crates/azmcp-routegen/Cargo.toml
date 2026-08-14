@@ -1,0 +1,11 @@
+[package]
+name = "azmcp-routegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+azmcp-core = { path = "../azmcp-core" }
+
+[lints]
+workspace = true

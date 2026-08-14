@@ -1975,7 +1975,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
 }
 
 fn exponential_backoff(policy: &RetryPolicy, retry_count: u32) -> Duration {
-    let exponent = retry_count.saturating_sub(1).min(127);
+    let exponent = retry_count.min(127);
     let multiplier = 1_u128.checked_shl(exponent).unwrap_or(u128::MAX);
     let nanos = policy
         .initial_backoff()
@@ -2494,15 +2494,15 @@ mod tests {
 
         let response = HttpResponse::from_parts(503, BTreeMap::new(), Vec::new());
         assert_eq!(
-            retry_delay(&policy, 1, &response),
+            retry_delay(&policy, 0, &response),
             Duration::from_millis(20)
         );
         assert_eq!(
-            retry_delay(&policy, 2, &response),
+            retry_delay(&policy, 1, &response),
             Duration::from_millis(40)
         );
         assert_eq!(
-            retry_delay(&policy, 3, &response),
+            retry_delay(&policy, 2, &response),
             Duration::from_millis(50)
         );
 

@@ -7,6 +7,7 @@ pub mod context;
 pub mod credential;
 pub mod http;
 pub mod policy;
+pub mod route_manifest;
 pub mod routes;
 pub mod schema;
 pub mod target;

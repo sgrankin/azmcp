@@ -130,29 +130,36 @@ impl BindingValidator for HttpBindingValidator {
                     let effective =
                         CloudBinding::new(pair.subscription().clone(), Some(pair.tenant().clone()))
                             .resolve(binding.cloud(), &[])
-                            .map_err(|_| DependencyError::Failed)?;
+                            .map_err(|_| (DependencyError::Failed, 0))?;
                     let client = self
                         .clients
                         .client_for(&effective)
-                        .map_err(|_| DependencyError::Failed)?;
+                        .map_err(|_| (DependencyError::Failed, 0))?;
                     let target = RelativeRequestTarget::parse(&format!(
                         "/subscriptions/{}",
                         pair.subscription_id()
                     ))
-                    .map_err(|_| DependencyError::Failed)?;
+                    .map_err(|_| (DependencyError::Failed, 0))?;
                     let request = HttpRequest::for_purpose(
                         RoutePurpose::Internal,
                         HttpMethod::Get,
                         target,
                         SUBSCRIPTIONS_API_VERSION,
                     )
-                    .map_err(|_| DependencyError::Failed)?;
+                    .map_err(|_| (DependencyError::Failed, 0))?;
                     client
                         .execute_with_identity_pin(request, Some(identity_pin))
                         .await
-                        .map_err(map_http_dependency_error)
+                        .map_err(|error| {
+                            let retry_count = error.retry_count();
+                            (map_http_dependency_error(error), retry_count)
+                        })
                 }
                 .await;
+                let retry_count = match &response {
+                    Ok(response) => response.retry_count(),
+                    Err((_, retry_count)) => *retry_count,
+                };
                 let mut validation = Err(DependencyError::Failed);
                 let (status, remaining_reads, decision, reason) = match &response {
                     Ok(response) => {
@@ -204,7 +211,7 @@ impl BindingValidator for HttpBindingValidator {
                     reason,
                     status,
                     duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                    retry_count: 0,
+                    retry_count,
                     remaining_subscription_reads: remaining_reads,
                     graph_scope: None,
                     data_plane: None,
@@ -214,7 +221,7 @@ impl BindingValidator for HttpBindingValidator {
                     sink.append(&record)
                         .map_err(|_| DependencyError::AuditFailed)?;
                 }
-                response?;
+                response.map_err(|(error, _)| error)?;
                 validation?;
             }
             Ok(())
@@ -1793,7 +1800,8 @@ fn map_schema_error(error: SchemaError) -> AppError {
         | SchemaError::DuplicateEntry
         | SchemaError::UnreviewedSource
         | SchemaError::MissingSource
-        | SchemaError::InvalidSchema => AppErrorCode::SchemaUnavailable,
+        | SchemaError::InvalidSchema
+        | SchemaError::Manifest(_) => AppErrorCode::SchemaUnavailable,
     })
 }
 
@@ -2000,6 +2008,25 @@ mod tests {
         policy: PolicyBundle,
     }
 
+    #[derive(Default)]
+    struct RecordingAudit {
+        records: std::sync::Mutex<Vec<CallRecord>>,
+    }
+
+    impl AuditSink for RecordingAudit {
+        fn prepare(&self) -> Result<(), crate::audit::AuditError> {
+            Ok(())
+        }
+
+        fn append(&self, record: &CallRecord) -> Result<(), crate::audit::AuditError> {
+            self.records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(record.clone());
+            Ok(())
+        }
+    }
+
     impl HttpClientFactory for ValidationClientFactory {
         fn client_for(
             &self,
@@ -2048,6 +2075,43 @@ mod tests {
                     body.len(),
                     body
                 );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+        (format!("http://{address}/"), task)
+    }
+
+    async fn validation_retry_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("loopback");
+        let address = listener.local_addr().expect("address");
+        let task = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("validation request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let count = stream.read(&mut buffer).await.expect("read request");
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = if attempt == 0 {
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_owned()
+                } else {
+                    let body = format!(r#"{{"subscriptionId":"{SUB}"}}"#);
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
                 stream
                     .write_all(response.as_bytes())
                     .await
@@ -2587,6 +2651,46 @@ mod tests {
         assert_eq!(credentials.calls.load(Ordering::SeqCst), 2);
         assert_eq!(state.starts.load(Ordering::SeqCst), 0);
         server.await.expect("validation server");
+    }
+
+    #[tokio::test]
+    async fn live_validation_audit_records_retry_count() {
+        let (origin, server) = validation_retry_server().await;
+        let credentials = Arc::new(IdentityCredentials {
+            calls: AtomicUsize::new(0),
+        });
+        let clients = Arc::new(ValidationClientFactory {
+            credentials,
+            origin,
+            policy: azmcp_core::routes::v0_policy().expect("policy"),
+        });
+        let sink = Arc::new(RecordingAudit::default());
+        let audit_sink: Arc<dyn AuditSink> = sink.clone();
+        let validator = HttpBindingValidator::new(clients).with_audit_sink(
+            audit_sink,
+            DEFAULT_POLICY_HASH,
+            DEFAULT_POLICY_VERSION,
+        );
+        let binding = CloudBinding::new(
+            SubscriptionId::new(SUB).expect("subscription"),
+            Some(TenantId::new(TENANT).expect("tenant")),
+        )
+        .resolve(AzureCloud::AzureCloud, &[])
+        .expect("binding");
+
+        validator
+            .validate(&binding, &CredentialIdentityPin::new())
+            .await
+            .expect("validation after retry");
+        server.await.expect("validation server");
+
+        let records = sink
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].retry_count, 1);
+        assert_eq!(records[0].status, Some(200));
     }
 
     #[tokio::test]

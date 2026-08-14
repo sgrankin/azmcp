@@ -1,0 +1,992 @@
+{
+  "formatVersion": 1,
+  "manifestId": "v1-observability-1",
+  "policyVersion": "v1-observability-1",
+  "policyHash": "v1-observability-1",
+  "source": {
+    "kind": "checked-in-reviewed-fixture",
+    "revision": "d13b7291813c0a17ebcfa0a0eca5f3dcaf71eb48"
+  },
+  "routes": [
+    {
+      "cloud": "AzureCloud",
+      "purpose": "request",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}/providers/{namespace}",
+      "apiVersions": [
+        "2021-04-01"
+      ],
+      "rbacAction": "Microsoft.Resources/subscriptions/providers/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureCloud",
+      "purpose": "request",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}",
+      "apiVersions": [
+        "2020-01-01"
+      ],
+      "rbacAction": "Microsoft.Resources/subscriptions/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureUSGovernment",
+      "purpose": "request",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}/providers/{namespace}",
+      "apiVersions": [
+        "2021-04-01"
+      ],
+      "rbacAction": "Microsoft.Resources/subscriptions/providers/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureUSGovernment",
+      "purpose": "request",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}",
+      "apiVersions": [
+        "2020-01-01"
+      ],
+      "rbacAction": "Microsoft.Resources/subscriptions/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureCloud",
+      "purpose": "resourceGraph",
+      "method": "POST",
+      "pathTemplate": "/providers/Microsoft.ResourceGraph/resources",
+      "apiVersions": [
+        "2022-10-01"
+      ],
+      "rbacAction": "Microsoft.ResourceGraph/resources/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureUSGovernment",
+      "purpose": "resourceGraph",
+      "method": "POST",
+      "pathTemplate": "/providers/Microsoft.ResourceGraph/resources",
+      "apiVersions": [
+        "2022-10-01"
+      ],
+      "rbacAction": "Microsoft.ResourceGraph/resources/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureCloud",
+      "purpose": "logsQuery",
+      "method": "POST",
+      "pathTemplate": "/v1/workspaces/{workspaceId}/query",
+      "apiVersions": [
+        "v1"
+      ],
+      "rbacAction": "Microsoft.OperationalInsights/workspaces/query/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureUSGovernment",
+      "purpose": "logsQuery",
+      "method": "POST",
+      "pathTemplate": "/v1/workspaces/{workspaceId}/query",
+      "apiVersions": [
+        "v1"
+      ],
+      "rbacAction": "Microsoft.OperationalInsights/workspaces/query/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureCloud",
+      "purpose": "internal",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}/providers/{namespace}",
+      "apiVersions": [
+        "2021-04-01"
+      ],
+      "rbacAction": "Microsoft.Resources/subscriptions/providers/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureCloud",
+      "purpose": "internal",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}",
+      "apiVersions": [
+        "2020-01-01"
+      ],
+      "rbacAction": "Microsoft.Resources/subscriptions/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureUSGovernment",
+      "purpose": "internal",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}/providers/{namespace}",
+      "apiVersions": [
+        "2021-04-01"
+      ],
+      "rbacAction": "Microsoft.Resources/subscriptions/providers/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureUSGovernment",
+      "purpose": "internal",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}",
+      "apiVersions": [
+        "2020-01-01"
+      ],
+      "rbacAction": "Microsoft.Resources/subscriptions/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureCloud",
+      "purpose": "metricsSingle",
+      "method": "GET",
+      "pathTemplate": "/{resourceUri}/providers/Microsoft.Insights/metrics",
+      "apiVersions": [
+        "2023-10-01"
+      ],
+      "rbacAction": "Microsoft.Insights/Metrics/Read",
+      "armTier": "inspect",
+      "allowedQueryParameters": [
+        "$filter",
+        "aggregation",
+        "AutoAdjustTimegrain",
+        "interval",
+        "metricnames",
+        "metricnamespace",
+        "orderby",
+        "resultType",
+        "rollupby",
+        "timespan",
+        "top",
+        "ValidateDimensions"
+      ]
+    },
+    {
+      "cloud": "AzureUSGovernment",
+      "purpose": "metricsSingle",
+      "method": "GET",
+      "pathTemplate": "/{resourceUri}/providers/Microsoft.Insights/metrics",
+      "apiVersions": [
+        "2023-10-01"
+      ],
+      "rbacAction": "Microsoft.Insights/Metrics/Read",
+      "armTier": "inspect",
+      "allowedQueryParameters": [
+        "$filter",
+        "aggregation",
+        "AutoAdjustTimegrain",
+        "interval",
+        "metricnames",
+        "metricnamespace",
+        "orderby",
+        "resultType",
+        "rollupby",
+        "timespan",
+        "top",
+        "ValidateDimensions"
+      ]
+    },
+    {
+      "cloud": "AzureCloud",
+      "purpose": "metricsBatch",
+      "method": "POST",
+      "pathTemplate": "/subscriptions/{subscription}/metrics:getBatch",
+      "apiVersions": [
+        "2023-10-01"
+      ],
+      "rbacAction": "Microsoft.Insights/Metrics/Read",
+      "armTier": "inspect",
+      "allowedQueryParameters": [
+        "aggregation",
+        "endtime",
+        "filter",
+        "interval",
+        "metricnames",
+        "metricnamespace",
+        "orderby",
+        "rollupby",
+        "starttime",
+        "top"
+      ]
+    },
+    {
+      "cloud": "AzureUSGovernment",
+      "purpose": "metricsBatch",
+      "method": "POST",
+      "pathTemplate": "/subscriptions/{subscription}/metrics:getBatch",
+      "apiVersions": [
+        "2023-10-01"
+      ],
+      "rbacAction": "Microsoft.Insights/Metrics/Read",
+      "armTier": "inspect",
+      "allowedQueryParameters": [
+        "aggregation",
+        "endtime",
+        "filter",
+        "interval",
+        "metricnames",
+        "metricnamespace",
+        "orderby",
+        "rollupby",
+        "starttime",
+        "top"
+      ]
+    }
+  ],
+  "schemas": [
+    {
+      "entryId": "AzureCloud.logs.query",
+      "resourceType": "Microsoft.OperationalInsights/workspaces",
+      "operation": "query",
+      "purpose": "logsQuery",
+      "displayName": "Query Log Analytics workspace",
+      "description": "Run a bounded KQL query against a Log Analytics workspace.",
+      "cliEquivalent": null,
+      "cloud": "AzureCloud",
+      "method": "POST",
+      "canonicalPathTemplate": "/v1/workspaces/{workspaceId}/query",
+      "requestPathTemplate": "/v1/workspaces/{workspaceId}/query",
+      "apiVersions": [
+        "v1"
+      ],
+      "rbacAction": "Microsoft.OperationalInsights/workspaces/query/read",
+      "armTier": "inspect",
+      "dataPlaneGrant": "logs.query",
+      "argumentSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "cloud": {
+            "enum": [
+              "AzureCloud",
+              "AzureUSGovernment"
+            ]
+          },
+          "query": {
+            "maxLength": 262144,
+            "minLength": 1,
+            "type": "string"
+          },
+          "subscription": {
+            "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$",
+            "type": "string"
+          },
+          "timespan": {
+            "description": "ISO-8601 duration from PT1S through P30D; the host rejects zero and overlong durations.",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^P(?:[0-9]+D)?(?:T(?:[0-9]+H)?(?:[0-9]+M)?(?:[0-9]+S)?)?$",
+            "type": "string"
+          },
+          "workspaceId": {
+            "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cloud",
+          "workspaceId",
+          "query",
+          "timespan"
+        ],
+        "title": "az.logs.query arguments",
+        "type": "object"
+      },
+      "requestBodySchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "maxLength": 262144,
+            "minLength": 1,
+            "type": "string"
+          },
+          "timespan": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "query",
+          "timespan"
+        ],
+        "title": "Log Analytics query request body",
+        "type": "object"
+      },
+      "responseBodySchema": null
+    },
+    {
+      "entryId": "AzureCloud.metrics.batch",
+      "resourceType": "Microsoft.Insights/metrics",
+      "operation": "batch",
+      "purpose": "metricsBatch",
+      "displayName": "Read metrics for multiple resources",
+      "description": "Read Azure Monitor metrics for up to 50 same-type resources in one subscription.",
+      "cliEquivalent": null,
+      "cloud": "AzureCloud",
+      "method": "POST",
+      "canonicalPathTemplate": "/subscriptions/{subscription}/metrics:getBatch",
+      "requestPathTemplate": "/subscriptions/{subscription}/metrics:getBatch",
+      "apiVersions": [
+        "2023-10-01"
+      ],
+      "rbacAction": "Microsoft.Insights/Metrics/Read",
+      "armTier": "inspect",
+      "dataPlaneGrant": null,
+      "argumentSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "aggregation": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "cloud": {
+            "enum": [
+              "AzureCloud",
+              "AzureUSGovernment"
+            ]
+          },
+          "endTime": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "filter": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "interval": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "metricNames": {
+            "items": {
+              "maxLength": 256,
+              "minLength": 1,
+              "pattern": "^[^,\\u0000-\\u001F\\u007F]+$",
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+          },
+          "metricNamespace": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "pattern": "^[^\\u0000-\\u001F\\u007F]+$",
+            "type": "string"
+          },
+          "orderBy": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "region": {
+            "maxLength": 63,
+            "minLength": 2,
+            "pattern": "^(global|[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9])$",
+            "type": "string"
+          },
+          "resourceIds": {
+            "items": {
+              "maxLength": 16384,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "rollupBy": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "startTime": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "top": {
+            "maximum": 4294967295,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cloud",
+          "region",
+          "resourceIds",
+          "metricNamespace",
+          "metricNames"
+        ],
+        "title": "az.metrics.batch arguments",
+        "type": "object"
+      },
+      "requestBodySchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "resourceids": {
+            "items": {
+              "maxLength": 16384,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "resourceids"
+        ],
+        "title": "Azure Monitor metrics:getBatch request body",
+        "type": "object"
+      },
+      "responseBodySchema": null
+    },
+    {
+      "entryId": "AzureCloud.metrics.single",
+      "resourceType": "Microsoft.Insights/metrics",
+      "operation": "single",
+      "purpose": "metricsSingle",
+      "displayName": "Read metrics for one resource",
+      "description": "Read Azure Monitor metrics for one resource in the selected subscription.",
+      "cliEquivalent": null,
+      "cloud": "AzureCloud",
+      "method": "GET",
+      "canonicalPathTemplate": "/{resourceUri}/providers/Microsoft.Insights/metrics",
+      "requestPathTemplate": "/{resourceUri}/providers/Microsoft.Insights/metrics",
+      "apiVersions": [
+        "2023-10-01"
+      ],
+      "rbacAction": "Microsoft.Insights/Metrics/Read",
+      "armTier": "inspect",
+      "dataPlaneGrant": null,
+      "argumentSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "aggregation": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "autoAdjustTimegrain": {
+            "type": "boolean"
+          },
+          "cloud": {
+            "enum": [
+              "AzureCloud",
+              "AzureUSGovernment"
+            ]
+          },
+          "filter": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "interval": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "metricNames": {
+            "items": {
+              "maxLength": 256,
+              "minLength": 1,
+              "pattern": "^[^,\\u0000-\\u001F\\u007F]+$",
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+          },
+          "metricNamespace": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "orderBy": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "resourceId": {
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          },
+          "resultType": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "rollupBy": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "timespan": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "top": {
+            "maximum": 4294967295,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "validateDimensions": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cloud",
+          "resourceId",
+          "metricNames"
+        ],
+        "title": "az.metrics.single arguments",
+        "type": "object"
+      },
+      "requestBodySchema": null,
+      "responseBodySchema": null
+    },
+    {
+      "entryId": "AzureCloud.providers.get",
+      "resourceType": "Microsoft.Resources/providers",
+      "operation": "get",
+      "purpose": "request",
+      "displayName": "Get provider metadata",
+      "description": "Read API versions and resource types exposed by one provider namespace.",
+      "cliEquivalent": "az provider show --namespace <namespace> --subscription <subscriptionId>",
+      "cloud": "AzureCloud",
+      "method": "GET",
+      "canonicalPathTemplate": "/subscriptions/{subscription}/providers/{namespace}",
+      "requestPathTemplate": "/providers/{namespace}",
+      "apiVersions": [
+        "2021-04-01"
+      ],
+      "rbacAction": "Microsoft.Resources/subscriptions/providers/read",
+      "armTier": "inspect",
+      "dataPlaneGrant": null,
+      "argumentSchema": null,
+      "requestBodySchema": null,
+      "responseBodySchema": null
+    },
+    {
+      "entryId": "AzureCloud.subscriptions.get",
+      "resourceType": "Microsoft.Resources/subscriptions",
+      "operation": "get",
+      "purpose": "request",
+      "displayName": "Get subscription",
+      "description": "Read the selected subscription's metadata and state.",
+      "cliEquivalent": "az account show --subscription <subscriptionId>",
+      "cloud": "AzureCloud",
+      "method": "GET",
+      "canonicalPathTemplate": "/subscriptions/{subscription}",
+      "requestPathTemplate": "/",
+      "apiVersions": [
+        "2020-01-01"
+      ],
+      "rbacAction": "Microsoft.Resources/subscriptions/read",
+      "armTier": "inspect",
+      "dataPlaneGrant": null,
+      "argumentSchema": null,
+      "requestBodySchema": null,
+      "responseBodySchema": null
+    },
+    {
+      "entryId": "AzureUSGovernment.logs.query",
+      "resourceType": "Microsoft.OperationalInsights/workspaces",
+      "operation": "query",
+      "purpose": "logsQuery",
+      "displayName": "Query Log Analytics workspace",
+      "description": "Run a bounded KQL query against a Log Analytics workspace.",
+      "cliEquivalent": null,
+      "cloud": "AzureUSGovernment",
+      "method": "POST",
+      "canonicalPathTemplate": "/v1/workspaces/{workspaceId}/query",
+      "requestPathTemplate": "/v1/workspaces/{workspaceId}/query",
+      "apiVersions": [
+        "v1"
+      ],
+      "rbacAction": "Microsoft.OperationalInsights/workspaces/query/read",
+      "armTier": "inspect",
+      "dataPlaneGrant": "logs.query",
+      "argumentSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "cloud": {
+            "enum": [
+              "AzureCloud",
+              "AzureUSGovernment"
+            ]
+          },
+          "query": {
+            "maxLength": 262144,
+            "minLength": 1,
+            "type": "string"
+          },
+          "subscription": {
+            "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$",
+            "type": "string"
+          },
+          "timespan": {
+            "description": "ISO-8601 duration from PT1S through P30D; the host rejects zero and overlong durations.",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^P(?:[0-9]+D)?(?:T(?:[0-9]+H)?(?:[0-9]+M)?(?:[0-9]+S)?)?$",
+            "type": "string"
+          },
+          "workspaceId": {
+            "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cloud",
+          "workspaceId",
+          "query",
+          "timespan"
+        ],
+        "title": "az.logs.query arguments",
+        "type": "object"
+      },
+      "requestBodySchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "maxLength": 262144,
+            "minLength": 1,
+            "type": "string"
+          },
+          "timespan": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "query",
+          "timespan"
+        ],
+        "title": "Log Analytics query request body",
+        "type": "object"
+      },
+      "responseBodySchema": null
+    },
+    {
+      "entryId": "AzureUSGovernment.metrics.batch",
+      "resourceType": "Microsoft.Insights/metrics",
+      "operation": "batch",
+      "purpose": "metricsBatch",
+      "displayName": "Read metrics for multiple resources",
+      "description": "Read Azure Monitor metrics for up to 50 same-type resources in one subscription.",
+      "cliEquivalent": null,
+      "cloud": "AzureUSGovernment",
+      "method": "POST",
+      "canonicalPathTemplate": "/subscriptions/{subscription}/metrics:getBatch",
+      "requestPathTemplate": "/subscriptions/{subscription}/metrics:getBatch",
+      "apiVersions": [
+        "2023-10-01"
+      ],
+      "rbacAction": "Microsoft.Insights/Metrics/Read",
+      "armTier": "inspect",
+      "dataPlaneGrant": null,
+      "argumentSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "aggregation": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "cloud": {
+            "enum": [
+              "AzureCloud",
+              "AzureUSGovernment"
+            ]
+          },
+          "endTime": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "filter": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "interval": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "metricNames": {
+            "items": {
+              "maxLength": 256,
+              "minLength": 1,
+              "pattern": "^[^,\\u0000-\\u001F\\u007F]+$",
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+          },
+          "metricNamespace": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "pattern": "^[^\\u0000-\\u001F\\u007F]+$",
+            "type": "string"
+          },
+          "orderBy": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "region": {
+            "maxLength": 63,
+            "minLength": 2,
+            "pattern": "^(global|[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9])$",
+            "type": "string"
+          },
+          "resourceIds": {
+            "items": {
+              "maxLength": 16384,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "rollupBy": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "startTime": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "top": {
+            "maximum": 4294967295,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cloud",
+          "region",
+          "resourceIds",
+          "metricNamespace",
+          "metricNames"
+        ],
+        "title": "az.metrics.batch arguments",
+        "type": "object"
+      },
+      "requestBodySchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "resourceids": {
+            "items": {
+              "maxLength": 16384,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "resourceids"
+        ],
+        "title": "Azure Monitor metrics:getBatch request body",
+        "type": "object"
+      },
+      "responseBodySchema": null
+    },
+    {
+      "entryId": "AzureUSGovernment.metrics.single",
+      "resourceType": "Microsoft.Insights/metrics",
+      "operation": "single",
+      "purpose": "metricsSingle",
+      "displayName": "Read metrics for one resource",
+      "description": "Read Azure Monitor metrics for one resource in the selected subscription.",
+      "cliEquivalent": null,
+      "cloud": "AzureUSGovernment",
+      "method": "GET",
+      "canonicalPathTemplate": "/{resourceUri}/providers/Microsoft.Insights/metrics",
+      "requestPathTemplate": "/{resourceUri}/providers/Microsoft.Insights/metrics",
+      "apiVersions": [
+        "2023-10-01"
+      ],
+      "rbacAction": "Microsoft.Insights/Metrics/Read",
+      "armTier": "inspect",
+      "dataPlaneGrant": null,
+      "argumentSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "aggregation": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "autoAdjustTimegrain": {
+            "type": "boolean"
+          },
+          "cloud": {
+            "enum": [
+              "AzureCloud",
+              "AzureUSGovernment"
+            ]
+          },
+          "filter": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "interval": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "metricNames": {
+            "items": {
+              "maxLength": 256,
+              "minLength": 1,
+              "pattern": "^[^,\\u0000-\\u001F\\u007F]+$",
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+          },
+          "metricNamespace": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "orderBy": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "resourceId": {
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          },
+          "resultType": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "rollupBy": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "timespan": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "top": {
+            "maximum": 4294967295,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "validateDimensions": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cloud",
+          "resourceId",
+          "metricNames"
+        ],
+        "title": "az.metrics.single arguments",
+        "type": "object"
+      },
+      "requestBodySchema": null,
+      "responseBodySchema": null
+    },
+    {
+      "entryId": "AzureUSGovernment.providers.get",
+      "resourceType": "Microsoft.Resources/providers",
+      "operation": "get",
+      "purpose": "request",
+      "displayName": "Get provider metadata",
+      "description": "Read API versions and resource types exposed by one provider namespace.",
+      "cliEquivalent": "az provider show --namespace <namespace> --subscription <subscriptionId>",
+      "cloud": "AzureUSGovernment",
+      "method": "GET",
+      "canonicalPathTemplate": "/subscriptions/{subscription}/providers/{namespace}",
+      "requestPathTemplate": "/providers/{namespace}",
+      "apiVersions": [
+        "2021-04-01"
+      ],
+      "rbacAction": "Microsoft.Resources/subscriptions/providers/read",
+      "armTier": "inspect",
+      "dataPlaneGrant": null,
+      "argumentSchema": null,
+      "requestBodySchema": null,
+      "responseBodySchema": null
+    },
+    {
+      "entryId": "AzureUSGovernment.subscriptions.get",
+      "resourceType": "Microsoft.Resources/subscriptions",
+      "operation": "get",
+      "purpose": "request",
+      "displayName": "Get subscription",
+      "description": "Read the selected subscription's metadata and state.",
+      "cliEquivalent": "az account show --subscription <subscriptionId>",
+      "cloud": "AzureUSGovernment",
+      "method": "GET",
+      "canonicalPathTemplate": "/subscriptions/{subscription}",
+      "requestPathTemplate": "/",
+      "apiVersions": [
+        "2020-01-01"
+      ],
+      "rbacAction": "Microsoft.Resources/subscriptions/read",
+      "armTier": "inspect",
+      "dataPlaneGrant": null,
+      "argumentSchema": null,
+      "requestBodySchema": null,
+      "responseBodySchema": null
+    }
+  ]
+}

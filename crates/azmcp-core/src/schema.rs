@@ -6,7 +6,9 @@
 use std::collections::BTreeSet;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use thiserror::Error;
 
 use crate::{
@@ -14,7 +16,8 @@ use crate::{
     context::{Context, LogsScope},
     credential::TokenAudience,
     policy::{ArmTier, HttpMethod, PolicyBundle, ReviewedRoute, RoutePurpose},
-    routes::{PROVIDERS_API_VERSION, SUBSCRIPTIONS_API_VERSION, V0_POLICY_HASH},
+    route_manifest,
+    routes::V0_POLICY_HASH,
 };
 
 pub const MAX_QUERY_BYTES: usize = 256;
@@ -38,9 +41,7 @@ pub const MAX_EXECUTION_SURFACE_BYTES: usize = 64;
 pub const MAX_QUERY_PARAMETERS: usize = 64;
 pub const MAX_QUERY_PARAMETER_BYTES: usize = 128;
 const MAX_SCHEMA_BYTES: usize = 64 * 1024;
-const MAX_RESOURCE_ID_BYTES: usize = 16 * 1024;
 const SUBSCRIPTION_ROUTE: &str = "/subscriptions/{subscription}";
-const PROVIDER_ROUTE: &str = "/subscriptions/{subscription}/providers/{namespace}";
 
 /// Source metadata for one reviewed operation.
 ///
@@ -168,6 +169,8 @@ pub enum SchemaError {
     UnrepresentablePath,
     #[error("schema source contains an invalid or overlarge JSON schema")]
     InvalidSchema,
+    #[error("checked-in route manifest is invalid: {0}")]
+    Manifest(String),
 }
 
 /// Immutable, offline schema metadata tied to one policy bundle.
@@ -242,7 +245,7 @@ impl SchemaIndex {
     }
 
     pub fn v0(policy: &PolicyBundle) -> Result<Self, SchemaError> {
-        Self::from_policy(policy, V0_POLICY_HASH, v0_sources())
+        Self::from_policy(policy, V0_POLICY_HASH, v0_sources()?)
     }
 
     pub fn policy_hash(&self) -> &str {
@@ -434,8 +437,16 @@ fn bounded(value: &str, maximum: usize) -> bool {
 
 fn valid_schema(schema: &Value) -> bool {
     schema.is_object()
-        && schema.get("$ref").is_none()
+        && !contains_ref(schema)
         && serde_json::to_vec(schema).is_ok_and(|json| json.len() <= MAX_SCHEMA_BYTES)
+}
+
+fn contains_ref(value: &Value) -> bool {
+    match value {
+        Value::Object(values) => values.contains_key("$ref") || values.values().any(contains_ref),
+        Value::Array(values) => values.iter().any(contains_ref),
+        _ => false,
+    }
 }
 
 fn expected_path(route: &ReviewedRoute) -> String {
@@ -628,301 +639,32 @@ fn score_entry(entry: &Entry, terms: &[String]) -> Option<usize> {
     (score > 0).then_some(score)
 }
 
-fn v0_sources() -> Vec<SchemaSource> {
-    let mut sources = Vec::new();
-    for cloud in [AzureCloud::AzureCloud, AzureCloud::AzureUSGovernment] {
-        sources.extend([
-            SchemaSource {
-                entry_id: format!("{}.subscriptions.get", cloud.as_str()),
-                resource_type: "Microsoft.Resources/subscriptions".to_owned(),
-                operation: "get".to_owned(),
-                purpose: RoutePurpose::Request,
-                display_name: "Get subscription".to_owned(),
-                description: "Read the selected subscription's metadata and state.".to_owned(),
-                cli_equivalent: Some("az account show --subscription <subscriptionId>".to_owned()),
-                cloud,
-                method: HttpMethod::Get,
-                canonical_path_template: SUBSCRIPTION_ROUTE.to_owned(),
-                request_path_template: "/".to_owned(),
-                api_versions: vec![SUBSCRIPTIONS_API_VERSION.to_owned()],
-                rbac_action: "Microsoft.Resources/subscriptions/read".to_owned(),
-                arm_tier: ArmTier::Inspect,
-                data_plane_grant: None,
-                argument_schema: None,
-                request_body_schema: None,
-                response_body_schema: None,
-            },
-            SchemaSource {
-                entry_id: format!("{}.providers.get", cloud.as_str()),
-                resource_type: "Microsoft.Resources/providers".to_owned(),
-                operation: "get".to_owned(),
-                purpose: RoutePurpose::Request,
-                display_name: "Get provider metadata".to_owned(),
-                description:
-                    "Read API versions and resource types exposed by one provider namespace."
-                        .to_owned(),
-                cli_equivalent: Some(
-                    "az provider show --namespace <namespace> --subscription <subscriptionId>"
-                        .to_owned(),
-                ),
-                cloud,
-                method: HttpMethod::Get,
-                canonical_path_template: PROVIDER_ROUTE.to_owned(),
-                request_path_template: "/providers/{namespace}".to_owned(),
-                api_versions: vec![PROVIDERS_API_VERSION.to_owned()],
-                rbac_action: "Microsoft.Resources/subscriptions/providers/read".to_owned(),
-                arm_tier: ArmTier::Inspect,
-                data_plane_grant: None,
-                argument_schema: None,
-                request_body_schema: None,
-                response_body_schema: None,
-            },
-            metrics_single_source(cloud),
-            metrics_batch_source(cloud),
-            logs_query_source(cloud),
-        ]);
-    }
-    sources
-}
-
-fn metrics_single_source(cloud: AzureCloud) -> SchemaSource {
-    SchemaSource {
-        entry_id: format!("{}.metrics.single", cloud.as_str()),
-        resource_type: "Microsoft.Insights/metrics".to_owned(),
-        operation: "single".to_owned(),
-        purpose: RoutePurpose::MetricsSingle,
-        display_name: "Read metrics for one resource".to_owned(),
-        description: "Read Azure Monitor metrics for one resource in the selected subscription."
-            .to_owned(),
-        cli_equivalent: None,
-        cloud,
-        method: HttpMethod::Get,
-        canonical_path_template: "/{resourceUri}/providers/Microsoft.Insights/metrics".to_owned(),
-        request_path_template: "/{resourceUri}/providers/Microsoft.Insights/metrics".to_owned(),
-        api_versions: vec![crate::routes::METRICS_API_VERSION.to_owned()],
-        rbac_action: "Microsoft.Insights/Metrics/Read".to_owned(),
-        arm_tier: ArmTier::Inspect,
-        data_plane_grant: None,
-        argument_schema: Some(metrics_single_arguments_schema()),
-        request_body_schema: None,
-        response_body_schema: None,
-    }
-}
-
-fn metrics_batch_source(cloud: AzureCloud) -> SchemaSource {
-    SchemaSource {
-        entry_id: format!("{}.metrics.batch", cloud.as_str()),
-        resource_type: "Microsoft.Insights/metrics".to_owned(),
-        operation: "batch".to_owned(),
-        purpose: RoutePurpose::MetricsBatch,
-        display_name: "Read metrics for multiple resources".to_owned(),
-        description:
-            "Read Azure Monitor metrics for up to 50 same-type resources in one subscription."
-                .to_owned(),
-        cli_equivalent: None,
-        cloud,
-        method: HttpMethod::Post,
-        canonical_path_template: "/subscriptions/{subscription}/metrics:getBatch".to_owned(),
-        request_path_template: "/subscriptions/{subscription}/metrics:getBatch".to_owned(),
-        api_versions: vec![crate::routes::METRICS_API_VERSION.to_owned()],
-        rbac_action: "Microsoft.Insights/Metrics/Read".to_owned(),
-        arm_tier: ArmTier::Inspect,
-        data_plane_grant: None,
-        argument_schema: Some(metrics_batch_arguments_schema()),
-        request_body_schema: Some(metrics_batch_request_schema()),
-        response_body_schema: None,
-    }
-}
-
-fn logs_query_source(cloud: AzureCloud) -> SchemaSource {
-    SchemaSource {
-        entry_id: format!("{}.logs.query", cloud.as_str()),
-        resource_type: "Microsoft.OperationalInsights/workspaces".to_owned(),
-        operation: "query".to_owned(),
-        purpose: RoutePurpose::LogsQuery,
-        display_name: "Query Log Analytics workspace".to_owned(),
-        description: "Run a bounded KQL query against a Log Analytics workspace.".to_owned(),
-        cli_equivalent: None,
-        cloud,
-        method: HttpMethod::Post,
-        canonical_path_template: "/v1/workspaces/{workspaceId}/query".to_owned(),
-        request_path_template: "/v1/workspaces/{workspaceId}/query".to_owned(),
-        api_versions: vec![crate::routes::LOGS_QUERY_API_VERSION.to_owned()],
-        rbac_action: crate::routes::LOGS_QUERY_RBAC_ACTION.to_owned(),
-        arm_tier: ArmTier::Inspect,
-        data_plane_grant: Some("logs.query".to_owned()),
-        argument_schema: Some(logs_query_arguments_schema()),
-        request_body_schema: Some(logs_query_request_schema()),
-        response_body_schema: None,
-    }
-}
-
-const JSON_SCHEMA_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
-
-fn schema_document(mut value: Value) -> Value {
-    value
-        .as_object_mut()
-        .expect("catalog schema document is an object")
-        .insert(
-            "$schema".to_owned(),
-            Value::String(JSON_SCHEMA_2020_12.to_owned()),
-        );
-    value
-}
-
-fn string_schema(maximum: usize) -> Value {
-    json!({"type": "string", "minLength": 1, "maxLength": maximum})
-}
-
-fn optional_string_schema(maximum: usize) -> Value {
-    json!({"type": "string", "minLength": 1, "maxLength": maximum})
-}
-
-fn cloud_schema() -> Value {
-    json!({"enum": ["AzureCloud", "AzureUSGovernment"]})
-}
-
-fn uuid_schema() -> Value {
-    json!({
-        "type": "string",
-        "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
-    })
-}
-
-fn metric_value_schema() -> Value {
-    json!({
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 4096,
-        "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
-    })
-}
-
-fn metric_names_schema() -> Value {
-    json!({
-        "type": "array",
-        "minItems": 1,
-        "maxItems": 20,
-        "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256,
-            "pattern": "^[^,\\u0000-\\u001F\\u007F]+$"
-        },
-        "description": "Metric names are non-empty, at most 256 bytes, control-character-free, and cannot contain commas."
-    })
-}
-
-fn metrics_single_arguments_schema() -> Value {
-    schema_document(json!({
-        "title": "az.metrics.single arguments",
-        "type": "object",
-        "properties": {
-            "cloud": cloud_schema(),
-            "resourceId": string_schema(MAX_RESOURCE_ID_BYTES),
-            "metricNames": metric_names_schema(),
-            "timespan": optional_string_schema(4096),
-            "interval": optional_string_schema(4096),
-            "aggregation": optional_string_schema(4096),
-            "top": {"type": "integer", "minimum": 0, "maximum": 4294967295u64},
-            "orderBy": optional_string_schema(4096),
-            "filter": optional_string_schema(4096),
-            "resultType": optional_string_schema(4096),
-            "metricNamespace": optional_string_schema(4096),
-            "autoAdjustTimegrain": {"type": "boolean"},
-            "validateDimensions": {"type": "boolean"},
-            "rollupBy": optional_string_schema(4096)
-        },
-        "required": ["cloud", "resourceId", "metricNames"],
-        "additionalProperties": false
-    }))
-}
-
-fn metrics_batch_arguments_schema() -> Value {
-    schema_document(json!({
-        "title": "az.metrics.batch arguments",
-        "type": "object",
-        "properties": {
-            "cloud": cloud_schema(),
-            "region": {
-                "type": "string",
-                "minLength": 2,
-                "maxLength": 63,
-                "pattern": "^(global|[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9])$"
-            },
-            "resourceIds": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 50,
-                "uniqueItems": true,
-                "items": string_schema(MAX_RESOURCE_ID_BYTES)
-            },
-            "metricNamespace": metric_value_schema(),
-            "metricNames": metric_names_schema(),
-            "startTime": optional_string_schema(4096),
-            "endTime": optional_string_schema(4096),
-            "interval": optional_string_schema(4096),
-            "aggregation": optional_string_schema(4096),
-            "top": {"type": "integer", "minimum": 0, "maximum": 4294967295u64},
-            "orderBy": optional_string_schema(4096),
-            "filter": optional_string_schema(4096),
-            "rollupBy": optional_string_schema(4096)
-        },
-        "required": ["cloud", "region", "resourceIds", "metricNamespace", "metricNames"],
-        "additionalProperties": false
-    }))
-}
-
-fn metrics_batch_request_schema() -> Value {
-    schema_document(json!({
-        "title": "Azure Monitor metrics:getBatch request body",
-        "type": "object",
-        "properties": {
-            "resourceids": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 50,
-                "items": string_schema(MAX_RESOURCE_ID_BYTES)
-            }
-        },
-        "required": ["resourceids"],
-        "additionalProperties": false
-    }))
-}
-
-fn logs_query_arguments_schema() -> Value {
-    schema_document(json!({
-        "title": "az.logs.query arguments",
-        "type": "object",
-        "properties": {
-            "cloud": cloud_schema(),
-            "subscription": uuid_schema(),
-            "workspaceId": uuid_schema(),
-            "query": string_schema(256 * 1024),
-            "timespan": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 128,
-                "pattern": "^P(?:[0-9]+D)?(?:T(?:[0-9]+H)?(?:[0-9]+M)?(?:[0-9]+S)?)?$",
-                "description": "ISO-8601 duration from PT1S through P30D; the host rejects zero and overlong durations."
-            }
-        },
-        "required": ["cloud", "workspaceId", "query", "timespan"],
-        "additionalProperties": false
-    }))
-}
-
-fn logs_query_request_schema() -> Value {
-    schema_document(json!({
-        "title": "Log Analytics query request body",
-        "type": "object",
-        "properties": {
-            "query": string_schema(256 * 1024),
-            "timespan": string_schema(128)
-        },
-        "required": ["query", "timespan"],
-        "additionalProperties": false
-    }))
+fn v0_sources() -> Result<Vec<SchemaSource>, SchemaError> {
+    let manifest = route_manifest::checked_in_manifest()
+        .map_err(|error| SchemaError::Manifest(error.to_string()))?;
+    Ok(route_manifest::schemas(&manifest)
+        .iter()
+        .map(|source| SchemaSource {
+            entry_id: source.entry_id.clone(),
+            resource_type: source.resource_type.clone(),
+            operation: source.operation.clone(),
+            purpose: source.purpose.route_purpose(),
+            display_name: source.display_name.clone(),
+            description: source.description.clone(),
+            cli_equivalent: source.cli_equivalent.clone(),
+            cloud: source.cloud,
+            method: source.method,
+            canonical_path_template: source.canonical_path_template.clone(),
+            request_path_template: source.request_path_template.clone(),
+            api_versions: source.api_versions.clone(),
+            rbac_action: source.rbac_action.clone(),
+            arm_tier: source.arm_tier,
+            data_plane_grant: source.data_plane_grant.clone(),
+            argument_schema: source.argument_schema.clone(),
+            request_body_schema: source.request_body_schema.clone(),
+            response_body_schema: source.response_body_schema.clone(),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -933,11 +675,13 @@ mod tests {
         context::{
             ContextOptions, ContextRegistry, GraphScope, Identity, LogsScope, RegistryConfig,
         },
+        routes::PROVIDERS_API_VERSION,
     };
     use std::{collections::BTreeMap, time::Duration};
 
     const SUBSCRIPTION: &str = "11111111-1111-1111-1111-111111111111";
     const TENANT: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const PROVIDER_ROUTE: &str = "/subscriptions/{subscription}/providers/{namespace}";
 
     fn policy() -> PolicyBundle {
         crate::routes::v0_policy().expect("v0 policy")
@@ -1171,13 +915,13 @@ mod tests {
 
     #[test]
     fn index_rejects_unreviewed_incomplete_and_mismatched_sources() {
-        let mut sources = v0_sources();
+        let mut sources = v0_sources().expect("checked-in schema fixture");
         sources.pop();
         assert_eq!(
             SchemaIndex::from_policy(&policy(), V0_POLICY_HASH, sources),
             Err(SchemaError::MissingSource)
         );
-        let mut sources = v0_sources();
+        let mut sources = v0_sources().expect("checked-in schema fixture");
         sources[0].canonical_path_template = "/subscriptions/{subscription}/unknown".to_owned();
         assert_eq!(
             SchemaIndex::from_policy(&policy(), V0_POLICY_HASH, sources),
@@ -1205,7 +949,7 @@ mod tests {
             Err(SchemaError::PolicyMismatch)
         );
 
-        let mut sources = v0_sources();
+        let mut sources = v0_sources().expect("checked-in schema fixture");
         sources[0].description = "x".repeat(MAX_DESCRIPTION_BYTES + 1);
         assert_eq!(
             SchemaIndex::from_policy(&policy(), V0_POLICY_HASH, sources),
