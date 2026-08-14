@@ -130,6 +130,7 @@ name = "azmcp-routegen"
 version = "0.1.0"
 dependencies = [
  "azmcp-core",
+ "serde_json",
  "tempfile",
 ]
 

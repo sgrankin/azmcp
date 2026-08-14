@@ -1,0 +1,82 @@
+{
+  "formatVersion": 1,
+  "source": {
+    "kind": "synthetic-upstream-contract",
+    "repository": "https://github.com/Azure/azure-rest-api-specs",
+    "revision": "synthetic-azure-rest-api-specs-v1",
+    "path": "specification/storage/resource-manager/Microsoft.Storage/stable/2023-05-01/storage.json",
+    "sourceSha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "catalogSha256": "sha256:6818f591fd2c21a4424c008a9147c0a3a90335aeb401348b36f748efa924e152"
+  },
+  "operations": [
+    {
+      "operationId": "Storage_StorageAccounts_Get",
+      "providerNamespace": "Microsoft.Storage",
+      "resourceType": "Microsoft.Storage/storageAccounts",
+      "operation": "get",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}",
+      "apiVersions": ["2023-05-01"],
+      "requestBodySchema": null,
+      "responseBodySchema": {
+        "additionalProperties": false,
+        "properties": {"id": {"type": "string"}},
+        "type": "object"
+      }
+    },
+    {
+      "operationId": "Storage_StorageAccounts_GetWithBody",
+      "providerNamespace": "Microsoft.Storage",
+      "resourceType": "Microsoft.Storage/storageAccounts",
+      "operation": "getWithBody",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}/metadata",
+      "apiVersions": ["2023-05-01"],
+      "requestBodySchema": {
+        "additionalProperties": false,
+        "properties": {"filter": {"type": "string"}},
+        "required": ["filter"],
+        "type": "object"
+      },
+      "responseBodySchema": null
+    },
+    {
+      "operationId": "Storage_StorageAccounts_List",
+      "providerNamespace": "Microsoft.Storage",
+      "resourceType": "Microsoft.Storage/storageAccounts",
+      "operation": "list",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts",
+      "apiVersions": ["2023-05-01"],
+      "requestBodySchema": null,
+      "responseBodySchema": null
+    },
+    {
+      "operationId": "Storage_StorageAccounts_Create",
+      "providerNamespace": "Microsoft.Storage",
+      "resourceType": "Microsoft.Storage/storageAccounts",
+      "operation": "create",
+      "method": "PUT",
+      "pathTemplate": "/subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}",
+      "apiVersions": ["2023-05-01"],
+      "requestBodySchema": {
+        "additionalProperties": false,
+        "properties": {"location": {"type": "string"}},
+        "required": ["location"],
+        "type": "object"
+      },
+      "responseBodySchema": null
+    },
+    {
+      "operationId": "Storage_StorageAccounts_ListKeys",
+      "providerNamespace": "Microsoft.Storage",
+      "resourceType": "Microsoft.Storage/storageAccounts/listKeys",
+      "operation": "listKeys",
+      "method": "POST",
+      "pathTemplate": "/subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}/listKeys",
+      "apiVersions": ["2023-05-01"],
+      "requestBodySchema": null,
+      "responseBodySchema": null
+    }
+  ]
+}

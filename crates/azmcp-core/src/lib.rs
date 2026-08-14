@@ -11,3 +11,4 @@ pub mod route_manifest;
 pub mod routes;
 pub mod schema;
 pub mod target;
+pub mod upstream_catalog;

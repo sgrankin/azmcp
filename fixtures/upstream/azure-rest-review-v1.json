@@ -1,0 +1,39 @@
+{
+  "formatVersion": 1,
+  "reviewId": "azure-rest-review-v1",
+  "source": {
+    "kind": "manual-route-review",
+    "revision": "synthetic-route-review-v1"
+  },
+  "upstream": {
+    "repository": "https://github.com/Azure/azure-rest-api-specs",
+    "revision": "synthetic-azure-rest-api-specs-v1",
+    "path": "specification/storage/resource-manager/Microsoft.Storage/stable/2023-05-01/storage.json",
+    "sourceSha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "catalogSha256": "sha256:6818f591fd2c21a4424c008a9147c0a3a90335aeb401348b36f748efa924e152"
+  },
+  "operations": [
+    {
+      "operationId": "Storage_StorageAccounts_Get",
+      "entryId": "AzureCloud.storageAccounts.get",
+      "displayName": "Get storage account",
+      "description": "Read metadata for one reviewed Azure Storage account.",
+      "cliEquivalent": "az storage account show --name <accountName> --resource-group <resourceGroupName>",
+      "cloud": "AzureCloud",
+      "armTier": "inspect",
+      "rbacAction": "Microsoft.Storage/storageAccounts/read",
+      "allowedQueryParameters": []
+    },
+    {
+      "operationId": "Storage_StorageAccounts_Get",
+      "entryId": "AzureUSGovernment.storageAccounts.get",
+      "displayName": "Get storage account",
+      "description": "Read metadata for one reviewed Azure Storage account.",
+      "cliEquivalent": "az storage account show --name <accountName> --resource-group <resourceGroupName>",
+      "cloud": "AzureUSGovernment",
+      "armTier": "inspect",
+      "rbacAction": "Microsoft.Storage/storageAccounts/read",
+      "allowedQueryParameters": []
+    }
+  ]
+}

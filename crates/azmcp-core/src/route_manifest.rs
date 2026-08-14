@@ -50,21 +50,39 @@ const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RouteManifest {
-    format_version: u32,
-    manifest_id: String,
-    policy_version: String,
-    policy_hash: String,
-    source: ManifestSource,
-    routes: Vec<ManifestRoute>,
-    schemas: Vec<ManifestSchema>,
+    pub(crate) format_version: u32,
+    pub(crate) manifest_id: String,
+    pub(crate) policy_version: String,
+    pub(crate) policy_hash: String,
+    pub(crate) source: ManifestSource,
+    pub(crate) routes: Vec<ManifestRoute>,
+    pub(crate) schemas: Vec<ManifestSchema>,
+}
+
+/// Provenance for rows imported from a pinned upstream operation export.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ManifestUpstreamSource {
+    pub(crate) kind: String,
+    pub(crate) repository: String,
+    pub(crate) revision: String,
+    pub(crate) path: String,
+    /// SHA-256 of the raw upstream file named by the provenance fields.
+    pub(crate) source_sha256: String,
+    /// SHA-256 of the normalized export with its own hash cleared.
+    pub(crate) catalog_sha256: String,
+    pub(crate) review_id: String,
+    pub(crate) review_revision: String,
 }
 
 /// The pinned provenance of a checked-in route fixture.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ManifestSource {
-    kind: String,
-    revision: String,
+    pub(crate) kind: String,
+    pub(crate) revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) upstream: Option<ManifestUpstreamSource>,
 }
 
 /// One source row that becomes a [`ReviewedRoute`].
@@ -194,8 +212,38 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<RouteManifest, ManifestError> {
     Ok(manifest)
 }
 
+/// Parse a generated manifest while allowing the route generator to calculate
+/// a new policy hash before its caller chooses to pin that hash.  Runtime
+/// callers must use [`parse_manifest`], which requires the checked-in policy
+/// identity.
+pub fn parse_manifest_for_generation(bytes: &[u8]) -> Result<RouteManifest, ManifestError> {
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(ManifestError::TooLarge);
+    }
+    let manifest = serde_json::from_slice(bytes)
+        .map_err(|error| ManifestError::InvalidJson(error.to_string()))?;
+    validate_manifest_for_generation(&manifest)?;
+    Ok(manifest)
+}
+
 /// Validate the manifest's pinned identity, route shape, and route/schema join.
 pub fn validate_manifest(manifest: &RouteManifest) -> Result<(), ManifestError> {
+    validate_manifest_with_hash(manifest, true)
+}
+
+/// Validate generated content before its policy hash is installed as the
+/// checked-in constant.  This remains crate-visible so the offline importer
+/// can build a new fixture without weakening runtime parsing.
+pub(crate) fn validate_manifest_for_generation(
+    manifest: &RouteManifest,
+) -> Result<(), ManifestError> {
+    validate_manifest_with_hash(manifest, false)
+}
+
+fn validate_manifest_with_hash(
+    manifest: &RouteManifest,
+    require_pinned_hash: bool,
+) -> Result<(), ManifestError> {
     if manifest.format_version != V1_MANIFEST_FORMAT
         || manifest.manifest_id != V1_MANIFEST_ID
         || manifest.policy_version != V1_POLICY_VERSION
@@ -203,6 +251,14 @@ pub fn validate_manifest(manifest: &RouteManifest) -> Result<(), ManifestError> 
         return Err(ManifestError::UnpinnedIdentity);
     }
     if manifest.source.kind != V1_SOURCE_KIND || manifest.source.revision != V1_SOURCE_REVISION {
+        return Err(ManifestError::UnpinnedSource);
+    }
+    if manifest
+        .source
+        .upstream
+        .as_ref()
+        .is_some_and(|source| !valid_upstream_source(source))
+    {
         return Err(ManifestError::UnpinnedSource);
     }
     if manifest.routes.is_empty() || manifest.routes.len() > MAX_ROUTES {
@@ -277,7 +333,7 @@ pub fn validate_manifest(manifest: &RouteManifest) -> Result<(), ManifestError> 
     if matched_routes.len() != discoverable_routes.len() {
         return Err(ManifestError::MissingSchema);
     }
-    if manifest.policy_hash != V1_POLICY_HASH {
+    if require_pinned_hash && manifest.policy_hash != V1_POLICY_HASH {
         return Err(ManifestError::UnpinnedIdentity);
     }
     let expected = computed_policy_hash(manifest)?;
@@ -361,6 +417,44 @@ pub fn policy_version(manifest: &RouteManifest) -> &str {
 /// Return the schema rows for conversion by the offline schema index.
 pub fn schemas(manifest: &RouteManifest) -> &[ManifestSchema] {
     &manifest.schemas
+}
+
+impl RouteManifest {
+    pub(crate) fn routes(&self) -> impl Iterator<Item = &ManifestRoute> {
+        self.routes.iter()
+    }
+
+    pub(crate) fn schemas(&self) -> &[ManifestSchema] {
+        &self.schemas
+    }
+
+    pub(crate) fn append_reviewed_rows(
+        &mut self,
+        routes: Vec<ManifestRoute>,
+        schemas: Vec<ManifestSchema>,
+        source: ManifestUpstreamSource,
+    ) {
+        self.routes.extend(routes);
+        self.schemas.extend(schemas);
+        self.source.upstream = Some(source);
+        self.policy_hash.clear();
+    }
+
+    pub(crate) fn clear_policy_hash(&mut self) {
+        self.policy_hash.clear();
+    }
+
+    pub(crate) fn set_policy_hash(&mut self, value: String) {
+        self.policy_hash = value;
+    }
+
+    pub(crate) fn upstream_source(&self) -> Option<&ManifestUpstreamSource> {
+        self.source.upstream.as_ref()
+    }
+
+    pub(crate) fn clear_upstream_source(&mut self) {
+        self.source.upstream = None;
+    }
 }
 
 fn reviewed_route(route: &ManifestRoute) -> Result<ReviewedRoute, String> {
@@ -512,6 +606,29 @@ fn bounded(value: &str, maximum: usize) -> bool {
     !value.is_empty()
         && value.len() <= maximum.min(MAX_STRING_BYTES)
         && !value.chars().any(char::is_control)
+}
+
+fn valid_upstream_source(source: &ManifestUpstreamSource) -> bool {
+    [
+        (&source.kind, 128),
+        (&source.repository, 512),
+        (&source.revision, 256),
+        (&source.path, 1_024),
+        (&source.source_sha256, 71),
+        (&source.catalog_sha256, 71),
+        (&source.review_id, 256),
+        (&source.review_revision, 256),
+    ]
+    .into_iter()
+    .all(|(value, maximum)| bounded(value, maximum))
+        && source.source_sha256.starts_with("sha256:")
+        && source.source_sha256[7..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+        && source.catalog_sha256.starts_with("sha256:")
+        && source.catalog_sha256[7..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
 }
 
 fn discoverable(purpose: ManifestRoutePurpose) -> bool {
