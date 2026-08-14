@@ -881,7 +881,9 @@ There are two related mechanisms:
 Ref IDs are random opaque handles, not sequential authority. The current bounded slice
 labels returned runs as `customerData` and does not infer or propagate secret labels;
 key names and string lengths in structural previews are therefore customer-data metadata.
-Previews contain no samples for any value. Rehydrating one is allowed only in the same
+Previews contain no samples for any value. Large object previews stop after a bounded
+key sample and report `keyCountAtLeast`, `keysSampled`, and `hasMore` rather than an
+exact count or omitted-key total. Rehydrating one is allowed only in the same
 `read` context. Cyclic or non-serializable values return a typed summary or a
 serialization error, never partial JSON.
 

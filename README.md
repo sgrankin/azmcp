@@ -205,8 +205,10 @@ Inline serialized results are capped at 64 KiB. Larger serializable values up
 to the bounded 480 KiB worker-reference ceiling become immutable, context-scoped
 refs with a structural preview; JavaScript can rehydrate one with
 `await az.ref(refId)` only in that context, and `az.peek(value)` returns a
-shape-only summary. Cyclic, non-serializable, or over-hard-cap values fail
-closed with shape-only diagnostics, never truncated JSON. Reference IDs and
+shape-only summary. Large object previews stop after a bounded key sample and
+report `keyCountAtLeast`, `keysSampled`, and `hasMore` instead of claiming an
+exact count or omitted-key total. Cyclic, non-serializable, or over-hard-cap
+values fail closed with shape-only diagnostics, never truncated JSON. Reference IDs and
 stored values are disposed with context close, expiry, or capacity eviction;
 previews contain no value samples. Key names and string lengths are
 `customerData` metadata; this slice does not infer or propagate secret labels.

@@ -1873,11 +1873,14 @@ const WORKER_BOOTSTRAP: &str = r#"
       }
       if (type === "object") {
         const sampledKeys = [];
-        let keyCount = 0;
+        let hasMore = false;
         for (const key in value) {
           if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
-          keyCount += 1;
-          if (sampledKeys.length < PEEK_LIMIT) sampledKeys.push(key);
+          if (sampledKeys.length >= PEEK_LIMIT) {
+            hasMore = true;
+            break;
+          }
+          sampledKeys.push(key);
         }
         const keys = sampledKeys.map((key) =>
           key.length > 128 ? key.slice(0, 128) : key);
@@ -1888,11 +1891,14 @@ const WORKER_BOOTSTRAP: &str = r#"
           try { childType = shapeType(value[key]); } catch (_) {}
           counts[childType] = (counts[childType] || 0) + 1;
         }
-        const result = { type, keyCount, keys, counts };
-        if (keyCount > keys.length) {
-          result.keysOmitted = keyCount - keys.length;
+        const result = { type, keys, counts };
+        if (hasMore) {
+          result.keyCountAtLeast = PEEK_LIMIT + 1;
           result.keysSampled = true;
+          result.hasMore = true;
           result.countsSampled = true;
+        } else {
+          result.keyCount = keys.length;
         }
         return result;
       }
@@ -2482,7 +2488,7 @@ mod tests {
         let mut runtime = WorkerRuntime::new().unwrap();
         let result = runtime
             .execute(
-                "({peek: az.peek({secret: 'do-not-return', count: 2}), refType: typeof az.ref})",
+                "({peek: az.peek({secret: 'do-not-return', count: 2}), manyPeek: az.peek(Object.fromEntries(Array.from({length: 64}, (_, index) => [`key${index}`, index]))), refType: typeof az.ref})",
                 Duration::from_secs(1),
             )
             .await
@@ -2490,6 +2496,16 @@ mod tests {
         assert_eq!(result.value["refType"], "function");
         assert_eq!(result.value["peek"]["type"], "object");
         assert_eq!(result.value["peek"]["keyCount"], 2);
+        assert_eq!(result.value["manyPeek"]["keyCountAtLeast"], 33);
+        assert_eq!(
+            result.value["manyPeek"]["keys"].as_array().unwrap().len(),
+            32
+        );
+        assert_eq!(result.value["manyPeek"]["keysSampled"], true);
+        assert_eq!(result.value["manyPeek"]["hasMore"], true);
+        assert_eq!(result.value["manyPeek"]["countsSampled"], true);
+        assert!(result.value["manyPeek"].get("keyCount").is_none());
+        assert!(result.value["manyPeek"].get("keysOmitted").is_none());
         let encoded = serde_json::to_string(&result.value).expect("peek JSON");
         assert!(!encoded.contains("do-not-return"));
     }

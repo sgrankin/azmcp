@@ -301,9 +301,7 @@ fn tool_result<T: Serialize>(result: Result<T, AppError>) -> Result<CallToolResp
                     ))),
                 );
             }
-            Ok(CallToolResult::structured(value)
-                .with_meta(Some(server_info_meta()))
-                .into())
+            bounded_call_tool_result(value, false)
         }
         Err(error) => {
             let details = error
@@ -336,7 +334,49 @@ fn domain_error_result(
     if let Some(details) = details {
         value["details"] = details;
     }
-    Ok(CallToolResult::structured_error(value)
+    bounded_call_tool_result(value, true)
+}
+
+fn bounded_call_tool_result(value: Value, is_error: bool) -> Result<CallToolResponse, ErrorData> {
+    let encoded_bytes = serde_json::to_vec(&value)
+        .map_err(|_| ErrorData::internal_error("tool result sizing failed", None))?
+        .len();
+    if encoded_bytes > MAX_TOOL_RESULT_BYTES {
+        return oversized_call_tool_result(&value, encoded_bytes);
+    }
+
+    let result = if is_error {
+        CallToolResult::structured_error(value)
+    } else {
+        CallToolResult::structured(value)
+    };
+    Ok(result.with_meta(Some(server_info_meta())).into())
+}
+
+fn oversized_call_tool_result(
+    value: &Value,
+    encoded_bytes: usize,
+) -> Result<CallToolResponse, ErrorData> {
+    let correlation_id = app::correlation_id()
+        .map_err(|_| ErrorData::internal_error("correlation ID generation failed", None))?;
+    let summary = ResultTooLargeSummary::from_json(value, encoded_bytes, MAX_TOOL_RESULT_BYTES);
+    let fallback = json!({
+        "code": "result_too_large",
+        "message": "structured tool result exceeded the 1 MiB transport limit",
+        "retryable": false,
+        "correlationId": correlation_id.clone(),
+        "details": result_too_large_details(&summary),
+    });
+    let fallback = match serde_json::to_vec(&fallback) {
+        Ok(encoded) if encoded.len() <= MAX_TOOL_RESULT_BYTES => fallback,
+        _ => json!({
+            "code": "result_too_large",
+            "message": "structured tool result exceeded the 1 MiB transport limit",
+            "retryable": false,
+            "correlationId": correlation_id,
+        }),
+    };
+    Ok(CallToolResult::structured_error(fallback)
         .with_meta(Some(server_info_meta()))
         .into())
 }
@@ -1194,6 +1234,33 @@ mod tests {
 
         drop(client);
         server_task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn oversized_constructed_domain_error_is_bounded_at_mcp_boundary() {
+        let secret = format!(
+            "DO-NOT-RETURN-{}",
+            "x".repeat(MAX_TOOL_RESULT_BYTES + 4_096)
+        );
+        let response = domain_error_result(
+            "upstream_error",
+            "safe error message",
+            true,
+            Some(json!({"secret": secret})),
+        )
+        .expect("bounded domain error");
+        let rmcp::model::CallToolResponse::Complete(response) = response else {
+            panic!("expected complete tool response");
+        };
+        let structured = response.structured_content.expect("structured content");
+        let encoded = serde_json::to_vec(&structured).expect("structured JSON");
+        assert!(encoded.len() <= MAX_TOOL_RESULT_BYTES);
+        assert_eq!(structured["code"], "result_too_large");
+        assert!(
+            !String::from_utf8(encoded)
+                .unwrap()
+                .contains("DO-NOT-RETURN")
+        );
     }
 
     #[test]
