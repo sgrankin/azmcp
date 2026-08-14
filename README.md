@@ -107,11 +107,26 @@ most 32 files and 4 MiB, while one artifact root can hold at most 256 files and
 non-regular destinations, traversal, overwrite, and cross-context addressing
 fail closed.
 
+The managed artifact store currently requires Unix file identities and private
+mode semantics (macOS or Linux). Other platforms fail server startup until an
+equivalent exact file-identity and private-ACL implementation is reviewed.
+The boundary isolates JavaScript/MCP callers and other OS users; it does not
+treat another hostile process running as the same OS user as a separate
+principal. Do not share or concurrently rewrite the artifact root from an
+untrusted same-UID process.
+
 Writes are staged privately and published only if the complete `azure_run`
 succeeds. A failed, timed-out, closed, or cancelled run returns no receipt and
 removes its staged files, including a file whose publication raced with
 cancellation. The audit decision `authorized` records the content-free write
 attempt; it does not claim that a later run commit succeeded.
+
+Abrupt process or host termination at the publication boundary is different
+from cancellation: the local file may have committed even if the MCP response
+was lost. azmcp removes stale unpublished temporary files on the next locked
+transaction, but cannot infer whether a durable create-only `.json` file was
+received by the client. Such an orphan remains subject to the normal root
+quota and ordinary local-shell cleanup.
 
 Artifacts deliberately survive context close, expiry, and server restart so a
 local process can consume the returned path. azmcp exposes no artifact read,
@@ -186,8 +201,9 @@ created lazily on the first explicitly granted artifact write; startup and
 ordinary Azure inspection do not create it. An existing root must already be a
 private dedicated azmcp artifact root (or an empty private directory); azmcp
 never changes permissions on an unrelated directory. One server holds the
-root lock for its lifetime so create-only checks and the documented quotas are
-root-wide rather than process-local.
+root lock while it has staged writes, releasing it after the last commit or
+rollback. This makes create-only checks and the documented quotas root-wide
+without monopolizing the standard root across Codex processes.
 
 Profile discovery uses `AZMCP_AZURE_PROFILE`, then
 `$AZURE_CONFIG_DIR/azureProfile.json`, then

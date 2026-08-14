@@ -57,28 +57,6 @@ pub trait ArtifactStore: Send + Sync {
         value: Value,
     ) -> Result<PreparedArtifact, ArtifactError>;
 
-    /// Create one immutable JSON artifact.
-    fn write_json<'a>(
-        &'a self,
-        namespace: ArtifactNamespace,
-        file_name: String,
-        value: Value,
-    ) -> ArtifactFuture<'a, ArtifactReceipt> {
-        Box::pin(async move {
-            let prepared = self.prepare_json(file_name, value)?;
-            let stage = self.stage_prepared(namespace.clone(), prepared).await?;
-            let receipt = stage.receipt().clone();
-            if let Err(error) = self
-                .commit_staged(namespace.clone(), vec![stage.clone()])
-                .await
-            {
-                let _ = self.discard_staged(namespace, vec![stage]).await;
-                return Err(error);
-            }
-            Ok(receipt)
-        })
-    }
-
     /// Stage one immutable JSON artifact without publishing its receipt path.
     fn stage_prepared<'a>(
         &'a self,
@@ -92,6 +70,14 @@ pub trait ArtifactStore: Send + Sync {
         namespace: ArtifactNamespace,
         stages: Vec<ArtifactStage>,
     ) -> ArtifactFuture<'a, ()>;
+
+    /// Release ownership after publication at the application's synchronous
+    /// commit point.
+    fn finalize_staged(
+        &self,
+        namespace: &ArtifactNamespace,
+        stages: &[ArtifactStage],
+    ) -> Result<(), ArtifactError>;
 
     /// Discard only the exact files owned by the supplied opaque stages.
     fn discard_staged<'a>(
@@ -208,7 +194,7 @@ impl fmt::Debug for PreparedArtifact {
             .debug_struct("PreparedArtifact")
             .field("file_name", &"<redacted>")
             .field("bytes", &self.bytes.len())
-            .field("sha256", &self.sha256)
+            .field("sha256", &"<redacted>")
             .finish()
     }
 }
@@ -299,7 +285,7 @@ impl fmt::Debug for ArtifactReceipt {
             .debug_struct("ArtifactReceipt")
             .field("path", &"<redacted>")
             .field("bytes", &self.bytes)
-            .field("sha256", &self.sha256)
+            .field("sha256", &"<redacted>")
             .field("media_type", &self.media_type)
             .field("sensitivity", &self.sensitivity)
             .finish()
@@ -347,17 +333,47 @@ impl FileArtifactStore {
         if !root.is_absolute() {
             return Err(ArtifactError::InvalidRoot);
         }
-        Ok(Self {
-            inner: Arc::new(FileArtifactStoreInner {
-                root,
-                limits: limits.validate()?,
-                gate: Mutex::new(StoreState::default()),
-            }),
-        })
+        let limits = limits.validate()?;
+        #[cfg(not(unix))]
+        {
+            let _ = (root, limits);
+            Err(ArtifactError::UnsupportedPlatform)
+        }
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                inner: Arc::new(FileArtifactStoreInner {
+                    root,
+                    limits,
+                    gate: Mutex::new(StoreState::default()),
+                }),
+            })
+        }
     }
 
     pub fn root(&self) -> &Path {
         &self.inner.root
+    }
+
+    #[cfg(test)]
+    async fn write_json(
+        &self,
+        namespace: ArtifactNamespace,
+        file_name: String,
+        value: Value,
+    ) -> Result<ArtifactReceipt, ArtifactError> {
+        let prepared = self.prepare_json(file_name, value)?;
+        let stage = self.stage_prepared(namespace.clone(), prepared).await?;
+        let receipt = stage.receipt().clone();
+        if let Err(error) = self
+            .commit_staged(namespace.clone(), vec![stage.clone()])
+            .await
+        {
+            let _ = self.discard_staged(namespace, vec![stage]).await;
+            return Err(error);
+        }
+        self.finalize_staged(&namespace, std::slice::from_ref(&stage))?;
+        Ok(receipt)
     }
 
     fn prepare_json_value(
@@ -392,47 +408,54 @@ impl FileArtifactStore {
             .gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ensure_store_ready(&self.inner.root, &mut state)?;
-        let snapshot = scan_root(&self.inner.root, namespace)?;
-        ensure_capacity(
-            snapshot.root,
-            snapshot.context,
-            prepared.bytes.len(),
-            self.inner.limits,
-        )?;
-        let namespace_path = self.inner.root.join(namespace.as_str());
-        if !snapshot.namespace_exists {
-            create_private_directory(&namespace_path).map_err(|_| ArtifactError::Unavailable)?;
-        }
-        validate_namespace_path(&namespace_path)?;
+        let result = (|| {
+            ensure_store_ready(&self.inner.root, &mut state)?;
+            let snapshot = scan_root(&self.inner.root, namespace)?;
+            ensure_capacity(
+                snapshot.root,
+                snapshot.context,
+                prepared.bytes.len(),
+                self.inner.limits,
+            )?;
+            let namespace_path = self.inner.root.join(namespace.as_str());
+            if !snapshot.namespace_exists {
+                create_private_directory(&namespace_path)
+                    .map_err(|_| ArtifactError::Unavailable)?;
+            }
+            validate_namespace_path(&namespace_path)?;
 
-        let destination = namespace_path.join(&prepared.file_name);
-        if state.reservations.contains_key(&destination) {
-            return Err(ArtifactError::DestinationExists);
-        }
-        reject_existing_destination(&destination)?;
-        let temporary_path = unique_temporary_path(&namespace_path)?;
-        let mut temporary = TemporaryArtifact::create(temporary_path)?;
-        temporary.write_all(&prepared.bytes)?;
-        let (staging_path, identity) = temporary.retain()?;
-        let stage_id = random_name("stage_")?;
-        let receipt =
-            ArtifactReceipt::new(destination.clone(), prepared.bytes.len(), prepared.sha256);
-        state.reservations.insert(
-            destination,
-            Reservation {
-                stage_id: stage_id.clone(),
-                staging_path: staging_path.clone(),
+            let destination = namespace_path.join(&prepared.file_name);
+            if state.reservations.contains_key(&destination) {
+                return Err(ArtifactError::DestinationExists);
+            }
+            reject_existing_destination(&destination)?;
+            let temporary_path = unique_temporary_path(&namespace_path)?;
+            let mut temporary = TemporaryArtifact::create(temporary_path)?;
+            temporary.write_all(&prepared.bytes)?;
+            let stage_id = random_name("stage_")?;
+            let (staging_path, identity) = temporary.retain()?;
+            let receipt =
+                ArtifactReceipt::new(destination.clone(), prepared.bytes.len(), prepared.sha256);
+            state.reservations.insert(
+                destination,
+                Reservation {
+                    stage_id: stage_id.clone(),
+                    staging_path: staging_path.clone(),
+                    identity,
+                },
+            );
+            Ok(ArtifactStage {
+                id: stage_id,
+                namespace: namespace.as_str().to_owned(),
+                staging_path,
+                receipt,
                 identity,
-            },
-        );
-        Ok(ArtifactStage {
-            id: stage_id,
-            namespace: namespace.as_str().to_owned(),
-            staging_path,
-            receipt,
-            identity,
-        })
+            })
+        })();
+        if result.is_err() {
+            release_root_if_idle(&mut state);
+        }
+        result
     }
 
     fn commit_staged_blocking(
@@ -440,6 +463,9 @@ impl FileArtifactStore {
         namespace: &ArtifactNamespace,
         stages: &[ArtifactStage],
     ) -> Result<(), ArtifactError> {
+        if stages.is_empty() {
+            return Ok(());
+        }
         let mut state = self
             .inner
             .gate
@@ -471,12 +497,38 @@ impl FileArtifactStore {
             Ok(())
         })();
         if let Err(error) = publish {
-            let _ = discard_exact_files(stages);
+            discard_exact_files(stages)?;
             return Err(error);
+        }
+        Ok(())
+    }
+
+    fn finalize_staged_now(
+        &self,
+        namespace: &ArtifactNamespace,
+        stages: &[ArtifactStage],
+    ) -> Result<(), ArtifactError> {
+        let mut state = self
+            .inner
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ensure_store_ready(&self.inner.root, &mut state)?;
+        for stage in stages {
+            if stage.namespace != namespace.as_str() {
+                return Err(ArtifactError::ReceiptMismatch);
+            }
+            let reservation = state
+                .reservations
+                .get(stage.receipt.path())
+                .ok_or(ArtifactError::ReceiptMismatch)?;
+            validate_reservation(reservation, stage)?;
+            require_exact_artifact(stage.receipt.path(), stage)?;
         }
         for stage in stages {
             state.reservations.remove(stage.receipt.path());
         }
+        release_root_if_idle(&mut state);
         Ok(())
     }
 
@@ -512,6 +564,7 @@ impl FileArtifactStore {
         }
         let namespace_path = self.inner.root.join(namespace.as_str());
         remove_directory_if_empty(&namespace_path)?;
+        release_root_if_idle(&mut state);
         first_error.map_or(Ok(()), Err)
     }
 
@@ -574,6 +627,13 @@ fn validate_reservation(
     Ok(())
 }
 
+fn release_root_if_idle(state: &mut StoreState) {
+    if state.reservations.is_empty() {
+        state.root_identity = None;
+        state.root_lock = None;
+    }
+}
+
 impl fmt::Debug for FileArtifactStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -623,6 +683,14 @@ impl ArtifactStore for FileArtifactStore {
         })
     }
 
+    fn finalize_staged(
+        &self,
+        namespace: &ArtifactNamespace,
+        stages: &[ArtifactStage],
+    ) -> Result<(), ArtifactError> {
+        self.finalize_staged_now(namespace, stages)
+    }
+
     fn discard_staged<'a>(
         &'a self,
         namespace: ArtifactNamespace,
@@ -644,6 +712,8 @@ pub enum ArtifactError {
     InvalidRoot,
     #[error("artifact storage limits are invalid")]
     InvalidLimits,
+    #[error("artifact storage is unsupported on this platform")]
+    UnsupportedPlatform,
     #[error("artifact file name is invalid")]
     InvalidFileName,
     #[error("artifact contains {bytes} bytes, exceeding the {limit}-byte limit")]
@@ -709,6 +779,22 @@ fn ensure_store_ready(root: &Path, state: &mut StoreState) -> Result<(), Artifac
         if metadata.file_type().is_symlink()
             || !metadata.is_dir()
             || file_identity(&metadata)? != expected
+        {
+            return Err(ArtifactError::UnsafeRoot);
+        }
+        validate_private_owned_directory(&metadata, ArtifactError::UnsafeRoot)?;
+        let held_lock = state.root_lock.as_ref().ok_or(ArtifactError::UnsafeRoot)?;
+        let held_identity = file_identity(
+            &held_lock
+                .metadata()
+                .map_err(|_| ArtifactError::Unavailable)?,
+        )?;
+        let lock_path = root.join(ROOT_LOCK_FILE);
+        let lock_metadata =
+            fs::symlink_metadata(&lock_path).map_err(|_| ArtifactError::UnsafeRoot)?;
+        validate_private_owned_file(&lock_metadata, ArtifactError::UnsafeRoot)?;
+        if file_identity(&lock_metadata)? != held_identity
+            || fs::read(lock_path).map_err(|_| ArtifactError::Unavailable)? != ROOT_LOCK_CONTENT
         {
             return Err(ArtifactError::UnsafeRoot);
         }
@@ -1022,16 +1108,10 @@ fn file_identity(metadata: &fs::Metadata) -> Result<FileIdentity, ArtifactError>
 }
 
 #[cfg(not(unix))]
-fn file_identity(metadata: &fs::Metadata) -> Result<FileIdentity, ArtifactError> {
-    let modified = metadata
-        .modified()
-        .map_err(|_| ArtifactError::Unavailable)?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| ArtifactError::Unavailable)?;
-    Ok(FileIdentity {
-        device: metadata.len(),
-        inode: modified.as_nanos() as u64,
-    })
+fn file_identity(_metadata: &fs::Metadata) -> Result<FileIdentity, ArtifactError> {
+    // Exact rollback ownership is part of the safety boundary. Add the
+    // platform's stable volume/file identity before enabling artifacts there.
+    Err(ArtifactError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]
@@ -1607,6 +1687,19 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = FileArtifactStore::new(directory.path().join("artifacts")).unwrap();
         let namespace = store.allocate_namespace().unwrap();
+        store
+            .commit_staged(namespace.clone(), Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .inner
+                .gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .root_lock
+                .is_none()
+        );
         let prepared = store
             .prepare_json("result.json".to_owned(), json!({"answer": 42}))
             .unwrap();
@@ -1624,11 +1717,82 @@ mod tests {
         );
 
         store
-            .commit_staged(namespace, vec![stage.clone()])
+            .commit_staged(namespace.clone(), vec![stage.clone()])
             .await
             .unwrap();
+        let second = FileArtifactStore::new(directory.path().join("artifacts")).unwrap();
+        assert_eq!(
+            second
+                .write_json(
+                    second.allocate_namespace().unwrap(),
+                    "blocked.json".to_owned(),
+                    json!(null),
+                )
+                .await
+                .expect_err("published stage still owns rollback boundary"),
+            ArtifactError::RootInUse
+        );
+        store
+            .finalize_staged(&namespace, std::slice::from_ref(&stage))
+            .unwrap();
+        second
+            .write_json(
+                second.allocate_namespace().unwrap(),
+                "accepted.json".to_owned(),
+                json!(null),
+            )
+            .await
+            .expect("finalized stage releases root");
         assert!(stage.receipt().path().is_file());
         assert!(!stage.staging_path.exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_a_replaced_published_file_and_retains_ownership() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("artifacts");
+        let store = FileArtifactStore::new(&root).unwrap();
+        let namespace = store.allocate_namespace().unwrap();
+        let stage = store
+            .stage_prepared(
+                namespace.clone(),
+                store
+                    .prepare_json("result.json".to_owned(), json!({"answer": 42}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .commit_staged(namespace.clone(), vec![stage.clone()])
+            .await
+            .unwrap();
+
+        let bytes = fs::read(stage.receipt().path()).unwrap();
+        fs::remove_file(stage.receipt().path()).unwrap();
+        let mut replacement = open_private_new(stage.receipt().path()).unwrap();
+        replacement.write_all(&bytes).unwrap();
+        replacement.sync_all().unwrap();
+        drop(replacement);
+
+        assert_eq!(
+            store
+                .finalize_staged(&namespace, std::slice::from_ref(&stage))
+                .expect_err("replaced published file"),
+            ArtifactError::ReceiptMismatch
+        );
+        let second = FileArtifactStore::new(&root).unwrap();
+        assert_eq!(
+            second
+                .write_json(
+                    second.allocate_namespace().unwrap(),
+                    "blocked.json".to_owned(),
+                    json!(null),
+                )
+                .await
+                .expect_err("failed finalize retains the root lock"),
+            ArtifactError::RootInUse
+        );
+        assert_eq!(fs::read(stage.receipt().path()).unwrap(), bytes);
     }
 
     #[tokio::test]
@@ -1671,6 +1835,50 @@ mod tests {
         assert!(receipt.path().is_file());
         assert!(!abandoned.staging_path.exists());
         assert!(!abandoned.receipt().path().exists());
+    }
+
+    #[tokio::test]
+    async fn resolving_the_last_stage_releases_the_root_for_another_store() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("artifacts");
+        let first = FileArtifactStore::new(&root).unwrap();
+        let first_namespace = first.allocate_namespace().unwrap();
+        let stage = first
+            .stage_prepared(
+                first_namespace.clone(),
+                first
+                    .prepare_json("temporary.json".to_owned(), json!(null))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second = FileArtifactStore::new(&root).unwrap();
+        assert_eq!(
+            second
+                .write_json(
+                    second.allocate_namespace().unwrap(),
+                    "blocked.json".to_owned(),
+                    json!(null),
+                )
+                .await
+                .expect_err("active transaction owns root"),
+            ArtifactError::RootInUse
+        );
+
+        first
+            .discard_staged(first_namespace, vec![stage])
+            .await
+            .unwrap();
+        let receipt = second
+            .write_json(
+                second.allocate_namespace().unwrap(),
+                "accepted.json".to_owned(),
+                json!(null),
+            )
+            .await
+            .expect("resolved transaction releases root");
+        assert!(receipt.path().is_file());
+        drop(first);
     }
 
     #[cfg(unix)]
@@ -1749,11 +1957,13 @@ mod tests {
         let root = directory.path().join("artifacts");
         let moved = directory.path().join("moved-artifacts");
         let store = FileArtifactStore::new(&root).unwrap();
-        store
-            .write_json(
-                store.allocate_namespace().unwrap(),
-                "first.json".to_owned(),
-                json!(null),
+        let namespace = store.allocate_namespace().unwrap();
+        let _pending = store
+            .stage_prepared(
+                namespace,
+                store
+                    .prepare_json("first.json".to_owned(), json!(null))
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -1773,6 +1983,41 @@ mod tests {
         );
         assert!(moved.join(ROOT_LOCK_FILE).is_file());
         assert!(fs::read_dir(&root).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn replacing_the_lock_file_after_acquisition_is_fail_closed() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("artifacts");
+        let store = FileArtifactStore::new(&root).unwrap();
+        let namespace = store.allocate_namespace().unwrap();
+        let _pending = store
+            .stage_prepared(
+                namespace,
+                store
+                    .prepare_json("first.json".to_owned(), json!(null))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let lock_path = root.join(ROOT_LOCK_FILE);
+        fs::remove_file(&lock_path).unwrap();
+        let mut replacement = open_private_new(&lock_path).unwrap();
+        replacement.write_all(ROOT_LOCK_CONTENT).unwrap();
+        replacement.sync_all().unwrap();
+        drop(replacement);
+
+        assert_eq!(
+            store
+                .write_json(
+                    store.allocate_namespace().unwrap(),
+                    "second.json".to_owned(),
+                    json!(null),
+                )
+                .await
+                .expect_err("replaced lock"),
+            ArtifactError::UnsafeRoot
+        );
     }
 
     #[cfg(unix)]

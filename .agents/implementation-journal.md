@@ -19,7 +19,7 @@
   `azure_accounts` requests over real stdio using a synthetic temporary home, the standard
   config/profile/state paths, and an explicitly injected fake Azure executable.
 - The core test suite uses only synthetic profiles, fake executables, and loopback HTTP.
-  The current combined gate passes 225 tests: 96 azmcp unit, one modern observability E2E,
+  The current combined gate passes 231 tests: 102 azmcp unit, one modern observability E2E,
   one modern stdio, eight worker subprocess, 113 core, and six routegen CLI tests.
   Formatting, warning-free workspace clippy, the 18-route/12-schema routegen check, and the
   complete release build also pass.
@@ -156,9 +156,10 @@
   surface is exposed.
 - Artifact writes are prepared once, audited as `authorized`, staged under an opaque ownership
   ticket, and published only after the complete run succeeds. Cancellation and failure delete
-  only the exact staged inode, including after publication races. A lifetime-held root lock makes
-  quotas and filename reservations root-wide; private dedicated-root validation occurs before
-  mutation, and stale unpublished stages are scavenged only after acquiring that lock.
+  only the exact staged inode, including after publication races. A root lock held while any local
+  stage is unresolved makes quotas and filename reservations root-wide without monopolizing the
+  standard root between transactions; private dedicated-root validation occurs before mutation,
+  and stale unpublished stages are scavenged only after acquiring that lock.
 
 ## Open risks
 
@@ -184,3 +185,11 @@
 - Managed artifact inputs currently share the worker host-call ceiling, so one file is capped at
   480 KiB. Multi-megabyte KQL exports need a separately reviewed parent-owned streaming protocol;
   the current implementation must not widen the worker message bound to simulate streaming.
+- A process or host crash at the artifact publication boundary can leave a durable create-only
+  `.json` file whose receipt response was lost. Startup safely scavenges unpublished temporary
+  files, but distinguishing a committed file from a lost response requires a future durable
+  client-acknowledgement protocol; such files remain quota-bound and locally removable.
+- The artifact boundary isolates the worker/MCP caller and other OS users, not a hostile process
+  already running as the same OS user. Path operations validate private shapes, root/lock
+  identities, and exact staged inodes, but do not use directory-handle-relative syscalls to defend
+  every check/use race against a same-UID process that can already rewrite the private root.

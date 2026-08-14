@@ -793,25 +793,27 @@ impl Drop for RunAbortGuard {
             slot.signal_cancel();
         }
         let cleanup = async move {
-            let Some(inner) = inner.upgrade() else {
-                return;
-            };
             let slot = if let Some(slot) = slot {
-                let mut workers = inner.workers.lock().await;
-                if workers
-                    .get(&id)
-                    .is_some_and(|current| Arc::ptr_eq(current, &slot))
-                {
-                    workers.remove(&id);
+                if let Some(inner) = inner.upgrade() {
+                    let mut workers = inner.workers.lock().await;
+                    if workers
+                        .get(&id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &slot))
+                    {
+                        workers.remove(&id);
+                    }
                 }
                 slot
             } else {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
                 let Some(slot) = inner.workers.lock().await.remove(&id) else {
                     return;
                 };
                 slot
             };
-            slot.cancel().await;
+            let _ = slot.cancel().await;
             let mut handle = slot.worker.lock().await;
             let _ = handle.terminate().await;
         };
@@ -850,10 +852,10 @@ impl WorkerSlot {
         self.cancellation.send_replace(true);
     }
 
-    async fn cancel(&self) {
+    async fn cancel(&self) -> Result<(), ArtifactError> {
         self.signal_cancel();
         self.refs.lock().await.clear();
-        let _ = self.rollback_pending_artifacts().await;
+        self.rollback_pending_artifacts().await
     }
 
     async fn stage_artifact(&self, stage: ArtifactStage) -> Result<(), ArtifactStage> {
@@ -867,6 +869,21 @@ impl WorkerSlot {
 
     async fn commit_pending_artifacts(&self) -> Result<(), ArtifactError> {
         let mut pending = self.pending_artifacts.lock().await;
+        if *self.cancellation.borrow() {
+            if !pending.is_empty() {
+                let (Some(store), Some(namespace)) = (
+                    self.artifact_store.as_ref(),
+                    self.artifact_namespace.as_ref(),
+                ) else {
+                    return Err(ArtifactError::Unavailable);
+                };
+                store
+                    .discard_staged(namespace.clone(), pending.clone())
+                    .await?;
+                pending.clear();
+            }
+            return Err(ArtifactError::Unavailable);
+        }
         if pending.is_empty() {
             return Ok(());
         }
@@ -877,17 +894,18 @@ impl WorkerSlot {
             return Err(ArtifactError::Unavailable);
         };
         let stages = pending.clone();
+        store
+            .commit_staged(namespace.clone(), stages.clone())
+            .await?;
         if *self.cancellation.borrow() {
             store.discard_staged(namespace.clone(), stages).await?;
-        } else {
-            store
-                .commit_staged(namespace.clone(), stages.clone())
-                .await?;
-            if *self.cancellation.borrow() {
-                store.discard_staged(namespace.clone(), stages).await?;
-                return Err(ArtifactError::Unavailable);
-            }
+            pending.clear();
+            return Err(ArtifactError::Unavailable);
         }
+        // There is deliberately no await between the final cancellation check
+        // and clearing ownership. Publication wins at this boundary; the MCP
+        // layer prioritizes the now-complete run over simultaneous cancellation.
+        store.finalize_staged(namespace, &stages)?;
         pending.clear();
         Ok(())
     }
@@ -1506,19 +1524,29 @@ impl Application {
                             run_result(value, result, records, context, correlation_id)
                         }
                         Err(error) => {
-                            let _ = worker.rollback_pending_artifacts().await;
+                            let rollback_failed =
+                                worker.rollback_pending_artifacts().await.is_err();
                             drop(lease);
                             let _ = self.inner.registry.close(id.as_str());
                             let _ = self.close_worker(id.as_str()).await;
-                            Err(AppError::new(map_artifact_error(error)))
+                            let code = if rollback_failed {
+                                AppErrorCode::UpstreamError
+                            } else {
+                                map_artifact_error(error)
+                            };
+                            Err(AppError::new(code))
                         }
                     },
                     Err(error) => {
-                        let _ = worker.rollback_pending_artifacts().await;
+                        let rollback_failed = worker.rollback_pending_artifacts().await.is_err();
                         drop(lease);
                         let _ = self.inner.registry.close(id.as_str());
                         let _ = self.close_worker(id.as_str()).await;
-                        Err(error)
+                        if rollback_failed {
+                            Err(AppError::new(AppErrorCode::UpstreamError))
+                        } else {
+                            Err(error)
+                        }
                     }
                 }
             }
@@ -1762,16 +1790,18 @@ async fn close_worker_inner(inner: &ApplicationInner, id: &str) -> Result<(), Ap
     let Some(worker) = worker else {
         return Ok(());
     };
-    worker.cancel().await;
+    let cleanup = worker.cancel().await;
     let Ok(mut handle) = worker.worker.try_lock() else {
         // An active run owns the worker mutex and will hard-terminate it
         // after observing the cancellation signal.
-        return Ok(());
+        return cleanup.map_err(|_| AppError::new(AppErrorCode::UpstreamError));
     };
-    handle
+    let terminated = handle
         .terminate()
         .await
-        .map_err(|_| AppError::new(AppErrorCode::WorkerCloseFailed))
+        .map_err(|_| AppError::new(AppErrorCode::WorkerCloseFailed));
+    cleanup.map_err(|_| AppError::new(AppErrorCode::UpstreamError))?;
+    terminated
 }
 
 fn parse_context_id(value: &str) -> Result<String, AppError> {
@@ -2208,6 +2238,7 @@ fn map_artifact_error(error: ArtifactError) -> AppErrorCode {
         }
         ArtifactError::InvalidRoot
         | ArtifactError::InvalidLimits
+        | ArtifactError::UnsupportedPlatform
         | ArtifactError::RootInUse
         | ArtifactError::UnsafeRoot
         | ArtifactError::UnsafeNamespace
@@ -2752,6 +2783,14 @@ mod tests {
             self.delegate.commit_staged(namespace, stages)
         }
 
+        fn finalize_staged(
+            &self,
+            namespace: &ArtifactNamespace,
+            stages: &[ArtifactStage],
+        ) -> Result<(), ArtifactError> {
+            self.delegate.finalize_staged(namespace, stages)
+        }
+
         fn discard_staged<'a>(
             &'a self,
             namespace: ArtifactNamespace,
@@ -2797,6 +2836,14 @@ mod tests {
                 self.release.notified().await;
                 Ok(())
             })
+        }
+
+        fn finalize_staged(
+            &self,
+            namespace: &ArtifactNamespace,
+            stages: &[ArtifactStage],
+        ) -> Result<(), ArtifactError> {
+            self.delegate.finalize_staged(namespace, stages)
         }
 
         fn discard_staged<'a>(
@@ -3547,9 +3594,42 @@ mod tests {
             assert_eq!(refs.len(), 1);
         }
 
-        slot.cancel().await;
+        slot.cancel().await.expect("cancel worker slot");
 
         assert!(slot.refs.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_slot_cannot_commit_after_close_already_cleared_its_stage() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let artifact_root = temporary.path().join("artifacts");
+        let store = Arc::new(FileArtifactStore::new(&artifact_root).expect("artifact store"));
+        let namespace = store.allocate_namespace().expect("namespace");
+        let slot = WorkerSlot::new(
+            Box::new(FakeWorker { state: state(None) }),
+            CredentialIdentityPin::new(),
+        )
+        .with_artifact_binding(Some(namespace.clone()), Some(store.clone()));
+        let stage = store
+            .stage_prepared(
+                namespace,
+                store
+                    .prepare_json("result.json".to_owned(), serde_json::json!({"ok": true}))
+                    .expect("prepared artifact"),
+            )
+            .await
+            .expect("staged artifact");
+        slot.stage_artifact(stage).await.expect("pending stage");
+
+        slot.cancel().await.expect("cancel artifact slot");
+
+        assert_eq!(
+            slot.commit_pending_artifacts()
+                .await
+                .expect_err("cancelled slot cannot report commit success"),
+            ArtifactError::Unavailable
+        );
+        assert!(artifact_json_files(&artifact_root).is_empty());
     }
 
     #[tokio::test]
@@ -3991,6 +4071,165 @@ mod tests {
                 .kind(),
             AppErrorCode::ContextNotFound
         );
+    }
+
+    #[tokio::test]
+    async fn aborted_last_application_after_publication_still_cleans_the_slot() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let artifact_root = temporary.path().join("artifacts");
+        let store = Arc::new(CommitGatedArtifactStore {
+            delegate: FileArtifactStore::new(&artifact_root).expect("artifact store"),
+            committed: Notify::new(),
+            release: Notify::new(),
+            removed: Notify::new(),
+        });
+        let application = Application::from_arcs(
+            Config::empty(),
+            default_registry().expect("registry"),
+            Arc::new(MemoryProfileSource::new(profile(&row(
+                SUB,
+                TENANT,
+                "AzureCloud",
+                "alice",
+            )))),
+            Arc::new(Validator::default()),
+            Arc::new(RefFactory),
+            DEFAULT_POLICY_HASH,
+            DEFAULT_POLICY_VERSION,
+        )
+        .expect("application")
+        .with_audit_sink(Arc::new(RecordingAudit::default()))
+        .with_artifact_store(store.clone());
+        let opened = application
+            .context_open(ContextOpenArgs {
+                local_capabilities: vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()],
+                ..ContextOpenArgs::default()
+            })
+            .await
+            .expect("context");
+        let running = application.clone();
+        let task = tokio::spawn(async move {
+            running
+                .run(RunArgs {
+                    context_id: opened.context_id,
+                    code: "__artifact__".to_owned(),
+                    timeout_ms: None,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), store.committed.notified())
+            .await
+            .expect("artifact reached publication boundary");
+        assert_eq!(artifact_json_files(&artifact_root).len(), 1);
+
+        drop(application);
+        task.abort();
+        assert!(task.await.expect_err("aborted run").is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), store.removed.notified())
+            .await
+            .expect("published artifact removed without application inner");
+        assert!(artifact_json_files(&artifact_root).is_empty());
+
+        let second = FileArtifactStore::new(&artifact_root).expect("second store");
+        let namespace = second.allocate_namespace().expect("second namespace");
+        let prepared = second
+            .prepare_json("after-abort.json".to_owned(), json!(null))
+            .expect("prepare after abort");
+        let stage = second
+            .stage_prepared(namespace.clone(), prepared)
+            .await
+            .expect("abort cleanup releases root ownership");
+        second
+            .discard_staged(namespace, vec![stage])
+            .await
+            .expect("clean second stage");
+    }
+
+    #[tokio::test]
+    async fn close_racing_artifact_commit_returns_no_deleted_receipt() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let artifact_root = temporary.path().join("artifacts");
+        let store = Arc::new(CommitGatedArtifactStore {
+            delegate: FileArtifactStore::new(&artifact_root).expect("artifact store"),
+            committed: Notify::new(),
+            release: Notify::new(),
+            removed: Notify::new(),
+        });
+        let application = Application::from_arcs(
+            Config::empty(),
+            default_registry().expect("registry"),
+            Arc::new(MemoryProfileSource::new(profile(&row(
+                SUB,
+                TENANT,
+                "AzureCloud",
+                "alice",
+            )))),
+            Arc::new(Validator::default()),
+            Arc::new(RefFactory),
+            DEFAULT_POLICY_HASH,
+            DEFAULT_POLICY_VERSION,
+        )
+        .expect("application")
+        .with_audit_sink(Arc::new(RecordingAudit::default()))
+        .with_artifact_store(store.clone());
+        let opened = application
+            .context_open(ContextOpenArgs {
+                local_capabilities: vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()],
+                ..ContextOpenArgs::default()
+            })
+            .await
+            .expect("context");
+        let running = application.clone();
+        let context_id = opened.context_id.clone();
+        let run_task = tokio::spawn(async move {
+            running
+                .run(RunArgs {
+                    context_id,
+                    code: "__artifact__".to_owned(),
+                    timeout_ms: None,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), store.committed.notified())
+            .await
+            .expect("artifact reached publication boundary");
+        let slot = application
+            .inner
+            .workers
+            .lock()
+            .await
+            .get(opened.context_id.as_str())
+            .cloned()
+            .expect("worker slot");
+        let mut cancellation = slot.subscribe();
+        let closing = application.clone();
+        let close_context_id = opened.context_id;
+        let close_task = tokio::spawn(async move {
+            closing
+                .context_close(ContextCloseArgs {
+                    context_id: close_context_id,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), cancellation.changed())
+            .await
+            .expect("close signalled cancellation")
+            .expect("cancellation sender");
+        store.release.notify_one();
+
+        assert_eq!(
+            run_task
+                .await
+                .expect("run task")
+                .expect_err("cancelled commit")
+                .kind(),
+            AppErrorCode::UpstreamError
+        );
+        close_task
+            .await
+            .expect("close task")
+            .expect("close context");
+        assert!(artifact_json_files(&artifact_root).is_empty());
     }
 
     #[tokio::test]

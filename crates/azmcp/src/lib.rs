@@ -175,6 +175,7 @@ impl ServerHandler for AzmcpServer {
                 let args = parse_tool_args::<RunArgs>(request.arguments)?;
                 let context_id = args.context_id.clone();
                 let result = tokio::select! {
+                    biased;
                     result = self.application.run(args) => Some(result),
                     _ = context.ct.cancelled() => None,
                 };
