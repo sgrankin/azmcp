@@ -15,7 +15,10 @@ use thiserror::Error;
 
 use crate::{
     cloud::AzureCloud,
-    policy::{ArmTier, HttpMethod, ReviewedRoute, RoutePurpose},
+    policy::{
+        ArmTier, ExecutableSelector, HttpMethod, ReviewedRoute, RoutePurpose,
+        executable_selectors_overlap,
+    },
     route_manifest::{
         ManifestRoute, ManifestRoutePurpose, ManifestSchema, ManifestUpstreamSource, RouteManifest,
     },
@@ -347,7 +350,7 @@ pub fn merge_into_manifest(
         .iter()
         .map(|schema| schema.entry_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut added_routes = Vec::new();
+    let mut added_routes: Vec<ManifestRoute> = Vec::new();
     let mut added_schemas = Vec::new();
     for (index, selected) in review.operations.iter().enumerate() {
         let Some(operation) = by_id.get(selected.operation_id.as_str()) else {
@@ -375,13 +378,41 @@ pub fn merge_into_manifest(
             arm_tier: ArmTier::Inspect,
             allowed_query_parameters: selected.allowed_query_parameters.clone(),
         };
-        if !manifest
-            .routes()
-            .any(|known| executable_selectors_overlap(known, &route))
-            && !added_routes
-                .iter()
-                .any(|known| executable_selectors_overlap(known, &route))
-            && !route_keys.contains(&route_key(&route))
+        if !manifest.routes().any(|known| {
+            executable_selectors_overlap(
+                &ExecutableSelector::new(
+                    known.cloud,
+                    known.purpose.route_purpose(),
+                    known.method,
+                    &known.path_template,
+                    &known.api_versions,
+                ),
+                &ExecutableSelector::new(
+                    route.cloud,
+                    route.purpose.route_purpose(),
+                    route.method,
+                    &route.path_template,
+                    &route.api_versions,
+                ),
+            )
+        }) && !added_routes.iter().any(|known| {
+            executable_selectors_overlap(
+                &ExecutableSelector::new(
+                    known.cloud,
+                    known.purpose.route_purpose(),
+                    known.method,
+                    &known.path_template,
+                    &known.api_versions,
+                ),
+                &ExecutableSelector::new(
+                    route.cloud,
+                    route.purpose.route_purpose(),
+                    route.method,
+                    &route.path_template,
+                    &route.api_versions,
+                ),
+            )
+        }) && !route_keys.contains(&route_key(&route))
             && !added_routes
                 .iter()
                 .any(|known| route_key(known) == route_key(&route))
@@ -640,17 +671,6 @@ fn route_key(route: &ManifestRoute) -> String {
     )
 }
 
-fn executable_selectors_overlap(left: &ManifestRoute, right: &ManifestRoute) -> bool {
-    left.cloud == right.cloud
-        && left.purpose == right.purpose
-        && left.method == right.method
-        && left.path_template == right.path_template
-        && left
-            .api_versions
-            .iter()
-            .any(|version| right.api_versions.iter().any(|other| version == other))
-}
-
 fn request_argument_schema(
     cloud: AzureCloud,
     request_path: &str,
@@ -903,6 +923,27 @@ mod tests {
                 validate_catalog(&catalog),
                 Err(UpstreamError::InvalidOperation { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn generation_rejects_semantically_overlapping_reviewed_routes() {
+        for path_template in [
+            "/subscriptions/{subscription}/PROVIDERS/{provider}",
+            "/subscriptions/{subscription}/{other}/providers",
+        ] {
+            let (mut catalog, mut review) = fixtures();
+            catalog.operations[0].path_template = path_template.to_owned();
+            catalog.operations[0].api_versions = vec!["2021-04-01".to_owned()];
+            catalog.source.catalog_sha256 = computed_catalog_hash(&catalog).expect("catalog hash");
+            review.upstream.catalog_sha256 = catalog.source.catalog_sha256.clone();
+            review.review_sha256 = computed_review_hash(&review).expect("review hash");
+            let base = route_manifest::checked_in_manifest().expect("base manifest");
+            let result = generate_manifest(&base, &catalog, &review);
+            assert!(
+                matches!(result, Err(UpstreamError::Collision)),
+                "{path_template}: {result:?}"
+            );
         }
     }
 }

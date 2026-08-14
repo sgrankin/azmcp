@@ -13,7 +13,10 @@ use thiserror::Error;
 
 use crate::{
     cloud::AzureCloud,
-    policy::{ArmTier, HttpMethod, PolicyBundle, ReviewedRoute, RoutePurpose},
+    policy::{
+        ArmTier, ExecutableSelector, HttpMethod, PolicyBundle, ReviewedRoute, RoutePurpose,
+        executable_selectors_overlap,
+    },
 };
 
 /// Repository-relative path of the checked-in reviewed source fixture.
@@ -283,10 +286,24 @@ fn validate_manifest_with_hash(
                 reason: "query parameter policy is empty, overlarge, or unbounded".to_owned(),
             });
         }
-        if manifest.routes[..index]
-            .iter()
-            .any(|previous| executable_selectors_overlap(previous, route))
-        {
+        if manifest.routes[..index].iter().any(|previous| {
+            executable_selectors_overlap(
+                &ExecutableSelector::new(
+                    previous.cloud,
+                    previous.purpose.route_purpose(),
+                    previous.method,
+                    &previous.path_template,
+                    &previous.api_versions,
+                ),
+                &ExecutableSelector::new(
+                    route.cloud,
+                    route.purpose.route_purpose(),
+                    route.method,
+                    &route.path_template,
+                    &route.api_versions,
+                ),
+            )
+        }) {
             return Err(ManifestError::DuplicateRoute { index });
         }
         let reviewed = reviewed_route(route)
@@ -630,17 +647,6 @@ fn valid_sha256(value: &str) -> bool {
         && value[7..]
             .chars()
             .all(|character| character.is_ascii_hexdigit())
-}
-
-fn executable_selectors_overlap(left: &ManifestRoute, right: &ManifestRoute) -> bool {
-    left.cloud == right.cloud
-        && left.purpose == right.purpose
-        && left.method == right.method
-        && left.path_template == right.path_template
-        && left
-            .api_versions
-            .iter()
-            .any(|version| right.api_versions.iter().any(|other| version == other))
 }
 
 fn discoverable(purpose: ManifestRoutePurpose) -> bool {

@@ -1,5 +1,7 @@
 //! Fail-closed matching against reviewed ARM route rows.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -206,10 +208,12 @@ impl PolicyBundle {
             return Err(InvalidPolicyBundle::Routes);
         }
         for (index, route) in routes.iter().enumerate() {
-            if routes[..index]
-                .iter()
-                .any(|previous| executable_selectors_overlap(previous, route))
-            {
+            if routes[..index].iter().any(|previous| {
+                executable_selectors_overlap(
+                    &ExecutableSelector::from_route(previous),
+                    &ExecutableSelector::from_route(route),
+                )
+            }) {
                 return Err(InvalidPolicyBundle::OverlappingRoutes);
             }
         }
@@ -414,6 +418,170 @@ impl RouteTemplate {
     }
 }
 
+/// Return whether two route templates can match the same request at the same
+/// specificity.  This uses the same literal, parameter, and `resourceUri`
+/// tail semantics as [`RouteTemplate::matches`], rather than comparing the
+/// source strings literally.
+pub(crate) fn templates_overlap(left: &str, right: &str) -> bool {
+    let Ok(left) = RouteTemplate::parse(left) else {
+        return false;
+    };
+    let Ok(right) = RouteTemplate::parse(right) else {
+        return false;
+    };
+    if left.literal_count != right.literal_count {
+        return false;
+    }
+
+    let left_min = left.segments.len();
+    let right_min = right.segments.len();
+    let minimum = left_min.max(right_min);
+    let maximum = if left.has_tail() || right.has_tail() {
+        left_min + right_min
+    } else {
+        minimum
+    };
+    (minimum..=maximum).any(|length| {
+        let Some(left) = expand_template(&left, length) else {
+            return false;
+        };
+        let Some(right) = expand_template(&right, length) else {
+            return false;
+        };
+        token_sequences_overlap(&left, &right)
+    })
+}
+
+impl RouteTemplate {
+    fn has_tail(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|segment| matches!(segment, TemplateSegment::TailParameter(_)))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MatchToken {
+    Literal(String),
+    Parameter(String),
+    Any,
+}
+
+fn expand_template(template: &RouteTemplate, length: usize) -> Option<Vec<MatchToken>> {
+    let base_length = template.segments.len();
+    let extra = if template.has_tail() {
+        length.checked_sub(base_length)?
+    } else {
+        if length != base_length {
+            return None;
+        }
+        0
+    };
+    let mut expanded = Vec::with_capacity(length);
+    for segment in &template.segments {
+        match segment {
+            TemplateSegment::Literal(value) => expanded.push(MatchToken::Literal(value.clone())),
+            TemplateSegment::Parameter(value) => {
+                expanded.push(MatchToken::Parameter(value.clone()))
+            }
+            TemplateSegment::TailParameter(_) => {
+                expanded.push(MatchToken::Any);
+                expanded.extend((0..extra).map(|_| MatchToken::Any));
+            }
+        }
+    }
+    Some(expanded)
+}
+
+fn token_sequences_overlap(left: &[MatchToken], right: &[MatchToken]) -> bool {
+    let mut solver = EqualitySolver::default();
+    for (left, right) in left.iter().zip(right) {
+        match (left, right) {
+            (MatchToken::Literal(left), MatchToken::Literal(right)) => {
+                if !left.eq_ignore_ascii_case(right) {
+                    return false;
+                }
+            }
+            (MatchToken::Literal(value), MatchToken::Parameter(name)) => {
+                let variable = solver.variable(1, name);
+                if !solver.bind(variable, value) {
+                    return false;
+                }
+            }
+            (MatchToken::Parameter(name), MatchToken::Literal(value)) => {
+                let variable = solver.variable(0, name);
+                if !solver.bind(variable, value) {
+                    return false;
+                }
+            }
+            (MatchToken::Parameter(left), MatchToken::Parameter(right)) => {
+                let left = solver.variable(0, left);
+                let right = solver.variable(1, right);
+                if !solver.union(left, right) {
+                    return false;
+                }
+            }
+            (MatchToken::Any, _) | (_, MatchToken::Any) => {}
+        }
+    }
+    true
+}
+
+#[derive(Default)]
+struct EqualitySolver {
+    parents: Vec<usize>,
+    constants: Vec<Option<String>>,
+    variables: BTreeMap<(u8, String), usize>,
+}
+
+impl EqualitySolver {
+    fn variable(&mut self, side: u8, name: &str) -> usize {
+        let key = (side, name.to_owned());
+        if let Some(index) = self.variables.get(&key) {
+            return *index;
+        }
+        let index = self.parents.len();
+        self.parents.push(index);
+        self.constants.push(None);
+        self.variables.insert(key, index);
+        index
+    }
+
+    fn find(&mut self, index: usize) -> usize {
+        if self.parents[index] != index {
+            let root = self.find(self.parents[index]);
+            self.parents[index] = root;
+        }
+        self.parents[index]
+    }
+
+    fn bind(&mut self, variable: usize, value: &str) -> bool {
+        let root = self.find(variable);
+        if let Some(previous) = &self.constants[root] {
+            return previous.eq_ignore_ascii_case(value);
+        }
+        self.constants[root] = Some(value.to_owned());
+        true
+    }
+
+    fn union(&mut self, left: usize, right: usize) -> bool {
+        let left = self.find(left);
+        let right = self.find(right);
+        if left == right {
+            return true;
+        }
+        match (&self.constants[left], &self.constants[right]) {
+            (Some(left), Some(right)) if !left.eq_ignore_ascii_case(right) => return false,
+            _ => {}
+        }
+        self.parents[right] = left;
+        if self.constants[left].is_none() {
+            self.constants[left] = self.constants[right].take();
+        }
+        true
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TemplateSegment {
     Literal(String),
@@ -452,15 +620,54 @@ pub enum InvalidPolicyBundle {
     OverlappingRoutes,
 }
 
-fn executable_selectors_overlap(left: &ReviewedRoute, right: &ReviewedRoute) -> bool {
+pub(crate) struct ExecutableSelector<'a> {
+    cloud: AzureCloud,
+    purpose: RoutePurpose,
+    method: HttpMethod,
+    path: &'a str,
+    api_versions: &'a [String],
+}
+
+impl<'a> ExecutableSelector<'a> {
+    pub(crate) fn new(
+        cloud: AzureCloud,
+        purpose: RoutePurpose,
+        method: HttpMethod,
+        path: &'a str,
+        api_versions: &'a [String],
+    ) -> Self {
+        Self {
+            cloud,
+            purpose,
+            method,
+            path,
+            api_versions,
+        }
+    }
+
+    fn from_route(route: &'a ReviewedRoute) -> Self {
+        Self::new(
+            route.cloud,
+            route.purpose,
+            route.method,
+            &route.template.source,
+            &route.api_versions,
+        )
+    }
+}
+
+pub(crate) fn executable_selectors_overlap(
+    left: &ExecutableSelector<'_>,
+    right: &ExecutableSelector<'_>,
+) -> bool {
     left.cloud == right.cloud
         && left.purpose == right.purpose
         && left.method == right.method
-        && left.template.source == right.template.source
         && left
             .api_versions
             .iter()
             .any(|version| right.api_versions.iter().any(|other| version == other))
+        && templates_overlap(left.path, right.path)
 }
 
 /// A request failed to resolve to one unambiguous reviewed route.
@@ -499,10 +706,6 @@ mod tests {
                 route(
                     "/subscriptions/{subscription}/providers/{namespace}",
                     "generic/read",
-                ),
-                route(
-                    "/subscriptions/{other}/providers/{provider}",
-                    "other-generic/read",
                 ),
                 route(
                     "/subscriptions/{subscription}/providers/Microsoft.Sql",
@@ -580,8 +783,8 @@ mod tests {
     }
 
     #[test]
-    fn denies_an_ambiguous_reviewed_join() {
-        let bundle = PolicyBundle::new(
+    fn rejects_an_ambiguous_reviewed_join() {
+        let result = PolicyBundle::new(
             "test-v1",
             vec![
                 route("/subscriptions/{first}/providers/{second}", "first/read"),
@@ -590,21 +793,8 @@ mod tests {
                     "second/read",
                 ),
             ],
-        )
-        .expect("valid bundle");
-        let target = RelativeRequestTarget::parse("/subscriptions/sub/providers/Example")
-            .expect("valid target");
-
-        assert_eq!(
-            bundle.classify(
-                AzureCloud::AzureCloud,
-                RoutePurpose::Request,
-                HttpMethod::Get,
-                &target,
-                "2024-01-01"
-            ),
-            Err(PolicyDenial::AmbiguousRoute)
         );
+        assert_eq!(result, Err(InvalidPolicyBundle::OverlappingRoutes));
     }
 
     #[test]
@@ -710,6 +900,24 @@ mod tests {
             PolicyBundle::new("test-v1", vec![first, second]),
             Err(InvalidPolicyBundle::OverlappingRoutes)
         );
+    }
+
+    #[test]
+    fn detects_case_parameter_and_cross_literal_template_intersections() {
+        for (left, right) in [
+            ("/A/{first}", "/a/{second}"),
+            ("/a/{first}", "/{second}/a"),
+            ("/a/{resourceUri}/b", "/a/{resourceId}/b"),
+            ("/{resourceUri}/a", "/a/{resourceId}"),
+        ] {
+            let first = route(left, "first/read");
+            let second = route(right, "second/read");
+            assert_eq!(
+                PolicyBundle::new("test-v1", vec![first, second]),
+                Err(InvalidPolicyBundle::OverlappingRoutes),
+                "{left} and {right}"
+            );
+        }
     }
 
     #[test]
