@@ -17,6 +17,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use lz4_flex::frame::{BlockMode, BlockSize, FrameEncoder, FrameInfo};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -24,14 +25,20 @@ use thiserror::Error;
 
 /// Maximum encoded bytes in one artifact, including its trailing newline.
 pub const DEFAULT_MAX_ARTIFACT_BYTES: usize = 480 * 1024;
+/// Maximum uncompressed bytes in one streamed artifact, including framing.
+pub const DEFAULT_MAX_STREAM_LOGICAL_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum stored bytes in one streamed artifact, including compression framing.
+pub const DEFAULT_MAX_STREAM_STORED_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum encoded bytes accepted in one append operation.
+pub const MAX_STREAM_APPEND_BYTES: usize = 400 * 1024;
 /// Maximum artifacts retained in one context namespace.
 pub const DEFAULT_MAX_CONTEXT_FILES: usize = 32;
 /// Maximum aggregate bytes retained in one context namespace.
-pub const DEFAULT_MAX_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_MAX_CONTEXT_BYTES: usize = 128 * 1024 * 1024;
 /// Maximum artifacts retained beneath one store root.
 pub const DEFAULT_MAX_ROOT_FILES: usize = 256;
 /// Maximum aggregate artifact bytes retained beneath one store root.
-pub const DEFAULT_MAX_ROOT_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_ROOT_BYTES: usize = 512 * 1024 * 1024;
 
 const NAMESPACE_RANDOM_BYTES: usize = 32;
 const NAMESPACE_PREFIX: &str = "ctx_";
@@ -45,6 +52,64 @@ const ROOT_LOCK_CONTENT: &[u8] = b"azmcp-artifacts-v1\n";
 pub type ArtifactFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ArtifactError>> + Send + 'a>>;
 
+/// Encoding used for a streamed artifact's stored bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactCompression {
+    Identity,
+    Lz4Frame,
+}
+
+impl ArtifactCompression {
+    fn content_encoding(self) -> Option<&'static str> {
+        match self {
+            Self::Identity => None,
+            Self::Lz4Frame => Some("lz4"),
+        }
+    }
+}
+
+/// Logical record framing used by a streamed JSON artifact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactStreamFormat {
+    JsonArray,
+    JsonLines,
+}
+
+/// An opaque, context-bound handle for an incomplete streamed artifact.
+///
+/// The handle carries no filesystem path and is not serializable. The store
+/// retains the open writer and exact inode identity until the stream is
+/// finished or discarded.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ArtifactStream {
+    id: String,
+    namespace: String,
+    format: ArtifactStreamFormat,
+    compression: ArtifactCompression,
+}
+
+impl ArtifactStream {
+    pub fn format(&self) -> ArtifactStreamFormat {
+        self.format
+    }
+
+    pub fn compression(&self) -> ArtifactCompression {
+        self.compression
+    }
+}
+
+impl fmt::Debug for ArtifactStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArtifactStream")
+            .field("id", &"<redacted>")
+            .field("namespace", &"<redacted>")
+            .field("format", &self.format)
+            .field("compression", &self.compression)
+            .finish()
+    }
+}
+
 /// Managed artifact operations available to the application host boundary.
 pub trait ArtifactStore: Send + Sync {
     /// Allocate an opaque namespace without touching the filesystem.
@@ -56,6 +121,77 @@ pub trait ArtifactStore: Send + Sync {
         file_name: String,
         value: Value,
     ) -> Result<PreparedArtifact, ArtifactError>;
+
+    /// Begin an incrementally written JSON stream.
+    ///
+    /// The concrete file format is selected by the filename extension:
+    /// `.json` is an array, `.jsonl` is JSON Lines, with matching `.lz4`
+    /// suffixes for compressed output.
+    fn begin_json_array<'a>(
+        &'a self,
+        _namespace: ArtifactNamespace,
+        _file_name: String,
+        _compression: ArtifactCompression,
+    ) -> ArtifactFuture<'a, ArtifactStream> {
+        Box::pin(async { Err(ArtifactError::Unavailable) })
+    }
+
+    /// Begin a stream with an explicitly selected JSON format.
+    fn begin_json_stream<'a>(
+        &'a self,
+        _namespace: ArtifactNamespace,
+        _file_name: String,
+        _compression: ArtifactCompression,
+        _format: ArtifactStreamFormat,
+    ) -> ArtifactFuture<'a, ArtifactStream> {
+        Box::pin(async { Err(ArtifactError::Unavailable) })
+    }
+
+    /// Append compact JSON values to an owned stream handle.
+    ///
+    /// Success returns the handle so callers can continue using it after the
+    /// asynchronous operation. On failure, the store owns and discards the
+    /// incomplete stream.
+    fn append_json_array<'a>(
+        &'a self,
+        _namespace: ArtifactNamespace,
+        _stream: ArtifactStream,
+        _values: Vec<Value>,
+    ) -> ArtifactFuture<'a, ArtifactStream> {
+        Box::pin(async { Err(ArtifactError::Unavailable) })
+    }
+
+    /// Finish a stream and return its unpublished artifact stage.
+    fn finish_json_array<'a>(
+        &'a self,
+        _namespace: ArtifactNamespace,
+        _stream: ArtifactStream,
+    ) -> ArtifactFuture<'a, ArtifactStage> {
+        Box::pin(async { Err(ArtifactError::Unavailable) })
+    }
+
+    /// Discard exactly one incomplete stream owned by this store.
+    fn discard_stream<'a>(
+        &'a self,
+        _namespace: ArtifactNamespace,
+        _stream: ArtifactStream,
+    ) -> ArtifactFuture<'a, ()> {
+        Box::pin(async { Err(ArtifactError::Unavailable) })
+    }
+
+    /// Discard a set of incomplete streams, preserving exact ownership checks.
+    fn discard_streams<'a>(
+        &'a self,
+        namespace: ArtifactNamespace,
+        streams: Vec<ArtifactStream>,
+    ) -> ArtifactFuture<'a, ()> {
+        Box::pin(async move {
+            for stream in streams {
+                self.discard_stream(namespace.clone(), stream).await?;
+            }
+            Ok(())
+        })
+    }
 
     /// Stage one immutable JSON artifact without publishing its receipt path.
     fn stage_prepared<'a>(
@@ -94,6 +230,8 @@ pub trait ArtifactStore: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactStoreLimits {
     pub max_artifact_bytes: usize,
+    pub max_stream_logical_bytes: usize,
+    pub max_stream_stored_bytes: usize,
     pub max_context_files: usize,
     pub max_context_bytes: usize,
     pub max_root_files: usize,
@@ -110,6 +248,8 @@ impl ArtifactStoreLimits {
     ) -> Self {
         Self {
             max_artifact_bytes,
+            max_stream_logical_bytes: DEFAULT_MAX_STREAM_LOGICAL_BYTES,
+            max_stream_stored_bytes: DEFAULT_MAX_STREAM_STORED_BYTES,
             max_context_files,
             max_context_bytes,
             max_root_files,
@@ -117,9 +257,24 @@ impl ArtifactStoreLimits {
         }
     }
 
+    /// Tighten the per-stream logical and stored bounds for deterministic tests.
+    pub const fn with_stream_limits(
+        mut self,
+        max_stream_logical_bytes: usize,
+        max_stream_stored_bytes: usize,
+    ) -> Self {
+        self.max_stream_logical_bytes = max_stream_logical_bytes;
+        self.max_stream_stored_bytes = max_stream_stored_bytes;
+        self
+    }
+
     fn validate(self) -> Result<Self, ArtifactError> {
         if self.max_artifact_bytes == 0
             || self.max_artifact_bytes > DEFAULT_MAX_ARTIFACT_BYTES
+            || self.max_stream_logical_bytes == 0
+            || self.max_stream_logical_bytes > DEFAULT_MAX_STREAM_LOGICAL_BYTES
+            || self.max_stream_stored_bytes == 0
+            || self.max_stream_stored_bytes > DEFAULT_MAX_STREAM_STORED_BYTES
             || self.max_context_files == 0
             || self.max_context_files > DEFAULT_MAX_CONTEXT_FILES
             || self.max_context_bytes == 0
@@ -206,16 +361,31 @@ pub struct ArtifactReceipt {
     path: PathBuf,
     bytes: usize,
     sha256: String,
+    logical_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_encoding: Option<&'static str>,
     media_type: &'static str,
     sensitivity: &'static str,
 }
 
 impl ArtifactReceipt {
     pub(crate) fn new(path: PathBuf, bytes: usize, sha256: String) -> Self {
+        Self::new_with_metadata(path, bytes, sha256, bytes, None)
+    }
+
+    fn new_with_metadata(
+        path: PathBuf,
+        bytes: usize,
+        sha256: String,
+        logical_bytes: usize,
+        content_encoding: Option<&'static str>,
+    ) -> Self {
         Self {
             path,
             bytes,
             sha256,
+            logical_bytes,
+            content_encoding,
             media_type: JSON_MEDIA_TYPE,
             sensitivity: CUSTOMER_DATA_SENSITIVITY,
         }
@@ -231,6 +401,14 @@ impl ArtifactReceipt {
 
     pub fn sha256(&self) -> &str {
         &self.sha256
+    }
+
+    pub const fn logical_bytes(&self) -> usize {
+        self.logical_bytes
+    }
+
+    pub const fn content_encoding(&self) -> Option<&'static str> {
+        self.content_encoding
     }
 
     pub const fn media_type(&self) -> &'static str {
@@ -286,6 +464,8 @@ impl fmt::Debug for ArtifactReceipt {
             .field("path", &"<redacted>")
             .field("bytes", &self.bytes)
             .field("sha256", &"<redacted>")
+            .field("logical_bytes", &self.logical_bytes)
+            .field("content_encoding", &self.content_encoding)
             .field("media_type", &self.media_type)
             .field("sensitivity", &self.sensitivity)
             .finish()
@@ -309,6 +489,7 @@ struct StoreState {
     root_lock: Option<File>,
     root_identity: Option<FileIdentity>,
     reservations: HashMap<PathBuf, Reservation>,
+    streams: HashMap<String, StreamState>,
 }
 
 #[derive(Clone)]
@@ -316,6 +497,99 @@ struct Reservation {
     stage_id: String,
     staging_path: PathBuf,
     identity: FileIdentity,
+}
+
+struct StreamState {
+    namespace: String,
+    file_name: String,
+    staging_path: PathBuf,
+    identity: FileIdentity,
+    format: ArtifactStreamFormat,
+    compression: ArtifactCompression,
+    logical_bytes: usize,
+    has_values: bool,
+    writer: StreamWriter,
+}
+
+enum StreamWriter {
+    Identity(File),
+    Lz4Frame(FrameEncoder<File>),
+}
+
+impl StreamWriter {
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), ArtifactError> {
+        match self {
+            Self::Identity(file) => file
+                .write_all(bytes)
+                .map_err(|_| ArtifactError::Unavailable),
+            Self::Lz4Frame(encoder) => encoder
+                .write_all(bytes)
+                .map_err(|_| ArtifactError::Unavailable),
+        }
+    }
+
+    fn flush_and_sync(&mut self) -> Result<(), ArtifactError> {
+        match self {
+            Self::Identity(file) => file
+                .flush()
+                .and_then(|_| file.sync_all())
+                .map_err(|_| ArtifactError::Unavailable),
+            Self::Lz4Frame(encoder) => encoder
+                .flush()
+                .and_then(|_| encoder.get_ref().sync_all())
+                .map_err(|_| ArtifactError::Unavailable),
+        }
+    }
+
+    fn stored_len(&self) -> Result<usize, ArtifactError> {
+        let length = match self {
+            Self::Identity(file) => file
+                .metadata()
+                .map_err(|_| ArtifactError::Unavailable)?
+                .len(),
+            Self::Lz4Frame(encoder) => encoder
+                .get_ref()
+                .metadata()
+                .map_err(|_| ArtifactError::Unavailable)?
+                .len(),
+        };
+        usize::try_from(length).map_err(|_| ArtifactError::RootCapacity)
+    }
+
+    fn finish(self, suffix: &[u8]) -> Result<(File, usize), ArtifactError> {
+        match self {
+            Self::Identity(mut file) => {
+                file.write_all(suffix)
+                    .and_then(|_| file.flush())
+                    .and_then(|_| file.sync_all())
+                    .map_err(|_| ArtifactError::Unavailable)?;
+                let length = usize::try_from(
+                    file.metadata()
+                        .map_err(|_| ArtifactError::Unavailable)?
+                        .len(),
+                )
+                .map_err(|_| ArtifactError::RootCapacity)?;
+                Ok((file, length))
+            }
+            Self::Lz4Frame(mut encoder) => {
+                encoder
+                    .write_all(suffix)
+                    .and_then(|_| encoder.flush())
+                    .map_err(|_| ArtifactError::Unavailable)?;
+                let mut file = encoder.finish().map_err(|_| ArtifactError::Unavailable)?;
+                file.flush()
+                    .and_then(|_| file.sync_all())
+                    .map_err(|_| ArtifactError::Unavailable)?;
+                let length = usize::try_from(
+                    file.metadata()
+                        .map_err(|_| ArtifactError::Unavailable)?
+                        .len(),
+                )
+                .map_err(|_| ArtifactError::RootCapacity)?;
+                Ok((file, length))
+            }
+        }
+    }
 }
 
 impl FileArtifactStore {
@@ -398,6 +672,397 @@ impl FileArtifactStore {
         })
     }
 
+    fn begin_json_stream_blocking(
+        &self,
+        namespace: &ArtifactNamespace,
+        file_name: String,
+        compression: ArtifactCompression,
+        format: ArtifactStreamFormat,
+    ) -> Result<ArtifactStream, ArtifactError> {
+        validate_stream_file_name(&file_name, compression, format)?;
+        let mut state = self
+            .inner
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = (|| {
+            let minimum_logical_bytes = match format {
+                ArtifactStreamFormat::JsonArray => 3,
+                ArtifactStreamFormat::JsonLines => 1,
+            };
+            if minimum_logical_bytes > self.inner.limits.max_stream_logical_bytes {
+                return Err(ArtifactError::ValueTooLarge {
+                    bytes: minimum_logical_bytes,
+                    limit: self.inner.limits.max_stream_logical_bytes,
+                });
+            }
+            let minimum_stored_bytes = if matches!(compression, ArtifactCompression::Identity) {
+                minimum_logical_bytes
+            } else {
+                1
+            };
+            if minimum_stored_bytes > self.inner.limits.max_stream_stored_bytes {
+                return Err(ArtifactError::ValueTooLarge {
+                    bytes: minimum_stored_bytes,
+                    limit: self.inner.limits.max_stream_stored_bytes,
+                });
+            }
+            ensure_store_ready(&self.inner.root, &mut state)?;
+            let snapshot = scan_root(&self.inner.root, namespace)?;
+            let initial_bytes = if matches!(compression, ArtifactCompression::Identity)
+                && matches!(format, ArtifactStreamFormat::JsonArray)
+            {
+                1
+            } else {
+                0
+            };
+            ensure_capacity(
+                snapshot.root,
+                snapshot.context,
+                initial_bytes,
+                self.inner.limits,
+            )?;
+            let namespace_path = self.inner.root.join(namespace.as_str());
+            if !snapshot.namespace_exists {
+                create_private_directory(&namespace_path)
+                    .map_err(|_| ArtifactError::Unavailable)?;
+            }
+            validate_namespace_path(&namespace_path)?;
+
+            let destination = namespace_path.join(&file_name);
+            if state.reservations.contains_key(&destination)
+                || state.streams.values().any(|stream| {
+                    stream.namespace == namespace.as_str()
+                        && namespace_path.join(&stream.file_name) == destination
+                })
+            {
+                return Err(ArtifactError::DestinationExists);
+            }
+            reject_existing_destination(&destination)?;
+            let temporary_path = unique_temporary_path(&namespace_path)?;
+            let file = open_private_new(&temporary_path)?;
+            let writer = match compression {
+                ArtifactCompression::Identity => {
+                    let mut file = file;
+                    if matches!(format, ArtifactStreamFormat::JsonArray)
+                        && file.write_all(b"[").and_then(|_| file.sync_all()).is_err()
+                    {
+                        drop(file);
+                        let _ = fs::remove_file(&temporary_path);
+                        return Err(ArtifactError::Unavailable);
+                    }
+                    StreamWriter::Identity(file)
+                }
+                ArtifactCompression::Lz4Frame => {
+                    StreamWriter::Lz4Frame(FrameEncoder::with_frame_info(stream_frame_info(), file))
+                }
+            };
+            let identity = match stream_writer_identity(&writer) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    drop(writer);
+                    let _ = fs::remove_file(&temporary_path);
+                    return Err(error);
+                }
+            };
+            let stream_id = match random_name("stream_") {
+                Ok(stream_id) => stream_id,
+                Err(error) => {
+                    drop(writer);
+                    let _ = fs::remove_file(&temporary_path);
+                    return Err(error);
+                }
+            };
+            state.streams.insert(
+                stream_id.clone(),
+                StreamState {
+                    namespace: namespace.as_str().to_owned(),
+                    file_name,
+                    staging_path: temporary_path,
+                    identity,
+                    format,
+                    compression,
+                    logical_bytes: if matches!(format, ArtifactStreamFormat::JsonArray) {
+                        1
+                    } else {
+                        0
+                    },
+                    has_values: false,
+                    writer,
+                },
+            );
+            Ok(ArtifactStream {
+                id: stream_id,
+                namespace: namespace.as_str().to_owned(),
+                format,
+                compression,
+            })
+        })();
+        if result.is_err() {
+            release_root_if_idle(&mut state);
+        }
+        result
+    }
+
+    fn append_json_stream_blocking(
+        &self,
+        namespace: &ArtifactNamespace,
+        stream: ArtifactStream,
+        values: Vec<Value>,
+    ) -> Result<ArtifactStream, ArtifactError> {
+        let mut state = self
+            .inner
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ensure_store_ready(&self.inner.root, &mut state)?;
+        let Some(mut stream_state) = state.streams.remove(&stream.id) else {
+            return Err(ArtifactError::ReceiptMismatch);
+        };
+        if !stream_handle_matches(namespace, &stream, &stream_state) {
+            state.streams.insert(stream.id.clone(), stream_state);
+            return Err(ArtifactError::ReceiptMismatch);
+        }
+
+        let chunk =
+            match encode_stream_values(&values, stream_state.format, stream_state.has_values) {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    return discard_removed_stream(&mut state, stream_state, error);
+                }
+            };
+        if chunk.is_empty() {
+            state.streams.insert(stream.id.clone(), stream_state);
+            return Ok(stream);
+        }
+        let closing_bytes = stream_closing_bytes(stream_state.format, stream_state.has_values);
+        if stream_state
+            .logical_bytes
+            .saturating_add(chunk.len())
+            .saturating_add(closing_bytes.len())
+            > self.inner.limits.max_stream_logical_bytes
+        {
+            let bytes = stream_state
+                .logical_bytes
+                .saturating_add(chunk.len())
+                .saturating_add(closing_bytes.len());
+            return discard_removed_stream(
+                &mut state,
+                stream_state,
+                ArtifactError::ValueTooLarge {
+                    bytes,
+                    limit: self.inner.limits.max_stream_logical_bytes,
+                },
+            );
+        }
+        let snapshot = match scan_root(&self.inner.root, namespace) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return discard_removed_stream(&mut state, stream_state, error),
+        };
+        if matches!(stream_state.compression, ArtifactCompression::Identity)
+            && let Err(error) = ensure_existing_capacity(
+                snapshot.root,
+                snapshot.context,
+                chunk.len(),
+                self.inner.limits,
+            )
+        {
+            return discard_removed_stream(&mut state, stream_state, error);
+        }
+        if let Err(error) = stream_state
+            .writer
+            .write_all(&chunk)
+            .and_then(|_| stream_state.writer.flush_and_sync())
+        {
+            return discard_removed_stream(&mut state, stream_state, error);
+        }
+        let stored_bytes = match stream_state.writer.stored_len() {
+            Ok(bytes) => bytes,
+            Err(error) => return discard_removed_stream(&mut state, stream_state, error),
+        };
+        if stored_bytes > self.inner.limits.max_stream_stored_bytes {
+            return discard_removed_stream::<ArtifactStream>(
+                &mut state,
+                stream_state,
+                ArtifactError::ValueTooLarge {
+                    bytes: stored_bytes,
+                    limit: self.inner.limits.max_stream_stored_bytes,
+                },
+            );
+        }
+        let after = match scan_root(&self.inner.root, namespace) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return discard_removed_stream(&mut state, stream_state, error),
+        };
+        if after.context.bytes > self.inner.limits.max_context_bytes {
+            return discard_removed_stream::<ArtifactStream>(
+                &mut state,
+                stream_state,
+                ArtifactError::ContextCapacity,
+            );
+        }
+        if after.root.bytes > self.inner.limits.max_root_bytes {
+            return discard_removed_stream::<ArtifactStream>(
+                &mut state,
+                stream_state,
+                ArtifactError::RootCapacity,
+            );
+        }
+        stream_state.logical_bytes = stream_state.logical_bytes.saturating_add(chunk.len());
+        stream_state.has_values = true;
+        state.streams.insert(stream.id.clone(), stream_state);
+        Ok(stream)
+    }
+
+    fn finish_json_stream_blocking(
+        &self,
+        namespace: &ArtifactNamespace,
+        stream: ArtifactStream,
+    ) -> Result<ArtifactStage, ArtifactError> {
+        let mut state = self
+            .inner
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ensure_store_ready(&self.inner.root, &mut state)?;
+        let Some(stream_state) = state.streams.remove(&stream.id) else {
+            return Err(ArtifactError::ReceiptMismatch);
+        };
+        if !stream_handle_matches(namespace, &stream, &stream_state) {
+            state.streams.insert(stream.id.clone(), stream_state);
+            return Err(ArtifactError::ReceiptMismatch);
+        }
+        let suffix = stream_closing_bytes(stream_state.format, stream_state.has_values);
+        let logical_bytes = stream_state.logical_bytes.saturating_add(suffix.len());
+        if logical_bytes > self.inner.limits.max_stream_logical_bytes {
+            return discard_removed_stream::<ArtifactStage>(
+                &mut state,
+                stream_state,
+                ArtifactError::ValueTooLarge {
+                    bytes: logical_bytes,
+                    limit: self.inner.limits.max_stream_logical_bytes,
+                },
+            )
+            .map(|_| unreachable!("stream finish error cannot produce a stage"));
+        }
+        let StreamState {
+            file_name,
+            staging_path,
+            identity,
+            compression,
+            writer,
+            ..
+        } = stream_state;
+        let destination = self.inner.root.join(namespace.as_str()).join(&file_name);
+        let (file, stored_bytes) = match writer.finish(suffix) {
+            Ok(result) => result,
+            Err(error) => {
+                return finish_stream_error(&mut state, staging_path, identity, error);
+            }
+        };
+        drop(file);
+        if stored_bytes > self.inner.limits.max_stream_stored_bytes {
+            return finish_stream_error(
+                &mut state,
+                staging_path,
+                identity,
+                ArtifactError::ValueTooLarge {
+                    bytes: stored_bytes,
+                    limit: self.inner.limits.max_stream_stored_bytes,
+                },
+            );
+        }
+        if let Err(error) = reject_existing_destination(&destination) {
+            return finish_stream_error(&mut state, staging_path, identity, error);
+        }
+        let snapshot = match scan_root(&self.inner.root, namespace) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return finish_stream_error(&mut state, staging_path, identity, error),
+        };
+        if snapshot.context.bytes > self.inner.limits.max_context_bytes {
+            return finish_stream_error(
+                &mut state,
+                staging_path,
+                identity,
+                ArtifactError::ContextCapacity,
+            );
+        }
+        if snapshot.root.bytes > self.inner.limits.max_root_bytes {
+            return finish_stream_error(
+                &mut state,
+                staging_path,
+                identity,
+                ArtifactError::RootCapacity,
+            );
+        }
+        let bytes = match fs::read(&staging_path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return finish_stream_error(
+                    &mut state,
+                    staging_path,
+                    identity,
+                    ArtifactError::Unavailable,
+                );
+            }
+        };
+        if bytes.len() != stored_bytes {
+            return finish_stream_error(
+                &mut state,
+                staging_path,
+                identity,
+                ArtifactError::ReceiptMismatch,
+            );
+        }
+        let stage_id = match random_name("stage_") {
+            Ok(stage_id) => stage_id,
+            Err(error) => return finish_stream_error(&mut state, staging_path, identity, error),
+        };
+        let receipt = ArtifactReceipt::new_with_metadata(
+            destination.clone(),
+            stored_bytes,
+            sha256_hex(&bytes),
+            logical_bytes,
+            compression.content_encoding(),
+        );
+        state.reservations.insert(
+            destination,
+            Reservation {
+                stage_id: stage_id.clone(),
+                staging_path: staging_path.clone(),
+                identity,
+            },
+        );
+        Ok(ArtifactStage {
+            id: stage_id,
+            namespace: namespace.as_str().to_owned(),
+            staging_path,
+            receipt,
+            identity,
+        })
+    }
+
+    fn discard_stream_blocking(
+        &self,
+        namespace: &ArtifactNamespace,
+        stream: ArtifactStream,
+    ) -> Result<(), ArtifactError> {
+        let mut state = self
+            .inner
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ensure_store_ready(&self.inner.root, &mut state)?;
+        let Some(stream_state) = state.streams.remove(&stream.id) else {
+            return Err(ArtifactError::ReceiptMismatch);
+        };
+        if !stream_handle_matches(namespace, &stream, &stream_state) {
+            state.streams.insert(stream.id, stream_state);
+            return Err(ArtifactError::ReceiptMismatch);
+        }
+        discard_stream_state(&mut state, stream_state)
+    }
+
     fn stage_prepared_blocking(
         &self,
         namespace: &ArtifactNamespace,
@@ -425,7 +1090,12 @@ impl FileArtifactStore {
             validate_namespace_path(&namespace_path)?;
 
             let destination = namespace_path.join(&prepared.file_name);
-            if state.reservations.contains_key(&destination) {
+            if state.reservations.contains_key(&destination)
+                || state.streams.values().any(|stream| {
+                    stream.namespace == namespace.as_str()
+                        && namespace_path.join(&stream.file_name) == destination
+                })
+            {
                 return Err(ArtifactError::DestinationExists);
             }
             reject_existing_destination(&destination)?;
@@ -602,7 +1272,11 @@ impl FileArtifactStore {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or(ArtifactError::ReceiptMismatch)?;
-        validate_file_name(file_name).map_err(|_| ArtifactError::ReceiptMismatch)?;
+        let (compression, _) =
+            validate_stored_file_name(file_name).map_err(|_| ArtifactError::ReceiptMismatch)?;
+        if stage.receipt.content_encoding != compression.content_encoding() {
+            return Err(ArtifactError::ReceiptMismatch);
+        }
         validate_temporary_name(
             stage
                 .staging_path
@@ -628,7 +1302,7 @@ fn validate_reservation(
 }
 
 fn release_root_if_idle(state: &mut StoreState) {
-    if state.reservations.is_empty() {
+    if state.reservations.is_empty() && state.streams.is_empty() {
         state.root_identity = None;
         state.root_lock = None;
     }
@@ -655,6 +1329,84 @@ impl ArtifactStore for FileArtifactStore {
         value: Value,
     ) -> Result<PreparedArtifact, ArtifactError> {
         self.prepare_json_value(file_name, value)
+    }
+
+    fn begin_json_array<'a>(
+        &'a self,
+        namespace: ArtifactNamespace,
+        file_name: String,
+        compression: ArtifactCompression,
+    ) -> ArtifactFuture<'a, ArtifactStream> {
+        let store = self.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let format = infer_stream_format(&file_name, compression)?;
+                store.begin_json_stream_blocking(&namespace, file_name, compression, format)
+            })
+            .await
+            .map_err(|_| ArtifactError::Unavailable)?
+        })
+    }
+
+    fn begin_json_stream<'a>(
+        &'a self,
+        namespace: ArtifactNamespace,
+        file_name: String,
+        compression: ArtifactCompression,
+        format: ArtifactStreamFormat,
+    ) -> ArtifactFuture<'a, ArtifactStream> {
+        let store = self.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                store.begin_json_stream_blocking(&namespace, file_name, compression, format)
+            })
+            .await
+            .map_err(|_| ArtifactError::Unavailable)?
+        })
+    }
+
+    fn append_json_array<'a>(
+        &'a self,
+        namespace: ArtifactNamespace,
+        stream: ArtifactStream,
+        values: Vec<Value>,
+    ) -> ArtifactFuture<'a, ArtifactStream> {
+        let store = self.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                store.append_json_stream_blocking(&namespace, stream, values)
+            })
+            .await
+            .map_err(|_| ArtifactError::Unavailable)?
+        })
+    }
+
+    fn finish_json_array<'a>(
+        &'a self,
+        namespace: ArtifactNamespace,
+        stream: ArtifactStream,
+    ) -> ArtifactFuture<'a, ArtifactStage> {
+        let store = self.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                store.finish_json_stream_blocking(&namespace, stream)
+            })
+            .await
+            .map_err(|_| ArtifactError::Unavailable)?
+        })
+    }
+
+    fn discard_stream<'a>(
+        &'a self,
+        namespace: ArtifactNamespace,
+        stream: ArtifactStream,
+    ) -> ArtifactFuture<'a, ()> {
+        let store = self.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || store.discard_stream_blocking(&namespace, stream))
+                .await
+                .map_err(|_| ArtifactError::Unavailable)?
+        })
     }
 
     fn stage_prepared<'a>(
@@ -771,6 +1523,170 @@ fn ensure_capacity(
         return Err(ArtifactError::RootCapacity);
     }
     Ok(())
+}
+
+fn ensure_existing_capacity(
+    root: Usage,
+    context: Usage,
+    added_bytes: usize,
+    limits: ArtifactStoreLimits,
+) -> Result<(), ArtifactError> {
+    if context.bytes.saturating_add(added_bytes) > limits.max_context_bytes {
+        return Err(ArtifactError::ContextCapacity);
+    }
+    if root.bytes.saturating_add(added_bytes) > limits.max_root_bytes {
+        return Err(ArtifactError::RootCapacity);
+    }
+    Ok(())
+}
+
+fn stream_frame_info() -> FrameInfo {
+    FrameInfo::new()
+        .block_size(BlockSize::Max256KB)
+        .block_mode(BlockMode::Independent)
+        .block_checksums(false)
+        .content_checksum(false)
+}
+
+fn stream_writer_identity(writer: &StreamWriter) -> Result<FileIdentity, ArtifactError> {
+    let metadata = match writer {
+        StreamWriter::Identity(file) => file.metadata(),
+        StreamWriter::Lz4Frame(encoder) => encoder.get_ref().metadata(),
+    }
+    .map_err(|_| ArtifactError::Unavailable)?;
+    file_identity(&metadata)
+}
+
+fn stream_handle_matches(
+    namespace: &ArtifactNamespace,
+    stream: &ArtifactStream,
+    state: &StreamState,
+) -> bool {
+    stream.namespace == namespace.as_str()
+        && state.namespace == namespace.as_str()
+        && stream.format == state.format
+        && stream.compression == state.compression
+}
+
+fn discard_stream_state(state: &mut StoreState, stream: StreamState) -> Result<(), ArtifactError> {
+    let path = stream.staging_path.clone();
+    let identity = stream.identity;
+    drop(stream);
+    let result = remove_exact_file(&path, identity);
+    release_root_if_idle(state);
+    result
+}
+
+fn discard_removed_stream<T>(
+    state: &mut StoreState,
+    stream: StreamState,
+    error: ArtifactError,
+) -> Result<T, ArtifactError> {
+    match discard_stream_state(state, stream) {
+        Ok(()) => Err(error),
+        Err(cleanup_error) => Err(cleanup_error),
+    }
+}
+
+fn finish_stream_error<T>(
+    state: &mut StoreState,
+    path: PathBuf,
+    identity: FileIdentity,
+    error: ArtifactError,
+) -> Result<T, ArtifactError> {
+    let cleanup = remove_exact_file(&path, identity);
+    release_root_if_idle(state);
+    match cleanup {
+        Ok(()) => Err(error),
+        Err(cleanup_error) => Err(cleanup_error),
+    }
+}
+
+fn stream_closing_bytes(format: ArtifactStreamFormat, has_values: bool) -> &'static [u8] {
+    match format {
+        ArtifactStreamFormat::JsonArray => b"]\n",
+        ArtifactStreamFormat::JsonLines if has_values => b"",
+        ArtifactStreamFormat::JsonLines => b"\n",
+    }
+}
+
+fn encode_stream_values(
+    values: &[Value],
+    format: ArtifactStreamFormat,
+    has_values: bool,
+) -> Result<Vec<u8>, ArtifactError> {
+    let mut output = BoundedBuffer::new(MAX_STREAM_APPEND_BYTES);
+    for (index, value) in values.iter().enumerate() {
+        match format {
+            ArtifactStreamFormat::JsonArray => {
+                if has_values || index != 0 {
+                    output.push_byte(b',')?;
+                }
+                serde_json::to_writer(&mut output, value).map_err(|_| {
+                    ArtifactError::ValueTooLarge {
+                        bytes: MAX_STREAM_APPEND_BYTES.saturating_add(1),
+                        limit: MAX_STREAM_APPEND_BYTES,
+                    }
+                })?;
+            }
+            ArtifactStreamFormat::JsonLines => {
+                serde_json::to_writer(&mut output, value).map_err(|_| {
+                    ArtifactError::ValueTooLarge {
+                        bytes: MAX_STREAM_APPEND_BYTES.saturating_add(1),
+                        limit: MAX_STREAM_APPEND_BYTES,
+                    }
+                })?;
+                output.push_byte(b'\n')?;
+            }
+        }
+    }
+    Ok(output.into_inner())
+}
+
+struct BoundedBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(16 * 1024)),
+            limit,
+        }
+    }
+
+    fn push_byte(&mut self, byte: u8) -> Result<(), ArtifactError> {
+        if self.bytes.len() == self.limit {
+            return Err(ArtifactError::ValueTooLarge {
+                bytes: self.limit.saturating_add(1),
+                limit: self.limit,
+            });
+        }
+        self.bytes.push(byte);
+        Ok(())
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl io::Write for BoundedBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "stream append bound",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn ensure_store_ready(root: &Path, state: &mut StoreState) -> Result<(), ArtifactError> {
@@ -959,7 +1875,7 @@ fn scan_namespace(path: &Path) -> Result<Usage, ArtifactError> {
         if name.starts_with(".tmp_") {
             validate_temporary_name(&name)?;
         } else {
-            validate_file_name(&name).map_err(|_| ArtifactError::UnsafeDestination)?;
+            validate_stored_file_name(&name).map_err(|_| ArtifactError::UnsafeDestination)?;
         }
         usage.files = usage.files.saturating_add(1);
         let bytes = usize::try_from(metadata.len()).map_err(|_| ArtifactError::RootCapacity)?;
@@ -997,22 +1913,67 @@ fn validate_namespace_name(name: &str) -> Result<(), ArtifactError> {
 }
 
 fn validate_file_name(file_name: &str) -> Result<(), ArtifactError> {
-    if file_name.is_empty()
-        || file_name.len() > MAX_FILE_NAME_BYTES
-        || !file_name.is_ascii()
-        || !file_name.ends_with(".json")
-    {
+    let (compression, format) = validate_stored_file_name(file_name)?;
+    if compression != ArtifactCompression::Identity || format != ArtifactStreamFormat::JsonArray {
         return Err(ArtifactError::InvalidFileName);
     }
-    let stem = &file_name[..file_name.len() - ".json".len()];
-    if stem.is_empty()
-        || stem
+    Ok(())
+}
+
+fn validate_stream_file_name(
+    file_name: &str,
+    compression: ArtifactCompression,
+    format: ArtifactStreamFormat,
+) -> Result<(), ArtifactError> {
+    let (actual_compression, actual_format) = validate_stored_file_name(file_name)?;
+    if actual_compression != compression || actual_format != format {
+        return Err(ArtifactError::InvalidFileName);
+    }
+    Ok(())
+}
+
+fn infer_stream_format(
+    file_name: &str,
+    compression: ArtifactCompression,
+) -> Result<ArtifactStreamFormat, ArtifactError> {
+    let (actual_compression, format) = validate_stored_file_name(file_name)?;
+    if actual_compression != compression {
+        return Err(ArtifactError::InvalidFileName);
+    }
+    Ok(format)
+}
+
+fn validate_stored_file_name(
+    file_name: &str,
+) -> Result<(ArtifactCompression, ArtifactStreamFormat), ArtifactError> {
+    if file_name.is_empty() || file_name.len() > MAX_FILE_NAME_BYTES || !file_name.is_ascii() {
+        return Err(ArtifactError::InvalidFileName);
+    }
+    let (compression, suffix) = if let Some(stem) = file_name.strip_suffix(".json.lz4") {
+        (ArtifactCompression::Lz4Frame, (stem, ".json"))
+    } else if let Some(stem) = file_name.strip_suffix(".jsonl.lz4") {
+        (ArtifactCompression::Lz4Frame, (stem, ".jsonl"))
+    } else if let Some(stem) = file_name.strip_suffix(".json") {
+        (ArtifactCompression::Identity, (stem, ".json"))
+    } else if let Some(stem) = file_name.strip_suffix(".jsonl") {
+        (ArtifactCompression::Identity, (stem, ".jsonl"))
+    } else {
+        return Err(ArtifactError::InvalidFileName);
+    };
+    if suffix.0.is_empty()
+        || suffix
+            .0
             .bytes()
             .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'_'))
     {
         return Err(ArtifactError::InvalidFileName);
     }
-    Ok(())
+    let format = if suffix.1 == ".json" {
+        ArtifactStreamFormat::JsonArray
+    } else {
+        ArtifactStreamFormat::JsonLines
+    };
+    Ok((compression, format))
 }
 
 fn validate_temporary_name(file_name: &str) -> Result<(), ArtifactError> {
@@ -1412,6 +2373,7 @@ mod tests {
                 "path": receipt.path(),
                 "bytes": expected.len(),
                 "sha256": sha256_hex(&expected),
+                "logicalBytes": expected.len(),
                 "mediaType": "application/json",
                 "sensitivity": "customerData",
             })
@@ -2146,5 +3108,234 @@ mod tests {
             ArtifactError::ReceiptMismatch
         );
         assert!(second_receipt.path().exists());
+    }
+
+    #[tokio::test]
+    async fn streams_write_compact_arrays_and_json_lines_with_trailing_newlines() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("artifacts");
+        let store = FileArtifactStore::new(&root).expect("artifact store");
+
+        let array_namespace = store.allocate_namespace().unwrap();
+        let array_stream = store
+            .begin_json_array(
+                array_namespace.clone(),
+                "array.json".to_owned(),
+                ArtifactCompression::Identity,
+            )
+            .await
+            .unwrap();
+        assert_eq!(array_stream.format(), ArtifactStreamFormat::JsonArray);
+        let array_stream = store
+            .append_json_array(
+                array_namespace.clone(),
+                array_stream,
+                vec![json!({"a": 1}), json!([2, 3])],
+            )
+            .await
+            .unwrap();
+        let array_stage = store
+            .finish_json_array(array_namespace.clone(), array_stream)
+            .await
+            .unwrap();
+        let array_receipt = array_stage.receipt().clone();
+        store
+            .commit_staged(array_namespace.clone(), vec![array_stage.clone()])
+            .await
+            .unwrap();
+        store
+            .finalize_staged(&array_namespace, std::slice::from_ref(&array_stage))
+            .unwrap();
+        assert_eq!(
+            fs::read(array_receipt.path()).unwrap(),
+            br#"[{"a":1},[2,3]]
+"#
+        );
+        assert_eq!(array_receipt.logical_bytes(), array_receipt.bytes());
+        assert_eq!(array_receipt.content_encoding(), None);
+
+        let lines_namespace = store.allocate_namespace().unwrap();
+        let lines_stream = store
+            .begin_json_array(
+                lines_namespace.clone(),
+                "rows.jsonl".to_owned(),
+                ArtifactCompression::Identity,
+            )
+            .await
+            .unwrap();
+        assert_eq!(lines_stream.format(), ArtifactStreamFormat::JsonLines);
+        let lines_stream = store
+            .append_json_array(
+                lines_namespace.clone(),
+                lines_stream,
+                vec![json!({"a": 1}), json!({"a": 2})],
+            )
+            .await
+            .unwrap();
+        let lines_stage = store
+            .finish_json_array(lines_namespace.clone(), lines_stream)
+            .await
+            .unwrap();
+        let lines_receipt = lines_stage.receipt().clone();
+        store
+            .commit_staged(lines_namespace.clone(), vec![lines_stage.clone()])
+            .await
+            .unwrap();
+        store
+            .finalize_staged(&lines_namespace, std::slice::from_ref(&lines_stage))
+            .unwrap();
+        assert_eq!(
+            fs::read(lines_receipt.path()).unwrap(),
+            br#"{"a":1}
+{"a":2}
+"#
+        );
+        assert_eq!(lines_receipt.logical_bytes(), lines_receipt.bytes());
+        assert_eq!(lines_receipt.content_encoding(), None);
+    }
+
+    #[tokio::test]
+    async fn lz4_streams_have_frame_output_and_stored_byte_receipts() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("artifacts");
+        let store = FileArtifactStore::new(&root).expect("artifact store");
+        let namespace = store.allocate_namespace().unwrap();
+        let stream = store
+            .begin_json_array(
+                namespace.clone(),
+                "result.json.lz4".to_owned(),
+                ArtifactCompression::Lz4Frame,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream.compression(), ArtifactCompression::Lz4Frame);
+        let stream = store
+            .append_json_array(
+                namespace.clone(),
+                stream,
+                vec![json!({"payload": "repeat-".repeat(10_000)})],
+            )
+            .await
+            .unwrap();
+        let stage = store
+            .finish_json_array(namespace.clone(), stream)
+            .await
+            .unwrap();
+        let receipt = stage.receipt().clone();
+        assert_eq!(receipt.content_encoding(), Some("lz4"));
+        assert!(receipt.logical_bytes() > receipt.bytes());
+        store
+            .commit_staged(namespace.clone(), vec![stage.clone()])
+            .await
+            .unwrap();
+        store
+            .finalize_staged(&namespace, std::slice::from_ref(&stage))
+            .unwrap();
+        let bytes = fs::read(receipt.path()).unwrap();
+        assert_eq!(&bytes[..4], &[0x04, 0x22, 0x4d, 0x18]);
+        assert_eq!(receipt.bytes(), bytes.len());
+        assert_eq!(receipt.sha256(), sha256_hex(&bytes));
+        assert_eq!(
+            serde_json::to_value(&receipt).unwrap()["contentEncoding"],
+            json!("lz4")
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_streams_are_exactly_discarded_and_release_the_root() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("artifacts");
+        let store = FileArtifactStore::new(&root).expect("artifact store");
+        let namespace = store.allocate_namespace().unwrap();
+        let stream = store
+            .begin_json_array(
+                namespace.clone(),
+                "pending.json".to_owned(),
+                ArtifactCompression::Identity,
+            )
+            .await
+            .unwrap();
+        let stream = store
+            .append_json_array(namespace.clone(), stream, vec![json!({"ok": true})])
+            .await
+            .unwrap();
+        let stream_copy = stream.clone();
+        assert_eq!(
+            store
+                .discard_stream(store.allocate_namespace().unwrap(), stream_copy)
+                .await
+                .expect_err("wrong namespace"),
+            ArtifactError::ReceiptMismatch
+        );
+        store.discard_stream(namespace, stream).await.unwrap();
+        let second = FileArtifactStore::new(&root).expect("second store");
+        let receipt = second
+            .write_json(
+                second.allocate_namespace().unwrap(),
+                "accepted.json".to_owned(),
+                json!(null),
+            )
+            .await
+            .unwrap();
+        assert!(receipt.path().exists());
+        assert!(
+            !root
+                .read_dir()
+                .unwrap()
+                .flat_map(Result::ok)
+                .flat_map(|entry| entry.path().read_dir().into_iter().flatten().flatten())
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".tmp_"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_append_and_logical_bounds_fail_closed() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let limits = limits(32, 4, 256, 8, 512).with_stream_limits(32, 128);
+        let store =
+            FileArtifactStore::with_limits(directory.path().join("artifacts"), limits).unwrap();
+        let namespace = store.allocate_namespace().unwrap();
+        let stream = store
+            .begin_json_array(
+                namespace.clone(),
+                "bounded.json".to_owned(),
+                ArtifactCompression::Identity,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .append_json_array(
+                    namespace,
+                    stream,
+                    vec![json!("x".repeat(MAX_STREAM_APPEND_BYTES))],
+                )
+                .await
+                .expect_err("append chunk bound"),
+            ArtifactError::ValueTooLarge {
+                bytes: MAX_STREAM_APPEND_BYTES + 1,
+                limit: MAX_STREAM_APPEND_BYTES,
+            }
+        );
+        let other = store.allocate_namespace().unwrap();
+        let stage = store
+            .begin_json_array(
+                other.clone(),
+                "small.json".to_owned(),
+                ArtifactCompression::Identity,
+            )
+            .await
+            .unwrap();
+        let stage = store
+            .append_json_array(other.clone(), stage, vec![json!({"a": 1})])
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .append_json_array(other, stage, vec![json!({"long": "y".repeat(40)})])
+                .await
+                .expect_err("logical bound"),
+            ArtifactError::ValueTooLarge { limit: 32, .. }
+        ));
     }
 }
