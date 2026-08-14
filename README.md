@@ -24,9 +24,10 @@ includes the executable surfaces for `az.request`, `az.metrics.single`,
 separate from host-owned HTTP body schemas. Response schemas remain
 `metadataOnly` because no response fixtures are checked in.
 
-Inside `azure_run`, JavaScript has only `console`, `az.request`, `az.graph`, and
-the reviewed `az.metrics` and `az.logs` helpers. There is no `fetch`, `Deno`,
-token access, ambient cloud, or ambient subscription.
+Inside `azure_run`, JavaScript has only `console`, `az.request`, `az.graph`,
+the reviewed `az.metrics` and `az.logs` helpers, and the context-scoped
+`az.ref`/`az.peek` result helpers. There is no `fetch`, `Deno`, token access,
+ambient cloud, or ambient subscription.
 
 The metrics signatures are explicit and closed:
 
@@ -200,12 +201,18 @@ breach. Synthetic local workers measured roughly 28–32 MiB RSS after startup
 and roughly 67–80 MiB under heap pressure across recent runs on this macOS
 arm64 host, so the process ceiling leaves room for the configured V8 heap and
 runtime overhead. These are diagnostic samples, not a portability guarantee.
-Serialized results are capped at 64 KiB; oversized values return a shape-only
-summary and reduction guidance, never truncated JSON. At most eight host calls
-run concurrently. Cancellation, timeout, heap pressure, RSS pressure, worker
-death, close, TTL expiry, or credential-identity change dispose the affected
-context. The RSS sampler uses OS process APIs through `sysinfo`; it does not
-invoke `ps` or another shell command.
+Inline serialized results are capped at 64 KiB. Larger serializable values up
+to the bounded 480 KiB worker-reference ceiling become immutable, context-scoped
+refs with a structural preview; JavaScript can rehydrate one with
+`await az.ref(refId)` only in that context, and `az.peek(value)` returns a
+shape-only summary. Cyclic, non-serializable, or over-hard-cap values fail
+closed with shape-only diagnostics, never truncated JSON. Reference IDs and
+stored values are disposed with context close, expiry, or capacity eviction;
+previews contain no value samples. At most eight host calls run concurrently.
+Cancellation, timeout, heap pressure, RSS pressure, worker death, close, TTL
+expiry, or credential-identity change dispose the affected context. The RSS
+sampler uses OS process APIs through `sysinfo`; it does not invoke `ps` or
+another shell command.
 
 Do not point development tests at a real Azure profile, credential cache, or
 subscription. Authenticated acceptance testing belongs in a separately

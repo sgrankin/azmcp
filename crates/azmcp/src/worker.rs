@@ -37,6 +37,11 @@ pub const MAX_CODE_BYTES: usize = 256 * 1024;
 pub const MAX_INPUT_BYTES: usize = 512 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESULT_BYTES: usize = 64 * 1024;
+/// A result may cross the worker boundary as a reference candidate only when
+/// it remains small enough for both the parent-to-worker rehydration message
+/// and the bounded context store. The final protocol envelope is checked
+/// separately before it is written.
+pub const MAX_REF_CANDIDATE_BYTES: usize = 480 * 1024;
 pub const MAX_LOG_BYTES: usize = 64 * 1024;
 pub const MAX_LOG_ENTRIES: usize = 256;
 pub const MAX_ERROR_BYTES: usize = 8 * 1024;
@@ -57,6 +62,9 @@ pub const HOST_METHOD_GRAPH: &str = "az.graph";
 pub const HOST_METHOD_METRICS_SINGLE: &str = "az.metrics.single";
 pub const HOST_METHOD_METRICS_BATCH: &str = "az.metrics.batch";
 pub const HOST_METHOD_LOGS_QUERY: &str = "az.logs.query";
+/// Internal worker-to-parent capability used by the JavaScript `az.ref`
+/// global. It is intentionally not an MCP tool.
+pub const HOST_METHOD_REF: &str = "az.ref";
 
 /// Keep shape diagnostics useful without allowing a pathological object key
 /// set to become a second oversized result.
@@ -192,6 +200,15 @@ pub enum WorkerResponse {
         logs: Vec<String>,
         logs_omitted: usize,
     },
+    /// A serializable result larger than the ordinary MCP result cap. The
+    /// application owns materialization into its context-scoped RefStore.
+    ResultRef {
+        id: u64,
+        value: Value,
+        encoded_bytes: usize,
+        logs: Vec<String>,
+        logs_omitted: usize,
+    },
     Error {
         id: u64,
         code: String,
@@ -213,7 +230,7 @@ pub enum WorkerResponse {
 }
 
 /// A request from the isolated JavaScript runtime to its parent process.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
 pub struct HostCallRequest {
     pub id: u64,
     pub call_id: u64,
@@ -221,8 +238,25 @@ pub struct HostCallRequest {
     pub arguments: Value,
 }
 
+impl fmt::Debug for HostCallRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostCallRequest")
+            .field("id", &self.id)
+            .field("call_id", &self.call_id)
+            .field("method", &self.method)
+            .field(
+                "arguments_bytes",
+                &serde_json::to_vec(&self.arguments)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or_default(),
+            )
+            .finish()
+    }
+}
+
 /// A parent response to a [`HostCallRequest`].
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
 pub struct HostCallResult {
     pub id: u64,
     pub call_id: u64,
@@ -231,6 +265,26 @@ pub struct HostCallResult {
     pub value: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl fmt::Debug for HostCallResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostCallResult")
+            .field("id", &self.id)
+            .field("call_id", &self.call_id)
+            .field("ok", &self.ok)
+            .field(
+                "value_bytes",
+                &self.value.as_ref().map(|value| {
+                    serde_json::to_vec(value)
+                        .map(|bytes| bytes.len())
+                        .unwrap_or_default()
+                }),
+            )
+            .field("error_present", &self.error.is_some())
+            .finish()
+    }
 }
 
 impl HostCallResult {
@@ -286,6 +340,15 @@ pub struct ExecutionResult {
     pub value: Value,
     pub logs: Vec<String>,
     pub logs_omitted: usize,
+    /// Present only for a serializable value that exceeded the ordinary
+    /// result cap but stayed below the bounded reference-candidate cap.
+    pub ref_candidate: Option<RefCandidate>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RefCandidate {
+    pub value: Value,
+    pub encoded_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -721,7 +784,40 @@ impl WorkerProcess {
                 value,
                 logs,
                 logs_omitted,
+                ref_candidate: None,
             }),
+            WorkerResponse::ResultRef {
+                value,
+                encoded_bytes,
+                logs,
+                logs_omitted,
+                ..
+            } => {
+                let actual_bytes = serde_json::to_vec(&value)
+                    .map_err(|error| WorkerError::Serialization(error.to_string()))?
+                    .len();
+                if encoded_bytes != actual_bytes {
+                    self.poison().await;
+                    return Err(WorkerError::Protocol(
+                        "reference candidate size mismatch".to_owned(),
+                    ));
+                }
+                if encoded_bytes <= MAX_RESULT_BYTES || encoded_bytes > MAX_REF_CANDIDATE_BYTES {
+                    self.poison().await;
+                    return Err(WorkerError::Protocol(
+                        "reference candidate is outside its bounded size range".to_owned(),
+                    ));
+                }
+                Ok(ExecutionResult {
+                    value: Value::Null,
+                    logs,
+                    logs_omitted,
+                    ref_candidate: Some(RefCandidate {
+                        value,
+                        encoded_bytes,
+                    }),
+                })
+            }
             WorkerResponse::Error { code, .. } if code == "execution_timeout" => {
                 self.poison().await;
                 Err(WorkerError::Timeout { timeout_ms })
@@ -913,6 +1009,7 @@ impl WorkerProcess {
             tokio::select! {
                 response = self.read_message(), if pending.len() < MAX_PENDING_HOST_CALLS => match response? {
                     response @ (WorkerResponse::Result { id: response_id, .. }
+                    | WorkerResponse::ResultRef { id: response_id, .. }
                     | WorkerResponse::Error { id: response_id, .. }) if response_id == id => {
                         if !pending.is_empty() {
                             return Err(WorkerError::Protocol(
@@ -947,7 +1044,9 @@ impl WorkerProcess {
                     let future = handler(call.clone());
                     pending.push(async move { (call, future.await) });
                     }
-                    WorkerResponse::Result { .. } | WorkerResponse::Error { .. } => {
+                    WorkerResponse::Result { .. }
+                    | WorkerResponse::ResultRef { .. }
+                    | WorkerResponse::Error { .. } => {
                         return Err(WorkerError::Protocol("response ID mismatch".to_owned()));
                     }
                     WorkerResponse::Ready { .. } | WorkerResponse::Closed { .. } => {
@@ -1313,7 +1412,18 @@ impl WorkerRuntime {
         let encoded = serde_json::to_vec(&value)
             .map_err(|error| WorkerError::Serialization(error.to_string()))?;
         if encoded.len() > MAX_RESULT_BYTES {
-            self.console.take();
+            if encoded.len() <= MAX_REF_CANDIDATE_BYTES {
+                let logs = self.console.take();
+                return Ok(ExecutionResult {
+                    value: Value::Null,
+                    logs: logs.entries,
+                    logs_omitted: logs.omitted,
+                    ref_candidate: Some(RefCandidate {
+                        value,
+                        encoded_bytes: encoded.len(),
+                    }),
+                });
+            }
             return Err(WorkerError::ResultTooLarge {
                 summary: Box::new(ResultTooLargeSummary::from_json(
                     &value,
@@ -1327,6 +1437,7 @@ impl WorkerRuntime {
             value,
             logs: logs.entries,
             logs_omitted: logs.omitted,
+            ref_candidate: None,
         })
     }
 
@@ -1424,15 +1535,55 @@ pub async fn run_stdio() -> anyhow::Result<()> {
                     .execute(&code, Duration::from_millis(timeout_ms))
                     .await
                 {
-                    Ok(result) => (
-                        WorkerResponse::Result {
-                            id,
-                            value: result.value,
-                            logs: result.logs,
-                            logs_omitted: result.logs_omitted,
-                        },
-                        false,
-                    ),
+                    Ok(result) => match result.ref_candidate {
+                        Some(candidate) => {
+                            let response = WorkerResponse::ResultRef {
+                                id,
+                                value: candidate.value,
+                                encoded_bytes: candidate.encoded_bytes,
+                                logs: result.logs,
+                                logs_omitted: result.logs_omitted,
+                            };
+                            let fits_output = serde_json::to_vec(&response)
+                                .is_ok_and(|bytes| bytes.len() < MAX_OUTPUT_BYTES);
+                            if fits_output {
+                                (response, false)
+                            } else {
+                                let summary = match &response {
+                                    WorkerResponse::ResultRef {
+                                        value,
+                                        encoded_bytes,
+                                        ..
+                                    } => ResultTooLargeSummary::from_json(
+                                        value,
+                                        *encoded_bytes,
+                                        MAX_RESULT_BYTES,
+                                    ),
+                                    _ => unreachable!("reference response variant is fixed"),
+                                };
+                                (
+                                    WorkerResponse::Error {
+                                        id,
+                                        code: "result_too_large".to_owned(),
+                                        message: "result exceeds the 64 KiB limit".to_owned(),
+                                        logs: Vec::new(),
+                                        logs_omitted: 0,
+                                        details: Some(summary),
+                                    },
+                                    false,
+                                )
+                            }
+                        }
+                        None => (
+                            WorkerResponse::Result {
+                                id,
+                                value: result.value,
+                                logs: result.logs,
+                                logs_omitted: result.logs_omitted,
+                            },
+                            false,
+                        ),
+                    },
                     Err(WorkerError::Execution {
                         message,
                         logs,
@@ -1562,6 +1713,46 @@ const WORKER_BOOTSTRAP: &str = r#"
     }
   }).join(" ");
   const write = (...args) => op(text(args));
+  const PEEK_LIMIT = 32;
+  const shapeType = (value) => {
+    if (value === null) return "null";
+    if (Array.isArray(value)) return "array";
+    return typeof value;
+  };
+  const boundedShape = (value) => {
+    try {
+      const type = shapeType(value);
+      if (type === "string") return { type, length: value.length };
+      if (type === "array") {
+        const count = Math.min(value.length, PEEK_LIMIT);
+        const counts = Object.create(null);
+        for (let index = 0; index < count; index += 1) {
+          const childType = shapeType(value[index]);
+          counts[childType] = (counts[childType] || 0) + 1;
+        }
+        const result = { type, length: value.length, counts };
+        if (value.length > count) result.itemsOmitted = value.length - count;
+        return result;
+      }
+      if (type === "object") {
+        const allKeys = Object.keys(value).sort();
+        const keys = allKeys.slice(0, PEEK_LIMIT).map((key) =>
+          key.length > 128 ? key.slice(0, 128) : key);
+        const counts = Object.create(null);
+        for (const key of allKeys.slice(0, PEEK_LIMIT)) {
+          let childType = "unavailable";
+          try { childType = shapeType(value[key]); } catch (_) {}
+          counts[childType] = (counts[childType] || 0) + 1;
+        }
+        const result = { type, keyCount: allKeys.length, keys, counts };
+        if (allKeys.length > keys.length) result.keysOmitted = allKeys.length - keys.length;
+        return result;
+      }
+      return { type };
+    } catch (_) {
+      return { type: "unavailable" };
+    }
+  };
   Object.defineProperty(globalThis, "console", {
     value: Object.freeze({ log: write, debug: write, info: write, warn: write, error: write }),
     writable: false,
@@ -1572,6 +1763,8 @@ const WORKER_BOOTSTRAP: &str = r#"
     value: Object.freeze(Object.assign(Object.create(null), {
       request: (arguments) => hostCall("az.request", arguments),
       graph: (arguments) => hostCall("az.graph", arguments),
+      ref: (refId) => hostCall("az.ref", { refId }),
+      peek: (value) => boundedShape(value),
       metrics: Object.freeze(Object.assign(Object.create(null), {
         single: (arguments) => hostCall("az.metrics.single", arguments),
         batch: (arguments) => hostCall("az.metrics.batch", arguments),
@@ -1735,6 +1928,7 @@ fn validate_host_call_request(request: &HostCallRequest) -> Result<(), String> {
         && request.method != HOST_METHOD_METRICS_SINGLE
         && request.method != HOST_METHOD_METRICS_BATCH
         && request.method != HOST_METHOD_LOGS_QUERY
+        && request.method != HOST_METHOD_REF
     {
         return Err("unknown host-call method".to_owned());
     }
@@ -1911,6 +2105,20 @@ mod tests {
                 .unwrap(),
             host_call
         );
+        let result_ref = WorkerResponse::ResultRef {
+            id: 7,
+            value: json!({"rows": [1, 2, 3]}),
+            encoded_bytes: serde_json::to_vec(&json!({"rows": [1, 2, 3]}))
+                .unwrap()
+                .len(),
+            logs: Vec::new(),
+            logs_omitted: 0,
+        };
+        assert_eq!(
+            serde_json::from_str::<WorkerResponse>(&serde_json::to_string(&result_ref).unwrap())
+                .unwrap(),
+            result_ref
+        );
         assert!(matches!(
             validate_code(&"x".repeat(MAX_CODE_BYTES + 1)),
             Err(WorkerError::Limit("code"))
@@ -1941,6 +2149,27 @@ mod tests {
             }
         );
         assert!(validate_host_call_request(&request).is_ok());
+        let ref_request = HostCallRequest {
+            method: HOST_METHOD_REF.to_owned(),
+            arguments: json!({"refId": "ref_"}),
+            ..request.clone()
+        };
+        assert!(validate_host_call_request(&ref_request).is_ok());
+        let sensitive_request = HostCallRequest {
+            arguments: json!({
+                "refId": "ref_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "query": "KQL-SENTINEL-DO-NOT-LOG",
+            }),
+            ..ref_request.clone()
+        };
+        let rendered = format!("{sensitive_request:?}");
+        assert!(!rendered.contains("ref_0123456789abcdef"));
+        assert!(!rendered.contains("KQL-SENTINEL-DO-NOT-LOG"));
+        let result_rendered = format!(
+            "{:?}",
+            HostCallResult::success(&sensitive_request, json!({"secret": "DO-NOT-LOG"}))
+        );
+        assert!(!result_rendered.contains("DO-NOT-LOG"));
         assert!(
             validate_host_call_request(&HostCallRequest {
                 method: "az.unknown".to_owned(),
@@ -2043,15 +2272,47 @@ mod tests {
             .unwrap();
         assert_eq!(result.value, json!({"value": 3}));
 
+        let candidate = runtime
+            .execute(
+                format!("'x'.repeat({})", MAX_RESULT_BYTES + 1),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("bounded oversized result becomes a candidate");
+        assert_eq!(candidate.value, Value::Null);
+        assert_eq!(
+            candidate
+                .ref_candidate
+                .as_ref()
+                .map(|candidate| candidate.encoded_bytes),
+            Some(MAX_RESULT_BYTES + 3)
+        );
         assert!(matches!(
             runtime
                 .execute(
-                    format!("'x'.repeat({})", MAX_RESULT_BYTES),
+                    format!("'x'.repeat({})", MAX_REF_CANDIDATE_BYTES + 1),
                     Duration::from_secs(1),
                 )
                 .await,
             Err(WorkerError::ResultTooLarge { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_peek_is_bounded_and_ref_is_a_host_capability() {
+        let mut runtime = WorkerRuntime::new().unwrap();
+        let result = runtime
+            .execute(
+                "({peek: az.peek({secret: 'do-not-return', count: 2}), refType: typeof az.ref})",
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("peek helper");
+        assert_eq!(result.value["refType"], "function");
+        assert_eq!(result.value["peek"]["type"], "object");
+        assert_eq!(result.value["peek"]["keyCount"], 2);
+        let encoded = serde_json::to_string(&result.value).expect("peek JSON");
+        assert!(!encoded.contains("do-not-return"));
     }
 
     #[tokio::test]

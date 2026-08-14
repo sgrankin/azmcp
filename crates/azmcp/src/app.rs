@@ -31,19 +31,22 @@ use azmcp_core::{
     schema::{SchemaDetails, SchemaError, SchemaIndex, SchemaSearchHit},
     target::RelativeRequestTarget,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, watch};
 
 use crate::{
     audit::AuditSink,
     host::{CallDecision, CallRecord, CallRecords, HostAdapter, HttpClientFactory},
-    refs::RefStore,
+    refs::{RefId, RefStore},
     tools::{
         AccountsArgs, ContextCloseArgs, ContextOpenArgs, GraphScopeArgs, GraphSubscriptionsArgs,
         LogsScopeOverrides, RunArgs, SchemaGetArgs, SchemaSearchArgs,
     },
-    worker::{ExecutionResult, HostCallHandler, ResultTooLargeSummary, WorkerProcess},
+    worker::{
+        ExecutionResult, HOST_METHOD_REF, HostCallHandler, HostCallRequest, HostCallResult,
+        MAX_INPUT_BYTES, RefCandidate, ResultTooLargeSummary, WorkerProcess,
+    },
 };
 
 /// A boxed, sendable future used instead of an async-trait dependency.
@@ -1249,14 +1252,21 @@ impl Application {
             }
             Arc::new(adapter)
         });
-        let host_handler = adapter.as_ref().map(|adapter| {
-            let adapter = Arc::clone(adapter);
-            Arc::new(move |request| {
-                let adapter = Arc::clone(&adapter);
-                Box::pin(async move { adapter.handle(request).await })
-                    as crate::worker::HostCallFuture
-            }) as HostCallHandler
-        });
+        let ref_worker = Arc::clone(&worker);
+        let adapter_for_handler = adapter.clone();
+        let host_handler = Some(Arc::new(move |request: HostCallRequest| {
+            let ref_worker = Arc::clone(&ref_worker);
+            let adapter = adapter_for_handler.clone();
+            Box::pin(async move {
+                if request.method == HOST_METHOD_REF {
+                    handle_ref_host_call(ref_worker, request).await
+                } else if let Some(adapter) = adapter {
+                    adapter.handle(request).await
+                } else {
+                    HostCallResult::failure(&request, "host calls are unavailable")
+                }
+            }) as crate::worker::HostCallFuture
+        }) as HostCallHandler);
         let result = {
             let mut handle = worker.worker.lock().await;
             if *cancellation.borrow() {
@@ -1304,7 +1314,7 @@ impl Application {
             return Err(error);
         }
         let result = match result {
-            Ok(result) => {
+            Ok(mut result) => {
                 let context = context_summary(lease.context());
                 let records = match adapter {
                     Some(adapter) => adapter.take_records(),
@@ -1313,8 +1323,12 @@ impl Application {
                         calls_omitted: 0,
                     },
                 };
+                let value = match result.ref_candidate.take() {
+                    Some(candidate) => materialize_ref(&worker, candidate).await?,
+                    None => std::mem::take(&mut result.value),
+                };
                 drop(lease);
-                run_result(result, records, context, correlation_id)
+                run_result(value, result, records, context, correlation_id)
             }
             Err(error) => {
                 let host_error = match &adapter {
@@ -1858,14 +1872,88 @@ fn map_host_error(error: crate::host::HostError) -> AppError {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RefHostCallArguments {
+    ref_id: String,
+}
+
+async fn handle_ref_host_call(worker: Arc<WorkerSlot>, request: HostCallRequest) -> HostCallResult {
+    let arguments = match serde_json::from_value::<RefHostCallArguments>(request.arguments.clone())
+    {
+        Ok(arguments) => arguments,
+        Err(_) => return HostCallResult::failure(&request, "invalid reference arguments"),
+    };
+    let id = match RefId::parse(&arguments.ref_id) {
+        Ok(id) => id,
+        Err(_) => return HostCallResult::failure(&request, "invalid reference id"),
+    };
+    let value = {
+        let mut refs = worker.refs.lock().await;
+        match refs.read(&id, crate::worker::MAX_REF_CANDIDATE_BYTES, Instant::now()) {
+            Ok(value) => value,
+            Err(_) => return HostCallResult::failure(&request, "reference is unavailable"),
+        }
+    };
+    let encoded_bytes = match serde_json::to_vec(&value) {
+        Ok(bytes) => bytes.len(),
+        Err(_) => return HostCallResult::failure(&request, "reference is unavailable"),
+    };
+    if encoded_bytes > crate::worker::MAX_REF_CANDIDATE_BYTES
+        || encoded_bytes.saturating_add(1024) > MAX_INPUT_BYTES
+    {
+        return HostCallResult::failure(&request, "reference exceeds the read limit");
+    }
+    HostCallResult::success(&request, value)
+}
+
+async fn materialize_ref(
+    worker: &Arc<WorkerSlot>,
+    candidate: RefCandidate,
+) -> Result<Value, AppError> {
+    let actual_bytes = serde_json::to_vec(&candidate.value)
+        .map_err(|_| AppError::new(AppErrorCode::ResultTooLarge))?
+        .len();
+    let summary = ResultTooLargeSummary::from_json(
+        &candidate.value,
+        actual_bytes,
+        crate::worker::MAX_RESULT_BYTES,
+    );
+    if actual_bytes != candidate.encoded_bytes
+        || actual_bytes <= crate::worker::MAX_RESULT_BYTES
+        || actual_bytes > crate::worker::MAX_REF_CANDIDATE_BYTES
+    {
+        return Err(AppError::result_too_large(Box::new(summary)));
+    }
+    let id = worker
+        .refs
+        .lock()
+        .await
+        .put(candidate.value, Instant::now())
+        .map_err(|_| AppError::result_too_large(Box::new(summary.clone())))?;
+    let mut envelope = serde_json::to_value(summary)
+        .expect("reference preview is a serializable structural summary");
+    if let Value::Object(fields) = &mut envelope {
+        // The token is an intentional capability handoff in the result. It is
+        // never used in diagnostics, errors, or call records.
+        fields.insert("__ref".to_owned(), Value::String(id.as_str().to_owned()));
+        fields.insert(
+            "sensitivity".to_owned(),
+            Value::String("customerData".to_owned()),
+        );
+    }
+    Ok(envelope)
+}
+
 fn run_result(
+    value: Value,
     result: ExecutionResult,
     records: CallRecords,
     context: Value,
     correlation_id: String,
 ) -> Result<RunResult, AppError> {
     Ok(RunResult {
-        value: result.value,
+        value,
         console: result.logs,
         console_omitted: result.logs_omitted,
         calls: records
@@ -1957,6 +2045,7 @@ mod tests {
         http::{ArmOrigin, BearerCredential, CredentialFuture, CredentialProvider, HttpClient},
         policy::PolicyBundle,
     };
+    use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -2230,6 +2319,7 @@ mod tests {
                     value: Value::String(code),
                     logs: vec!["ok".to_owned()],
                     logs_omitted: 0,
+                    ref_candidate: None,
                 })
             })
         }
@@ -2247,6 +2337,83 @@ mod tests {
                 self.state.terminated.notify_waiters();
                 Ok(())
             })
+        }
+    }
+
+    struct RefFactory;
+
+    impl WorkerFactory for RefFactory {
+        fn start<'a>(
+            &'a self,
+            _context: &'a Context,
+        ) -> BoxFuture<'a, Result<Box<dyn WorkerHandle>, DependencyError>> {
+            Box::pin(async { Ok(Box::new(RefWorker) as Box<dyn WorkerHandle>) })
+        }
+    }
+
+    struct RefWorker;
+
+    impl WorkerHandle for RefWorker {
+        fn execute<'a>(
+            &'a mut self,
+            code: &'a str,
+            _timeout: Duration,
+            host_handler: Option<HostCallHandler>,
+        ) -> BoxFuture<'a, Result<ExecutionResult, DependencyError>> {
+            let code = code.to_owned();
+            Box::pin(async move {
+                if code == "__large_ref__" {
+                    let value = json!({
+                        "secret": "secret-value",
+                        "padding": "x".repeat(70_000),
+                    });
+                    let encoded_bytes = serde_json::to_vec(&value).expect("candidate JSON").len();
+                    return Ok(ExecutionResult {
+                        value: Value::Null,
+                        logs: Vec::new(),
+                        logs_omitted: 0,
+                        ref_candidate: Some(RefCandidate {
+                            value,
+                            encoded_bytes,
+                        }),
+                    });
+                }
+                if let Some(ref_id) = code.strip_prefix("__ref__") {
+                    let Some(handler) = host_handler else {
+                        return Err(DependencyError::ExecutionFailed);
+                    };
+                    let request = HostCallRequest {
+                        id: 1,
+                        call_id: 1,
+                        method: HOST_METHOD_REF.to_owned(),
+                        arguments: json!({"refId": ref_id}),
+                    };
+                    let response = handler(request).await;
+                    if !response.ok {
+                        return Err(DependencyError::ExecutionFailed);
+                    }
+                    let value = response.value.ok_or(DependencyError::ExecutionFailed)?;
+                    return Ok(ExecutionResult {
+                        value: json!({
+                            "secret": value["secret"].clone(),
+                            "paddingLength": value["padding"].as_str().map(str::len),
+                        }),
+                        logs: Vec::new(),
+                        logs_omitted: 0,
+                        ref_candidate: None,
+                    });
+                }
+                Ok(ExecutionResult {
+                    value: Value::String(code),
+                    logs: Vec::new(),
+                    logs_omitted: 0,
+                    ref_candidate: None,
+                })
+            })
+        }
+
+        fn close<'a>(&'a mut self) -> BoxFuture<'a, Result<(), DependencyError>> {
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -2849,6 +3016,135 @@ mod tests {
         slot.cancel();
 
         assert!(slot.refs.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn application_materializes_refs_and_keeps_them_context_scoped() {
+        let application = Application::from_arcs(
+            Config::empty(),
+            default_registry().expect("registry"),
+            Arc::new(MemoryProfileSource::new(profile(&row(
+                SUB,
+                TENANT,
+                "AzureCloud",
+                "alice",
+            )))),
+            Arc::new(Validator::default()),
+            Arc::new(RefFactory),
+            DEFAULT_POLICY_HASH,
+            DEFAULT_POLICY_VERSION,
+        )
+        .expect("application");
+        let first = application
+            .context_open(ContextOpenArgs::default())
+            .await
+            .expect("first context");
+        let ref_result = application
+            .run(RunArgs {
+                context_id: first.context_id.clone(),
+                code: "__large_ref__".to_owned(),
+                timeout_ms: None,
+            })
+            .await
+            .expect("reference result");
+        let ref_id = ref_result.value["__ref"]
+            .as_str()
+            .expect("reference token")
+            .to_owned();
+        let first_slot = application
+            .inner
+            .workers
+            .lock()
+            .await
+            .get(&first.context_id)
+            .cloned()
+            .expect("first worker slot");
+        assert_eq!(first_slot.refs.lock().await.len(), 1);
+        assert_eq!(ref_result.value["type"], "object");
+        assert_eq!(ref_result.value["keyCount"], 2);
+        assert_eq!(ref_result.value["sensitivity"], "customerData");
+        let rendered = serde_json::to_string(&ref_result.value).expect("preview JSON");
+        assert!(!rendered.contains("secret-value"));
+        assert!(!rendered.contains(&"x".repeat(70_000)));
+
+        let restored = application
+            .run(RunArgs {
+                context_id: first.context_id.clone(),
+                code: format!("__ref__{ref_id}"),
+                timeout_ms: None,
+            })
+            .await
+            .expect("same-context rehydration");
+        assert_eq!(restored.value["secret"], "secret-value");
+        assert_eq!(restored.value["paddingLength"], 70_000);
+        assert_eq!(
+            application
+                .run(RunArgs {
+                    context_id: first.context_id.clone(),
+                    code: "__ref__ref_invalid".to_owned(),
+                    timeout_ms: None,
+                })
+                .await
+                .expect_err("invalid ref")
+                .kind(),
+            AppErrorCode::ExecutionFailed
+        );
+        application
+            .run(RunArgs {
+                context_id: first.context_id.clone(),
+                code: "still alive".to_owned(),
+                timeout_ms: None,
+            })
+            .await
+            .expect("invalid ref does not evict context");
+
+        let second = application
+            .context_open(ContextOpenArgs::default())
+            .await
+            .expect("second context");
+        let denied = application
+            .run(RunArgs {
+                context_id: second.context_id.clone(),
+                code: format!("__ref__{ref_id}"),
+                timeout_ms: None,
+            })
+            .await
+            .expect_err("cross-context ref");
+        assert_eq!(denied.kind(), AppErrorCode::ExecutionFailed);
+        application
+            .run(RunArgs {
+                context_id: second.context_id.clone(),
+                code: "still alive".to_owned(),
+                timeout_ms: None,
+            })
+            .await
+            .expect("missing ref does not evict context");
+
+        application
+            .context_close(ContextCloseArgs {
+                context_id: first.context_id.clone(),
+            })
+            .await
+            .expect("close ref context");
+        assert!(first_slot.refs.lock().await.is_empty());
+        assert_eq!(
+            application
+                .run(RunArgs {
+                    context_id: first.context_id,
+                    code: format!("__ref__{ref_id}"),
+                    timeout_ms: None,
+                })
+                .await
+                .expect_err("closed context cannot rehydrate")
+                .kind(),
+            AppErrorCode::ContextNotFound
+        );
+        application
+            .context_close(ContextCloseArgs {
+                context_id: second.context_id,
+            })
+            .await
+            .expect("close second context");
     }
 
     #[tokio::test]

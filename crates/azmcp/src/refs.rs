@@ -1,9 +1,9 @@
 //! Context-owned storage for bounded large-result references.
 //!
-//! A reference is an opaque capability to one immutable JSON value.  The store
-//! is deliberately separate from the MCP result boundary: until a reviewed
-//! rehydration protocol exists, oversized worker results still fail closed with
-//! their shape-only summary.
+//! A reference is an opaque capability to one immutable JSON value. The
+//! application materializes bounded worker candidates here and exposes only a
+//! structural envelope at the MCP boundary. Rehydration is mediated by the
+//! worker protocol, so a token is useful only to its owning context.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -24,32 +24,34 @@ pub const DEFAULT_REF_TTL: Duration = Duration::from_secs(5 * 60);
 pub const DEFAULT_REF_MAX_ENTRIES: usize = 32;
 /// Default aggregate encoded-byte budget for one context's references.
 pub const DEFAULT_REF_MAX_BYTES: usize = 4 * 1024 * 1024;
-/// Default encoded-byte budget for one reference value.
-pub const DEFAULT_REF_MAX_VALUE_BYTES: usize = 1024 * 1024;
+/// Default encoded-byte budget for one reference value. This stays below the
+/// worker's 512 KiB parent-input ceiling, leaving room for protocol framing.
+pub const DEFAULT_REF_MAX_VALUE_BYTES: usize = 480 * 1024;
 /// Default encoded-byte budget for one bounded read.
-pub const DEFAULT_REF_MAX_READ_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_REF_MAX_READ_BYTES: usize = 480 * 1024;
 
 /// Hard upper bound for a context's reference count.
 pub const MAX_REF_ENTRIES: usize = 256;
 /// Hard upper bound for a context's aggregate reference storage.
 pub const MAX_REF_BYTES: usize = 16 * 1024 * 1024;
-/// Hard upper bound for one stored reference value.
-pub const MAX_REF_VALUE_BYTES: usize = 8 * 1024 * 1024;
+/// Hard upper bound for one stored reference value. Keep this aligned with the
+/// bounded worker candidate and rehydration protocol.
+pub const MAX_REF_VALUE_BYTES: usize = 480 * 1024;
 /// Hard upper bound for one reference read.
-pub const MAX_REF_READ_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_REF_READ_BYTES: usize = 480 * 1024;
 /// Hard upper bound for a reference lifetime.
 pub const MAX_REF_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// An opaque, random reference capability.
 ///
 /// The actual token is available only through [`RefId::as_str`], which is an
-/// explicit handoff for a future rehydration protocol.  Formatting an ID for
+/// explicit handoff for the worker rehydration protocol. Formatting an ID for
 /// diagnostics never emits that token.
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct RefId(String);
 
 impl RefId {
-    /// Parse an opaque reference token received from a future ref-aware API.
+    /// Parse an opaque reference token received from the worker ref bridge.
     pub fn parse(value: &str) -> Result<Self, InvalidRefId> {
         let expected_bytes = REF_ID_PREFIX.len() + REF_ID_BYTES * 2;
         if value.len() != expected_bytes || !value.starts_with(REF_ID_PREFIX) {
@@ -64,7 +66,7 @@ impl RefId {
         Ok(Self(value.to_owned()))
     }
 
-    /// Return the opaque token for an explicit protocol handoff.
+    /// Return the opaque token for the explicit worker ref handoff.
     pub fn as_str(&self) -> &str {
         &self.0
     }

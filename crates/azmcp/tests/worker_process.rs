@@ -3,14 +3,37 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use azmcp::refs::{RefId, RefStore};
 use azmcp::worker::{
-    HostCallHandler, HostCallResult, MAX_PENDING_HOST_CALLS, WorkerError, WorkerProcess,
+    HOST_METHOD_REF, HostCallHandler, HostCallResult, MAX_PENDING_HOST_CALLS, WorkerError,
+    WorkerProcess,
 };
-use serde_json::json;
-use tokio::sync::{Barrier, Notify};
+use serde_json::{Value, json};
+use tokio::sync::{Barrier, Mutex, Notify};
+
+fn ref_handler(store: Arc<Mutex<RefStore>>) -> HostCallHandler {
+    Arc::new(move |request| {
+        let store = Arc::clone(&store);
+        Box::pin(async move {
+            if request.method != HOST_METHOD_REF {
+                return HostCallResult::failure(&request, "host call is not a ref call");
+            }
+            let Some(ref_id) = request.arguments.get("refId").and_then(Value::as_str) else {
+                return HostCallResult::failure(&request, "invalid reference arguments");
+            };
+            let Ok(ref_id) = RefId::parse(ref_id) else {
+                return HostCallResult::failure(&request, "invalid reference id");
+            };
+            match store.lock().await.get(&ref_id, Instant::now()) {
+                Ok(value) => HostCallResult::success(&request, value),
+                Err(_) => HostCallResult::failure(&request, "reference is unavailable"),
+            }
+        })
+    })
+}
 
 #[tokio::test]
 async fn subprocess_worker_persists_and_closes() {
@@ -116,6 +139,81 @@ async fn subprocess_host_calls_bound_parent_handler_concurrency() {
         MAX_PENDING_HOST_CALLS
     );
     worker.close().await.expect("clean close");
+}
+
+#[tokio::test]
+async fn subprocess_refs_rehydrate_immutably_and_deny_other_contexts() {
+    let mut worker = WorkerProcess::start(env!("CARGO_BIN_EXE_azmcp"))
+        .await
+        .expect("start isolated worker");
+    let candidate = worker
+        .execute(
+            "({secret: 'do-not-leak', padding: 'x'.repeat(70000)})",
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("oversized serializable result");
+    let candidate = candidate
+        .ref_candidate
+        .expect("oversized value is a bounded ref candidate");
+    let store = Arc::new(Mutex::new(RefStore::with_defaults()));
+    let ref_id = store
+        .lock()
+        .await
+        .put(candidate.value, Instant::now())
+        .expect("store candidate");
+    let ref_id_text = ref_id.as_str().to_owned();
+    let handler = ref_handler(Arc::clone(&store));
+
+    let mutated = worker
+        .execute_with_host_handler(
+            format!(
+                "(async () => {{ const value = await az.ref({ref_id_text:?}); value.secret = 'mutated'; value.padding = 'short'; return value.secret; }})()"
+            ),
+            Duration::from_secs(2),
+            Arc::clone(&handler),
+        )
+        .await
+        .expect("rehydrate and mutate");
+    assert_eq!(mutated.value, "mutated");
+
+    let original = worker
+        .execute_with_host_handler(
+            format!(
+                "(async () => {{ const value = await az.ref({ref_id_text:?}); return {{secret: value.secret, paddingLength: value.padding.length}}; }})()"
+            ),
+            Duration::from_secs(2),
+            Arc::clone(&handler),
+        )
+        .await
+        .expect("rehydrate original value");
+    assert_eq!(original.value["secret"], "do-not-leak");
+    assert_eq!(original.value["paddingLength"], 70000);
+
+    let mut other_worker = WorkerProcess::start(env!("CARGO_BIN_EXE_azmcp"))
+        .await
+        .expect("start second isolated worker");
+    let other_store = Arc::new(Mutex::new(RefStore::with_defaults()));
+    let denied = other_worker
+        .execute_with_host_handler(
+            format!("await az.ref({ref_id_text:?})"),
+            Duration::from_secs(2),
+            ref_handler(other_store),
+        )
+        .await
+        .expect_err("ref must not cross contexts");
+    assert!(matches!(denied, WorkerError::Execution { .. }));
+    assert_eq!(
+        other_worker
+            .execute("1 + 1", Duration::from_secs(2))
+            .await
+            .expect("missing ref does not poison context")
+            .value,
+        2
+    );
+
+    worker.close().await.expect("close first worker");
+    other_worker.close().await.expect("close second worker");
 }
 
 #[tokio::test]

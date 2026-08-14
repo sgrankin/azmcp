@@ -519,6 +519,7 @@ mod tests {
                     value: Value::String(code.to_owned()),
                     logs: Vec::new(),
                     logs_omitted: 0,
+                    ref_candidate: None,
                 })
             })
         }

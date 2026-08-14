@@ -887,8 +887,12 @@ summary or a serialization error, never partial JSON.
 This is the single largest determinant of whether code mode feels good or drowns the
 context window.
 
-v0, before refs exist, returns `result_too_large` with a shape-only summary and asks the
-caller to reduce the value in JS. It never returns a truncated success value.
+The pre-reference v0 behavior returns `result_too_large` with a shape-only summary and
+asks the caller to reduce the value in JS. The bounded reference slice retains that
+fail-closed behavior for cyclic, non-serializable, and over-hard-cap values; bounded
+serializable values instead cross as immutable context-scoped refs and can be
+rehydrated with `az.ref` only inside their owning context. No path returns truncated
+JSON.
 
 ### 6.5 Write mode: plan / apply
 
