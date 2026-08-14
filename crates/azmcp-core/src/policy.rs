@@ -6,6 +6,8 @@ use thiserror::Error;
 use crate::cloud::AzureCloud;
 use crate::target::RelativeRequestTarget;
 
+const MAX_TEMPLATE_SEGMENTS: usize = 64;
+
 /// HTTP methods represented in the reviewed route bundle.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -203,6 +205,14 @@ impl PolicyBundle {
         if routes.is_empty() {
             return Err(InvalidPolicyBundle::Routes);
         }
+        for (index, route) in routes.iter().enumerate() {
+            if routes[..index]
+                .iter()
+                .any(|previous| executable_selectors_overlap(previous, route))
+            {
+                return Err(InvalidPolicyBundle::OverlappingRoutes);
+            }
+        }
         Ok(Self { version, routes })
     }
 
@@ -272,6 +282,10 @@ impl RouteTemplate {
         }
 
         let mut literal_count = 0;
+        let mut resource_uri_count = 0;
+        if value.split('/').skip(1).count() > MAX_TEMPLATE_SEGMENTS {
+            return Err(InvalidRoute::PathTemplate);
+        }
         let segments = value
             .split('/')
             .skip(1)
@@ -288,6 +302,10 @@ impl RouteTemplate {
                         return Err(InvalidRoute::PathTemplate);
                     }
                     if parameter == "resourceUri" {
+                        resource_uri_count += 1;
+                        if resource_uri_count > 1 {
+                            return Err(InvalidRoute::PathTemplate);
+                        }
                         Ok(TemplateSegment::TailParameter(parameter.to_owned()))
                     } else {
                         Ok(TemplateSegment::Parameter(parameter.to_owned()))
@@ -429,6 +447,20 @@ pub enum InvalidPolicyBundle {
     /// An empty bundle is almost certainly a packaging error.
     #[error("policy bundle must contain at least one reviewed route")]
     Routes,
+    /// Two rows with the same executable selector cannot vary authorization or query metadata.
+    #[error("policy bundle contains overlapping executable route selectors")]
+    OverlappingRoutes,
+}
+
+fn executable_selectors_overlap(left: &ReviewedRoute, right: &ReviewedRoute) -> bool {
+    left.cloud == right.cloud
+        && left.purpose == right.purpose
+        && left.method == right.method
+        && left.template.source == right.template.source
+        && left
+            .api_versions
+            .iter()
+            .any(|version| right.api_versions.iter().any(|other| version == other))
 }
 
 /// A request failed to resolve to one unambiguous reviewed route.
@@ -658,6 +690,59 @@ mod tests {
                 "2024-01-01"
             ),
             Err(PolicyDenial::UnknownRoute)
+        );
+    }
+
+    #[test]
+    fn rejects_overlapping_selectors_before_query_or_rbac_metadata() {
+        let first = route(
+            "/subscriptions/{subscription}/providers/Microsoft.Storage/storageAccounts/{name}",
+            "Microsoft.Storage/storageAccounts/read",
+        )
+        .with_query_parameters(["$expand"])
+        .expect("valid query policy");
+        let second = route(
+            "/subscriptions/{subscription}/providers/Microsoft.Storage/storageAccounts/{name}",
+            "different/read",
+        );
+
+        assert_eq!(
+            PolicyBundle::new("test-v1", vec![first, second]),
+            Err(InvalidPolicyBundle::OverlappingRoutes)
+        );
+    }
+
+    #[test]
+    fn limits_resource_uri_tail_parameters() {
+        let duplicate = ReviewedRoute::new(
+            AzureCloud::AzureCloud,
+            RoutePurpose::Request,
+            HttpMethod::Get,
+            "/subscriptions/{subscription}/{resourceUri}/{resourceUri}/providers/Test",
+            ["2024-01-01"],
+            "read",
+            ArmTier::Inspect,
+        );
+        assert_eq!(duplicate, Err(InvalidRoute::PathTemplate));
+
+        let long_path = format!(
+            "/{}",
+            (0..65)
+                .map(|index| format!("segment{index}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        assert_eq!(
+            ReviewedRoute::new(
+                AzureCloud::AzureCloud,
+                RoutePurpose::Request,
+                HttpMethod::Get,
+                &long_path,
+                ["2024-01-01"],
+                "read",
+                ArmTier::Inspect,
+            ),
+            Err(InvalidRoute::PathTemplate)
         );
     }
 }

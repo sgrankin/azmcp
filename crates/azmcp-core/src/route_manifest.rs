@@ -73,6 +73,8 @@ pub struct ManifestUpstreamSource {
     pub(crate) catalog_sha256: String,
     pub(crate) review_id: String,
     pub(crate) review_revision: String,
+    /// SHA-256 of the canonical review join with its own hash cleared.
+    pub(crate) review_sha256: String,
 }
 
 /// The pinned provenance of a checked-in route fixture.
@@ -281,6 +283,12 @@ fn validate_manifest_with_hash(
                 reason: "query parameter policy is empty, overlarge, or unbounded".to_owned(),
             });
         }
+        if manifest.routes[..index]
+            .iter()
+            .any(|previous| executable_selectors_overlap(previous, route))
+        {
+            return Err(ManifestError::DuplicateRoute { index });
+        }
         let reviewed = reviewed_route(route)
             .map_err(|reason| ManifestError::InvalidRoute { index, reason })?;
         let key = route_identity(route);
@@ -447,14 +455,6 @@ impl RouteManifest {
     pub(crate) fn set_policy_hash(&mut self, value: String) {
         self.policy_hash = value;
     }
-
-    pub(crate) fn upstream_source(&self) -> Option<&ManifestUpstreamSource> {
-        self.source.upstream.as_ref()
-    }
-
-    pub(crate) fn clear_upstream_source(&mut self) {
-        self.source.upstream = None;
-    }
 }
 
 fn reviewed_route(route: &ManifestRoute) -> Result<ReviewedRoute, String> {
@@ -614,21 +614,33 @@ fn valid_upstream_source(source: &ManifestUpstreamSource) -> bool {
         (&source.repository, 512),
         (&source.revision, 256),
         (&source.path, 1_024),
-        (&source.source_sha256, 71),
-        (&source.catalog_sha256, 71),
         (&source.review_id, 256),
         (&source.review_revision, 256),
     ]
     .into_iter()
     .all(|(value, maximum)| bounded(value, maximum))
-        && source.source_sha256.starts_with("sha256:")
-        && source.source_sha256[7..]
+        && valid_sha256(&source.source_sha256)
+        && valid_sha256(&source.catalog_sha256)
+        && valid_sha256(&source.review_sha256)
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
             .chars()
             .all(|character| character.is_ascii_hexdigit())
-        && source.catalog_sha256.starts_with("sha256:")
-        && source.catalog_sha256[7..]
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
+}
+
+fn executable_selectors_overlap(left: &ManifestRoute, right: &ManifestRoute) -> bool {
+    left.cloud == right.cloud
+        && left.purpose == right.purpose
+        && left.method == right.method
+        && left.path_template == right.path_template
+        && left
+            .api_versions
+            .iter()
+            .any(|version| right.api_versions.iter().any(|other| version == other))
 }
 
 fn discoverable(purpose: ManifestRoutePurpose) -> bool {
@@ -819,6 +831,19 @@ mod tests {
             validate_manifest(&manifest),
             Err(ManifestError::SchemaNotDiscoverable { .. })
                 | Err(ManifestError::PolicyHashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn overlapping_selector_cannot_bypass_rbac_or_query_metadata() {
+        let mut manifest = checked_in_manifest().expect("fixture");
+        let mut duplicate = manifest.routes[0].clone();
+        duplicate.rbac_action = "different/read".to_owned();
+        duplicate.allowed_query_parameters = vec!["$expand".to_owned()];
+        manifest.routes.push(duplicate);
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ManifestError::DuplicateRoute { .. })
         ));
     }
 
