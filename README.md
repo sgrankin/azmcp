@@ -6,8 +6,8 @@ inspection from persistent JavaScript contexts.
 The MCP transport has no session lifecycle. Application state is explicit: a
 caller opens an opaque context, runs one serialized JavaScript turn at a time,
 and closes the context. Each context fixes its identity, cloud bindings,
-subscription allowlist, Resource Graph scope, inspect-only capability, policy
-bundle, and isolated V8 worker.
+subscription allowlist, Resource Graph scope, Azure-inspect-only capability,
+optional managed local capabilities, policy bundle, and isolated V8 worker.
 
 v0 is deliberately small. It exposes:
 
@@ -25,9 +25,10 @@ separate from host-owned HTTP body schemas. Response schemas remain
 `metadataOnly` because no response fixtures are checked in.
 
 Inside `azure_run`, JavaScript has only `console`, `az.request`, `az.graph`,
-the reviewed `az.metrics` and `az.logs` helpers, and the context-scoped
-`az.ref`/`az.peek` result helpers. There is no `fetch`, `Deno`, token access,
-ambient cloud, or ambient subscription.
+the reviewed `az.metrics` and `az.logs` helpers, the context-scoped
+`az.ref`/`az.peek` result helpers, and the explicitly granted managed artifact
+writer described below. There is no general filesystem access, `fetch`,
+`Deno`, token access, ambient cloud, or ambient subscription.
 
 The metrics signatures are explicit and closed:
 
@@ -78,6 +79,41 @@ subscription validation, provider metadata, Resource Graph, metrics, and Logs
 Query operations for Azure commercial and US Government clouds, plus the pinned
 `StorageAccounts_GetProperties` ARM GET for both clouds.
 
+### Managed JSON artifacts
+
+A context can explicitly grant one local capability for handing a generated
+value to a local CLI or visualization script without returning the JSON through
+MCP:
+
+```json
+{
+  "localCapabilities": ["artifacts.write"]
+}
+```
+
+```js
+const receipt = await az.artifacts.writeJson({
+  name: "metrics.json",
+  value: result
+})
+// {path, bytes, sha256, mediaType: "application/json", sensitivity: "customerData"}
+```
+
+`name` is one conservative ASCII filename ending in `.json`, never a path.
+Writes are create-only and confined to a fresh random directory owned by that
+context. Each compact JSON file is limited to 480 KiB; a context can create at
+most 32 files and 4 MiB, while one artifact root can hold at most 256 files and
+16 MiB. Directories are mode `0700` and files mode `0600` on Unix. Symlinks,
+non-regular destinations, traversal, overwrite, and cross-context addressing
+fail closed.
+
+Artifacts deliberately survive context close, expiry, and server restart so a
+local process can consume the returned path. azmcp exposes no artifact read,
+list, delete, or arbitrary filesystem API; cleanup is an ordinary local-shell
+operation. The durable audit log records only the correlation ID, operation,
+decision, encoded byte count, and sensitivity—not the path, filename, or JSON
+content.
+
 ## Build and test
 
 The workspace pins Rust 1.97.1 and `rmcp` 3.0.1.
@@ -125,12 +161,23 @@ tenant = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 [clouds.AzureUSGovernment]
 subscription = "33333333-3333-3333-3333-333333333333"
 tenant = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+# Optional. Defaults to the standard user data directory described below.
+[artifacts]
+root = "/absolute/private/path/to/azmcp-artifacts"
 ```
 
 An omitted primary tenant is resolved only when the cached Azure profile has
 exactly one matching tenant candidate. With no configured or caller-supplied
 bindings, auto-binding succeeds only for a cloud with exactly one candidate;
 ambiguity fails closed.
+
+The managed artifact root defaults to
+`$XDG_DATA_HOME/azmcp/artifacts`, or
+`$HOME/.local/share/azmcp/artifacts` when `XDG_DATA_HOME` is unset.
+The optional `[artifacts] root` setting must be an absolute path. The root is
+created lazily on the first explicitly granted artifact write; startup and
+ordinary Azure inspection do not create it.
 
 Profile discovery uses `AZMCP_AZURE_PROFILE`, then
 `$AZURE_CONFIG_DIR/azureProfile.json`, then
