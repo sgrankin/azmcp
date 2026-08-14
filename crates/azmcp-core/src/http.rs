@@ -12,10 +12,10 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use reqwest::redirect::Policy as RedirectPolicy;
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
@@ -40,8 +40,23 @@ pub const DEFAULT_REQUEST_BODY_LIMIT: usize = 1024 * 1024;
 pub const DEFAULT_RESPONSE_BODY_LIMIT: usize = 8 * 1024 * 1024;
 /// The default wall-clock timeout for one ARM HTTP exchange.
 pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// The default total number of HTTP attempts, including the initial request.
+pub const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
+/// The default wall-clock budget for one retrying HTTP operation.
+pub const DEFAULT_RETRY_MAX_ELAPSED: Duration = Duration::from_secs(10);
+/// The default delay before the first retry when `Retry-After` is absent.
+pub const DEFAULT_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+/// The largest delay used for either exponential backoff or `Retry-After`.
+pub const DEFAULT_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
+/// Absolute upper bound accepted for configured retry attempts.
+pub const MAX_RETRY_ATTEMPTS: u32 = 8;
+/// Absolute upper bound accepted for one retrying operation's elapsed time.
+pub const MAX_RETRY_ELAPSED: Duration = Duration::from_secs(60);
+/// Absolute upper bound accepted for one retry delay.
+pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 const MAX_SAFE_HEADER_VALUE_BYTES: usize = 4096;
+const MAX_SAFE_RETRY_AFTER_BYTES: usize = 128;
 
 /// A boxed asynchronous credential acquisition operation.
 pub type CredentialFuture<'a> =
@@ -139,10 +154,12 @@ pub struct HttpLimits {
     request_body_bytes: usize,
     response_body_bytes: usize,
     timeout: Duration,
+    retry_policy: RetryPolicy,
 }
 
 impl HttpLimits {
-    /// Construct explicit limits.  All limits must be non-zero.
+    /// Construct explicit limits.  Request, response, and timeout limits must
+    /// be non-zero; retry backoffs may be zero for deterministic tests.
     pub const fn new(
         request_body_bytes: usize,
         response_body_bytes: usize,
@@ -152,6 +169,12 @@ impl HttpLimits {
             request_body_bytes,
             response_body_bytes,
             timeout,
+            retry_policy: RetryPolicy::new(
+                DEFAULT_RETRY_MAX_ATTEMPTS,
+                DEFAULT_RETRY_MAX_ELAPSED,
+                DEFAULT_RETRY_INITIAL_BACKOFF,
+                DEFAULT_RETRY_MAX_BACKOFF,
+            ),
         }
     }
 
@@ -170,6 +193,22 @@ impl HttpLimits {
         self.timeout
     }
 
+    /// Retry policy for reviewed read operations.
+    pub const fn retry_policy(self) -> RetryPolicy {
+        self.retry_policy
+    }
+
+    /// Replace the bounded retry policy.
+    pub const fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
+    }
+
+    /// Alias for [`HttpLimits::with_retry_policy`].
+    pub const fn with_retry(self, retry_policy: RetryPolicy) -> Self {
+        self.with_retry_policy(retry_policy)
+    }
+
     fn validate(self) -> Result<Self, HttpError> {
         if self.request_body_bytes == 0 {
             return Err(HttpError::InvalidLimits {
@@ -184,6 +223,7 @@ impl HttpLimits {
         if self.timeout.is_zero() {
             return Err(HttpError::InvalidLimits { field: "timeout" });
         }
+        self.retry_policy.validate()?;
         Ok(self)
     }
 }
@@ -197,6 +237,104 @@ impl Default for HttpLimits {
         )
     }
 }
+
+/// Bounded retry controls for one policy-approved read operation.
+///
+/// `max_attempts` includes the initial request.  The elapsed-time bound covers
+/// request attempts and backoff sleeps together.  A zero backoff is accepted
+/// for deterministic tests, but production defaults use exponential delays.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryPolicy {
+    max_attempts: u32,
+    max_elapsed: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+}
+
+impl RetryPolicy {
+    /// Construct explicit retry controls.
+    pub const fn new(
+        max_attempts: u32,
+        max_elapsed: Duration,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) -> Self {
+        Self {
+            max_attempts,
+            max_elapsed,
+            initial_backoff,
+            max_backoff,
+        }
+    }
+
+    /// Maximum number of attempts, including the first request.
+    pub const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+
+    /// Maximum elapsed time for all attempts and backoff sleeps.
+    pub const fn max_elapsed(self) -> Duration {
+        self.max_elapsed
+    }
+
+    /// Initial exponential-backoff delay.
+    pub const fn initial_backoff(self) -> Duration {
+        self.initial_backoff
+    }
+
+    /// Maximum delay for exponential backoff and `Retry-After`.
+    pub const fn max_backoff(self) -> Duration {
+        self.max_backoff
+    }
+
+    fn validate(self) -> Result<(), HttpError> {
+        if self.max_attempts == 0 {
+            return Err(HttpError::InvalidLimits {
+                field: "retry attempt limit",
+            });
+        }
+        if self.max_attempts > MAX_RETRY_ATTEMPTS {
+            return Err(HttpError::InvalidLimits {
+                field: "retry attempt limit",
+            });
+        }
+        if self.max_elapsed.is_zero() {
+            return Err(HttpError::InvalidLimits {
+                field: "retry elapsed-time limit",
+            });
+        }
+        if self.max_elapsed > MAX_RETRY_ELAPSED {
+            return Err(HttpError::InvalidLimits {
+                field: "retry elapsed-time limit",
+            });
+        }
+        if self.initial_backoff > self.max_backoff {
+            return Err(HttpError::InvalidLimits {
+                field: "retry backoff limit",
+            });
+        }
+        if self.max_backoff > MAX_RETRY_BACKOFF {
+            return Err(HttpError::InvalidLimits {
+                field: "retry backoff limit",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_RETRY_MAX_ATTEMPTS,
+            DEFAULT_RETRY_MAX_ELAPSED,
+            DEFAULT_RETRY_INITIAL_BACKOFF,
+            DEFAULT_RETRY_MAX_BACKOFF,
+        )
+    }
+}
+
+/// Descriptive alias for callers configuring the HTTP boundary.
+pub type HttpRetryPolicy = RetryPolicy;
 
 /// An exact reviewed ARM origin.
 ///
@@ -712,6 +850,8 @@ pub struct HttpResponse {
     status: u16,
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
+    #[serde(skip)]
+    retry_count: u32,
 }
 
 impl HttpResponse {
@@ -724,6 +864,7 @@ impl HttpResponse {
             status,
             headers,
             body,
+            retry_count: 0,
         }
     }
 
@@ -746,6 +887,16 @@ impl HttpResponse {
     pub fn into_body(self) -> Vec<u8> {
         self.body
     }
+
+    /// Number of retry attempts made before this response was returned.
+    pub const fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
+    fn with_retry_count(mut self, retry_count: u32) -> Self {
+        self.retry_count = retry_count;
+        self
+    }
 }
 
 impl fmt::Debug for HttpResponse {
@@ -755,6 +906,7 @@ impl fmt::Debug for HttpResponse {
             .field("status", &self.status)
             .field("headers", &self.headers)
             .field("body_len", &self.body.len())
+            .field("retry_count", &self.retry_count)
             .finish()
     }
 }
@@ -1078,7 +1230,8 @@ impl HttpClient {
 
         // Route classification is a hard gate.  There is intentionally no
         // generic GET/POST fallback for paths absent from the reviewed bundle.
-        self.config
+        let route = self
+            .config
             .policy
             .classify(
                 self.config.cloud,
@@ -1088,6 +1241,7 @@ impl HttpClient {
                 &request.api_version,
             )
             .map_err(HttpError::PolicyDenied)?;
+        let retryable_route = retryable_route(route);
 
         verify_subscription_scope(&request.target, self.config.subscription.as_str())?;
 
@@ -1123,10 +1277,7 @@ impl HttpClient {
         let authorization = authorization?;
 
         let method = reqwest_method(request.method);
-        let mut builder = self
-            .http
-            .request(method, url)
-            .header(AUTHORIZATION, authorization);
+        let mut headers = Vec::with_capacity(request.headers.len());
         for (name, value) in request.headers {
             // Header validation has already run and this conversion cannot
             // contain the bearer value, which is held in a separate object.
@@ -1136,35 +1287,21 @@ impl HttpClient {
                 HeaderValue::from_str(&value).map_err(|_| HttpError::InvalidHeaderValue {
                     name: name.to_string(),
                 })?;
-            builder = builder.header(name, value);
+            headers.push((name, value));
         }
-        let builder = builder.body(request.body);
-
-        let body_limit = self.config.limits.response_body_bytes();
-        time::timeout(self.config.limits.timeout(), async move {
-            let response = builder.send().await.map_err(|_| HttpError::RequestSend)?;
-            if response.status().is_redirection() {
-                return Err(HttpError::RedirectDenied);
-            }
-
-            let status = response.status();
-            let headers = safe_response_headers(response.headers());
-            if response
-                .content_length()
-                .is_some_and(|length| length > body_limit as u64)
-            {
-                return Err(HttpError::ResponseBodyTooLarge { limit: body_limit });
-            }
-
-            let body = read_response_body(response, body_limit).await?;
-            Ok(HttpResponse {
-                status: status.as_u16(),
+        execute_with_retries(
+            &self.http,
+            PreparedRequest {
+                method,
+                url,
+                authorization,
                 headers,
-                body,
-            })
-        })
+                body: request.body,
+                retryable: retryable_route,
+            },
+            self.config.limits,
+        )
         .await
-        .map_err(|_| HttpError::Timeout)?
     }
 }
 
@@ -1373,7 +1510,8 @@ impl LogsHttpClient {
                 limit: self.config.limits.request_body_bytes(),
             });
         }
-        self.config
+        let route = self
+            .config
             .policy
             .classify(
                 self.config.cloud,
@@ -1383,6 +1521,7 @@ impl LogsHttpClient {
                 LOGS_QUERY_API_VERSION,
             )
             .map_err(HttpError::PolicyDenied)?;
+        let retryable_route = retryable_route(route);
         let url = build_logs_request_url(&self.config.origin, &request.target)?;
 
         let mut token_request = TokenRequest::new(
@@ -1414,35 +1553,22 @@ impl LogsHttpClient {
         auth_bytes.zeroize();
         let authorization = authorization?;
 
-        let builder = self
-            .http
-            .post(url)
-            .header(AUTHORIZATION, authorization)
-            .header(CONTENT_TYPE, "application/json")
-            .body(request.body);
-        let body_limit = self.config.limits.response_body_bytes();
-        time::timeout(self.config.limits.timeout(), async move {
-            let response = builder.send().await.map_err(|_| HttpError::RequestSend)?;
-            if response.status().is_redirection() {
-                return Err(HttpError::RedirectDenied);
-            }
-            let status = response.status();
-            let headers = safe_response_headers(response.headers());
-            if response
-                .content_length()
-                .is_some_and(|length| length > body_limit as u64)
-            {
-                return Err(HttpError::ResponseBodyTooLarge { limit: body_limit });
-            }
-            let body = read_response_body(response, body_limit).await?;
-            Ok(HttpResponse {
-                status: status.as_u16(),
-                headers,
-                body,
-            })
-        })
+        execute_with_retries(
+            &self.http,
+            PreparedRequest {
+                method: Method::POST,
+                url,
+                authorization,
+                headers: vec![(
+                    HeaderName::from_static("content-type"),
+                    HeaderValue::from_static("application/json"),
+                )],
+                body: request.body,
+                retryable: retryable_route,
+            },
+            self.config.limits,
+        )
         .await
-        .map_err(|_| HttpError::Timeout)?
     }
 }
 
@@ -1601,6 +1727,15 @@ fn safe_response_headers(headers: &reqwest::header::HeaderMap) -> BTreeMap<Strin
                 return None;
             }
             let value = value.to_str().ok()?;
+            if name == "retry-after" {
+                if value.len() > MAX_SAFE_RETRY_AFTER_BYTES {
+                    return None;
+                }
+                let delay = parse_retry_after(value)?;
+                if delay > MAX_RETRY_BACKOFF {
+                    return None;
+                }
+            }
             (!value.chars().any(char::is_control)).then(|| (name.to_owned(), value.to_owned()))
         })
         .collect()
@@ -1620,6 +1755,242 @@ async fn read_response_body(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+struct PreparedRequest {
+    method: Method,
+    url: Url,
+    authorization: HeaderValue,
+    headers: Vec<(HeaderName, HeaderValue)>,
+    body: Vec<u8>,
+    retryable: bool,
+}
+
+async fn execute_with_retries(
+    client: &Client,
+    request: PreparedRequest,
+    limits: HttpLimits,
+) -> Result<HttpResponse, HttpError> {
+    let retry_policy = limits.retry_policy();
+    let started = std::time::Instant::now();
+    let mut attempts = 0_u32;
+    let mut last_response = None;
+
+    loop {
+        let elapsed = started.elapsed();
+        let Some(remaining) = retry_policy.max_elapsed().checked_sub(elapsed) else {
+            return last_response
+                .map(|response: HttpResponse| {
+                    Ok(response.with_retry_count(attempts.saturating_sub(1)))
+                })
+                .unwrap_or(Err(HttpError::Timeout));
+        };
+        if remaining.is_zero() {
+            return last_response
+                .map(|response: HttpResponse| {
+                    Ok(response.with_retry_count(attempts.saturating_sub(1)))
+                })
+                .unwrap_or(Err(HttpError::Timeout));
+        }
+        attempts = attempts.saturating_add(1);
+        let attempt_timeout = limits.timeout().min(remaining);
+        let response = time::timeout(
+            attempt_timeout,
+            send_once(client, &request, limits.response_body_bytes()),
+        )
+        .await
+        .map_err(|_| retry_failed(HttpError::Timeout, attempts.saturating_sub(1)))?
+        .map_err(|error| retry_failed(error, attempts.saturating_sub(1)))?;
+
+        let retry_count = attempts.saturating_sub(1);
+        let retryable_status = response.status == 429 || (500..=599).contains(&response.status);
+        if !request.retryable || !retryable_status || attempts >= retry_policy.max_attempts() {
+            return Ok(response.with_retry_count(retry_count));
+        }
+
+        let delay = retry_delay(&retry_policy, retry_count, &response);
+        let remaining = retry_policy
+            .max_elapsed()
+            .checked_sub(started.elapsed())
+            .unwrap_or_default();
+        if delay >= remaining {
+            return Ok(response.with_retry_count(retry_count));
+        }
+        last_response = Some(response);
+        time::sleep(delay).await;
+    }
+}
+
+async fn send_once(
+    client: &Client,
+    request: &PreparedRequest,
+    body_limit: usize,
+) -> Result<HttpResponse, HttpError> {
+    let mut builder = client
+        .request(request.method.clone(), request.url.clone())
+        .header(AUTHORIZATION, request.authorization.clone());
+    for (name, value) in &request.headers {
+        builder = builder.header(name.clone(), value.clone());
+    }
+    let response = builder
+        .body(request.body.clone())
+        .send()
+        .await
+        .map_err(|_| HttpError::RequestSend)?;
+    if response.status().is_redirection() {
+        return Err(HttpError::RedirectDenied);
+    }
+
+    let status = response.status();
+    let headers = safe_response_headers(response.headers());
+    if response
+        .content_length()
+        .is_some_and(|length| length > body_limit as u64)
+    {
+        return Err(HttpError::ResponseBodyTooLarge { limit: body_limit });
+    }
+
+    let body = read_response_body(response, body_limit).await?;
+    Ok(HttpResponse::from_parts(status.as_u16(), headers, body))
+}
+
+fn retry_failed(error: HttpError, retry_count: u32) -> HttpError {
+    if retry_count == 0 {
+        error
+    } else {
+        HttpError::RetryFailed {
+            retry_count,
+            source: Box::new(error),
+        }
+    }
+}
+
+fn retryable_route(route: &crate::policy::ReviewedRoute) -> bool {
+    if route.tier() == crate::policy::ArmTier::Write {
+        return false;
+    }
+    matches!(
+        (route.purpose(), route.method()),
+        (RoutePurpose::Request, HttpMethod::Get)
+            | (RoutePurpose::Internal, HttpMethod::Get)
+            | (RoutePurpose::MetricsSingle, HttpMethod::Get)
+            | (RoutePurpose::ResourceGraph, HttpMethod::Post)
+            | (RoutePurpose::MetricsBatch, HttpMethod::Post)
+            | (RoutePurpose::LogsQuery, HttpMethod::Post)
+    )
+}
+
+fn retry_delay(policy: &RetryPolicy, retry_count: u32, response: &HttpResponse) -> Duration {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| parse_retry_after(value))
+        .map(|delay| delay.min(policy.max_backoff()))
+        .unwrap_or_else(|| exponential_backoff(policy, retry_count))
+}
+
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    parse_http_date(value)
+}
+
+fn parse_http_date(value: &str) -> Option<Duration> {
+    let mut comma_parts = value.splitn(2, ',');
+    comma_parts.next()?;
+    let fields = comma_parts.next()?.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 5 || fields[4] != "GMT" {
+        return None;
+    }
+    if fields[0].len() > 2 || fields[2].len() != 4 {
+        return None;
+    }
+    let day = fields[0].parse::<u32>().ok()?;
+    let month = match fields[1] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year = fields[2].parse::<i64>().ok()?;
+    let mut time_parts = fields[3].split(':');
+    let hour = time_parts.next()?.parse::<u64>().ok()?;
+    let minute = time_parts.next()?.parse::<u64>().ok()?;
+    let second = time_parts.next()?.parse::<u64>().ok()?;
+    if time_parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    if days < 0 {
+        return Some(Duration::ZERO);
+    }
+    let seconds = u64::try_from(days).ok()?.checked_mul(86_400)?;
+    let seconds = seconds
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)?;
+    let target = UNIX_EPOCH.checked_add(Duration::from_secs(seconds))?;
+    match target.duration_since(SystemTime::now()) {
+        Ok(delay) => Some(delay),
+        Err(_) => Some(Duration::ZERO),
+    }
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day == 0 || day > month_days {
+        return None;
+    }
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 {
+        year / 400
+    } else {
+        (year - 399) / 400
+    };
+    let year_of_era = year - era * 400;
+    let month_prime = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
+}
+
+fn exponential_backoff(policy: &RetryPolicy, retry_count: u32) -> Duration {
+    let exponent = retry_count.saturating_sub(1).min(127);
+    let multiplier = 1_u128.checked_shl(exponent).unwrap_or(u128::MAX);
+    let nanos = policy
+        .initial_backoff()
+        .as_nanos()
+        .saturating_mul(multiplier)
+        .min(policy.max_backoff().as_nanos());
+    duration_from_nanos(nanos)
+}
+
+fn duration_from_nanos(nanos: u128) -> Duration {
+    let seconds = nanos / 1_000_000_000;
+    if seconds > u128::from(u64::MAX) {
+        return Duration::MAX;
+    }
+    Duration::new(seconds as u64, (nanos % 1_000_000_000) as u32)
 }
 
 /// Errors returned by the HTTP boundary.
@@ -1696,12 +2067,30 @@ pub enum HttpError {
     /// The request could not be sent.
     #[error("HTTP request could not be sent")]
     RequestSend,
+    /// A later transport failure occurred after one or more transient
+    /// responses.  The retry count remains available to the host audit record.
+    #[error("HTTP request failed after {retry_count} retries: {source}")]
+    RetryFailed {
+        retry_count: u32,
+        #[source]
+        source: Box<HttpError>,
+    },
     /// The response body could not be read.
     #[error("HTTP response body could not be read")]
     ResponseRead,
     /// Redirects are never followed or accepted as an execution result.
     #[error("HTTP redirects are not permitted")]
     RedirectDenied,
+}
+
+impl HttpError {
+    /// Number of retries already attempted before this error was returned.
+    pub const fn retry_count(&self) -> u32 {
+        match self {
+            Self::RetryFailed { retry_count, .. } => *retry_count,
+            _ => 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1799,6 +2188,54 @@ mod tests {
         (format!("http://{address}/"), task)
     }
 
+    async fn loopback_sequence_server(
+        responses: Vec<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.expect("loopback request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let count = stream.read(&mut buffer).await.expect("read request");
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    {
+                        let content_length = String::from_utf8_lossy(&request[..header_end])
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("Content-Length:")
+                                    .or_else(|| line.strip_prefix("content-length:"))
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= header_end.saturating_add(content_length) {
+                            break;
+                        }
+                    }
+                }
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+                requests.push(request);
+            }
+            requests
+        });
+        (format!("http://{address}/"), task)
+    }
+
     fn client_for(provider: Arc<FakeCredentials>, origin: &str) -> HttpClient {
         let (subscription, tenant) = ids();
         let origin =
@@ -1813,6 +2250,38 @@ mod tests {
             policy(),
         )
         .expect("client")
+    }
+
+    fn client_for_with_limits(
+        provider: Arc<FakeCredentials>,
+        origin: &str,
+        policy: PolicyBundle,
+        limits: HttpLimits,
+    ) -> HttpClient {
+        let (subscription, tenant) = ids();
+        let origin =
+            ArmOrigin::loopback_from_str(AzureCloud::AzureCloud, origin).expect("loopback origin");
+        let config = HttpClientConfig::with_origin(
+            AzureCloud::AzureCloud,
+            subscription,
+            tenant,
+            AUDIENCE,
+            origin,
+            policy,
+        )
+        .expect("config")
+        .with_limits(limits)
+        .expect("limits");
+        HttpClient::from_config(provider, config).expect("client")
+    }
+
+    fn fast_retry_limits(max_attempts: u32) -> HttpLimits {
+        HttpLimits::new(1024, 1024, Duration::from_secs(2)).with_retry_policy(RetryPolicy::new(
+            max_attempts,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            Duration::from_millis(50),
+        ))
     }
 
     #[test]
@@ -1858,6 +2327,266 @@ mod tests {
             MetricsOrigin::for_cloud(AzureCloud::AzureCloud, "https://evil.example"),
             Err(HttpError::InvalidMetricsRegion)
         ));
+    }
+
+    #[tokio::test]
+    async fn retries_transient_statuses_for_reviewed_gets_and_reports_count() {
+        let (base, server) = loopback_sequence_server(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+        ])
+        .await;
+        let provider = Arc::new(FakeCredentials::default());
+        let client =
+            client_for_with_limits(provider.clone(), &base, policy(), fast_retry_limits(3));
+        let request = HttpRequest::get(
+            &format!("/subscriptions/{SUBSCRIPTION}/resourceGroups/prod"),
+            API_VERSION,
+        )
+        .expect("request");
+
+        let response = client.execute(request).await.expect("successful retry");
+        let requests = server.await.expect("server task");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.retry_count(), 2);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retries_read_only_resource_graph_post_but_not_generic_post() {
+        let (base, server) = loopback_sequence_server(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+        ])
+        .await;
+        let client = client_for_with_limits(
+            Arc::new(FakeCredentials::default()),
+            &base,
+            policy(),
+            fast_retry_limits(2),
+        );
+        let target = RelativeRequestTarget::parse(
+            "/subscriptions/11111111-1111-1111-1111-111111111111/providers/Microsoft.ResourceGraph/resources",
+        )
+        .expect("graph target");
+        let request = HttpRequest::for_purpose(
+            RoutePurpose::ResourceGraph,
+            HttpMethod::Post,
+            target,
+            API_VERSION,
+        )
+        .expect("request")
+        .with_body(br#"{"query":"resources | take 1"}"#.to_vec());
+
+        let response = client.execute(request).await.expect("successful retry");
+        let requests = server.await.expect("server task");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(response.retry_count(), 1);
+
+        let (base, server) = loopback_sequence_server(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+        let generic_post_policy = PolicyBundle::new(
+            "test-http-post-v1",
+            vec![
+                crate::policy::ReviewedRoute::new(
+                    AzureCloud::AzureCloud,
+                    RoutePurpose::Request,
+                    HttpMethod::Post,
+                    "/subscriptions/{subscription}/resourceGroups/{group}/action",
+                    [API_VERSION],
+                    "Microsoft.Resources/resourceGroups/action",
+                    crate::policy::ArmTier::Inspect,
+                )
+                .expect("valid route"),
+            ],
+        )
+        .expect("valid policy");
+        let client = client_for_with_limits(
+            Arc::new(FakeCredentials::default()),
+            &base,
+            generic_post_policy,
+            fast_retry_limits(2),
+        );
+        let target = RelativeRequestTarget::parse(&format!(
+            "/subscriptions/{SUBSCRIPTION}/resourceGroups/prod/action"
+        ))
+        .expect("target");
+        let request =
+            HttpRequest::for_purpose(RoutePurpose::Request, HttpMethod::Post, target, API_VERSION)
+                .expect("request");
+        let response = client.execute(request).await.expect("response");
+        let requests = server.await.expect("server task");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(response.status(), 503);
+        assert_eq!(response.retry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_attempts_are_capped() {
+        let (base, server) = loopback_sequence_server(vec![
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+        let client = client_for_with_limits(
+            Arc::new(FakeCredentials::default()),
+            &base,
+            policy(),
+            fast_retry_limits(2),
+        );
+        let request = HttpRequest::get(
+            &format!("/subscriptions/{SUBSCRIPTION}/resourceGroups/prod"),
+            API_VERSION,
+        )
+        .expect("request");
+        let response = client.execute(request).await.expect("bounded response");
+        let requests = server.await.expect("server task");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(response.status(), 502);
+        assert_eq!(response.retry_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn auth_and_other_client_errors_are_never_retried() {
+        for response_text in [
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let (base, server) = loopback_sequence_server(vec![response_text]).await;
+            let client = client_for_with_limits(
+                Arc::new(FakeCredentials::default()),
+                &base,
+                policy(),
+                fast_retry_limits(3),
+            );
+            let request = HttpRequest::get(
+                &format!("/subscriptions/{SUBSCRIPTION}/resourceGroups/prod"),
+                API_VERSION,
+            )
+            .expect("request");
+            let response = client.execute(request).await.expect("response");
+            let requests = server.await.expect("server task");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(response.retry_count(), 0);
+        }
+    }
+
+    #[test]
+    fn retry_after_is_bounded_and_backoff_is_exponential() {
+        let mut headers = BTreeMap::new();
+        headers.insert("retry-after".to_owned(), "100".to_owned());
+        let response = HttpResponse::from_parts(429, headers, Vec::new());
+        let policy = RetryPolicy::new(
+            3,
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+        );
+        assert_eq!(
+            retry_delay(&policy, 1, &response),
+            Duration::from_millis(50)
+        );
+
+        let response = HttpResponse::from_parts(503, BTreeMap::new(), Vec::new());
+        assert_eq!(
+            retry_delay(&policy, 1, &response),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            retry_delay(&policy, 2, &response),
+            Duration::from_millis(40)
+        );
+        assert_eq!(
+            retry_delay(&policy, 3, &response),
+            Duration::from_millis(50)
+        );
+
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "retry-after".to_owned(),
+            "Sun, 06 Nov 1994 08:49:37 GMT".to_owned(),
+        );
+        let response = HttpResponse::from_parts(429, headers, Vec::new());
+        assert_eq!(retry_delay(&policy, 1, &response), Duration::ZERO);
+    }
+
+    #[test]
+    fn safe_headers_keep_only_bounded_retry_after_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            reqwest::header::HeaderValue::from_static("31"),
+        );
+        assert!(!safe_response_headers(&headers).contains_key("retry-after"));
+
+        headers.insert(
+            "retry-after",
+            reqwest::header::HeaderValue::from_static("30"),
+        );
+        assert_eq!(
+            safe_response_headers(&headers).get("retry-after"),
+            Some(&"30".to_owned())
+        );
+    }
+
+    #[test]
+    fn retry_policy_rejects_unbounded_controls() {
+        for policy in [
+            RetryPolicy::new(
+                MAX_RETRY_ATTEMPTS + 1,
+                Duration::from_secs(1),
+                Duration::ZERO,
+                Duration::ZERO,
+            ),
+            RetryPolicy::new(
+                1,
+                MAX_RETRY_ELAPSED + Duration::from_nanos(1),
+                Duration::ZERO,
+                Duration::ZERO,
+            ),
+            RetryPolicy::new(
+                1,
+                Duration::from_secs(1),
+                Duration::ZERO,
+                MAX_RETRY_BACKOFF + Duration::from_nanos(1),
+            ),
+        ] {
+            assert!(matches!(
+                HttpLimits::new(1, 1, Duration::from_secs(1))
+                    .with_retry_policy(policy)
+                    .validate(),
+                Err(HttpError::InvalidLimits { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_transport_errors_preserve_prior_retry_count() {
+        let (base, server) =
+            loopback_server("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n").await;
+        let client = client_for_with_limits(
+            Arc::new(FakeCredentials::default()),
+            &base,
+            policy(),
+            fast_retry_limits(2),
+        );
+        let request = HttpRequest::get(
+            &format!("/subscriptions/{SUBSCRIPTION}/resourceGroups/prod"),
+            API_VERSION,
+        )
+        .expect("request");
+        let error = client
+            .execute(request)
+            .await
+            .expect_err("second attempt fails");
+        let _ = server.await.expect("first response server");
+        assert_eq!(error.retry_count(), 1);
+        assert!(matches!(error, HttpError::RetryFailed { .. }));
     }
 
     #[tokio::test]
@@ -2094,6 +2823,7 @@ mod tests {
             status: 200,
             headers: BTreeMap::new(),
             body: token.as_bytes().to_vec(),
+            retry_count: 0,
         };
         assert!(!format!("{response:?}").contains(token));
     }

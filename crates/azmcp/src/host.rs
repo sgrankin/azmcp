@@ -482,6 +482,7 @@ struct RecordBuilder {
     decision: CallDecision,
     reason: Option<String>,
     status: Option<u16>,
+    retry_count: u32,
     remaining_subscription_reads: Option<u64>,
     graph_scope: Option<String>,
     data_plane: Option<String>,
@@ -508,6 +509,7 @@ impl RecordBuilder {
             decision: CallDecision::Denied,
             reason: None,
             status: None,
+            retry_count: 0,
             remaining_subscription_reads: None,
             graph_scope: None,
             data_plane: None,
@@ -540,7 +542,7 @@ impl RecordBuilder {
             reason: self.reason,
             status: self.status,
             duration_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            retry_count: 0,
+            retry_count: self.retry_count,
             remaining_subscription_reads: self.remaining_subscription_reads,
             graph_scope: self.graph_scope,
             data_plane: self.data_plane,
@@ -771,8 +773,12 @@ impl HostAdapter {
         let response = client
             .execute_with_identity_pin(request, Some(&self.identity_pin))
             .await
-            .map_err(|error| map_http_error(error, &binding))?;
+            .map_err(|error| {
+                record.retry_count = error.retry_count();
+                map_http_error(error, &binding)
+            })?;
         record.status = Some(response.status());
+        record.retry_count = response.retry_count();
         record.remaining_subscription_reads = remaining_subscription_reads(&response);
         decode_http_response(response)
     }
@@ -878,8 +884,12 @@ impl HostAdapter {
         let response = client
             .execute_with_identity_pin(request, Some(&self.identity_pin))
             .await
-            .map_err(|error| map_http_error(error, &binding))?;
+            .map_err(|error| {
+                record.retry_count = error.retry_count();
+                map_http_error(error, &binding)
+            })?;
         record.status = Some(response.status());
+        record.retry_count = response.retry_count();
         record.remaining_subscription_reads = remaining_subscription_reads(&response);
         decode_http_response(response)
     }
@@ -955,8 +965,12 @@ impl HostAdapter {
         let response = client
             .execute_with_identity_pin(request, Some(&self.identity_pin))
             .await
-            .map_err(|error| map_http_error(error, &binding))?;
+            .map_err(|error| {
+                record.retry_count = error.retry_count();
+                map_http_error(error, &binding)
+            })?;
         record.status = Some(response.status());
+        record.retry_count = response.retry_count();
         record.remaining_subscription_reads = remaining_subscription_reads(&response);
         decode_http_response(response)
     }
@@ -1039,8 +1053,12 @@ impl HostAdapter {
         let response = client
             .execute_with_identity_pin(request, Some(&self.identity_pin))
             .await
-            .map_err(|error| map_http_error(error, &binding))?;
+            .map_err(|error| {
+                record.retry_count = error.retry_count();
+                map_http_error(error, &binding)
+            })?;
         record.status = Some(response.status());
+        record.retry_count = response.retry_count();
         record.remaining_subscription_reads = remaining_subscription_reads(&response);
         decode_http_response(response)
     }
@@ -1132,8 +1150,12 @@ impl HostAdapter {
         let response = client
             .execute_with_identity_pin(request, Some(&self.identity_pin))
             .await
-            .map_err(|error| map_http_error(error, &binding))?;
+            .map_err(|error| {
+                record.retry_count = error.retry_count();
+                map_http_error(error, &binding)
+            })?;
         record.status = Some(response.status());
+        record.retry_count = response.retry_count();
         decode_logs_query_response(response)
     }
     fn resolve_binding(
@@ -1778,6 +1800,7 @@ fn decode_logs_query_response(response: HttpResponse) -> Result<Value, HostError
 
 fn map_http_error(error: HttpError, binding: &ResolvedCloudBinding) -> HostError {
     match error {
+        HttpError::RetryFailed { source, .. } => map_http_error(*source, binding),
         HttpError::PolicyDenied(PolicyDenial::UnknownRoute)
         | HttpError::PolicyDenied(PolicyDenial::AmbiguousRoute) => HostError::route_denied(),
         HttpError::SubscriptionMismatch => HostError::new(
@@ -2011,6 +2034,49 @@ mod tests {
             }
             stream.write_all(response.as_bytes()).await.expect("write");
             request
+        });
+        (format!("http://{address}/"), task)
+    }
+
+    async fn server_sequence(
+        responses: Vec<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("loopback");
+        let address = listener.local_addr().expect("address");
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.expect("request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let count = stream.read(&mut buffer).await.expect("read");
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    {
+                        let content_length = String::from_utf8_lossy(&request[..header_end])
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("Content-Length:")
+                                    .or_else(|| line.strip_prefix("content-length:"))
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= header_end.saturating_add(content_length) {
+                            break;
+                        }
+                    }
+                }
+                stream.write_all(response.as_bytes()).await.expect("write");
+                requests.push(request);
+            }
+            requests
         });
         (format!("http://{address}/"), task)
     }
@@ -2300,6 +2366,34 @@ mod tests {
             "/providers/Microsoft.ResourceGraph/resources"
         );
         server_task.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn retry_count_is_surface_in_the_host_call_record() {
+        let (origin, server_task) = server_sequence(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"data\":[]}",
+        ])
+        .await;
+        let factory = Arc::new(TestFactory {
+            credentials: Arc::new(FakeCredentials::default()),
+            origins: [(AzureCloud::AzureCloud, origin)].into_iter().collect(),
+            policy: policy(),
+        });
+        let context = context(GraphScope::AllAccessible, false);
+        let adapter = HostAdapter::new(&context, factory);
+        let value = adapter
+            .dispatch(
+                HOST_METHOD_GRAPH,
+                json!({"cloud": "AzureCloud", "query": "Resources", "scope": "allAccessible"}),
+            )
+            .await
+            .expect("graph response after retry");
+        assert_eq!(value["status"], 200);
+        let requests = server_task.await.expect("server");
+        assert_eq!(requests.len(), 2);
+        let record = adapter.records().pop().expect("call record");
+        assert_eq!(record.retry_count, 1);
     }
 
     #[tokio::test]
