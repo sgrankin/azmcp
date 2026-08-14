@@ -107,6 +107,12 @@ most 32 files and 4 MiB, while one artifact root can hold at most 256 files and
 non-regular destinations, traversal, overwrite, and cross-context addressing
 fail closed.
 
+Writes are staged privately and published only if the complete `azure_run`
+succeeds. A failed, timed-out, closed, or cancelled run returns no receipt and
+removes its staged files, including a file whose publication raced with
+cancellation. The audit decision `authorized` records the content-free write
+attempt; it does not claim that a later run commit succeeded.
+
 Artifacts deliberately survive context close, expiry, and server restart so a
 local process can consume the returned path. azmcp exposes no artifact read,
 list, delete, or arbitrary filesystem API; cleanup is an ordinary local-shell
@@ -177,7 +183,11 @@ The managed artifact root defaults to
 `$HOME/.local/share/azmcp/artifacts` when `XDG_DATA_HOME` is unset.
 The optional `[artifacts] root` setting must be an absolute path. The root is
 created lazily on the first explicitly granted artifact write; startup and
-ordinary Azure inspection do not create it.
+ordinary Azure inspection do not create it. An existing root must already be a
+private dedicated azmcp artifact root (or an empty private directory); azmcp
+never changes permissions on an unrelated directory. One server holds the
+root lock for its lifetime so create-only checks and the documented quotas are
+root-wide rather than process-local.
 
 Profile discovery uses `AZMCP_AZURE_PROFILE`, then
 `$AZURE_CONFIG_DIR/azureProfile.json`, then

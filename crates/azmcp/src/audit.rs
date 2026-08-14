@@ -39,7 +39,7 @@ pub trait AuditSink: Send + Sync {
     fn append_artifact(&self, record: &ArtifactWriteAuditRecord) -> Result<(), AuditError>;
 }
 
-/// Redacted metadata for one successful managed artifact write.
+/// Redacted metadata for one authorized managed artifact write attempt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactWriteAuditRecord {
@@ -51,11 +51,11 @@ pub struct ArtifactWriteAuditRecord {
 }
 
 impl ArtifactWriteAuditRecord {
-    pub fn allowed(correlation_id: impl Into<String>, bytes: usize) -> Self {
+    pub fn authorized(correlation_id: impl Into<String>, bytes: usize) -> Self {
         Self {
             correlation_id: correlation_id.into(),
             operation: "az.artifacts.writeJson",
-            decision: "allowed",
+            decision: "authorized",
             bytes,
             sensitivity: "customerData",
         }
@@ -390,7 +390,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("audit/requests.jsonl");
         let sink = FileAuditLog::new(FileAuditConfig::with_defaults(&path).expect("config"));
-        sink.append_artifact(&ArtifactWriteAuditRecord::allowed("corr-2", 123))
+        sink.append_artifact(&ArtifactWriteAuditRecord::authorized("corr-2", 123))
             .expect("append artifact");
 
         let line = fs::read_to_string(&path).expect("audit file");

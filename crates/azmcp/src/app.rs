@@ -36,7 +36,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, watch};
 
 use crate::{
-    artifacts::{ArtifactError, ArtifactNamespace, ArtifactStore},
+    artifacts::{ArtifactError, ArtifactNamespace, ArtifactStage, ArtifactStore},
     audit::{ArtifactWriteAuditRecord, AuditSink},
     host::{CallDecision, CallRecord, CallRecords, HostAdapter, HttpClientFactory},
     refs::{RefId, RefStore},
@@ -293,6 +293,7 @@ pub enum AppErrorCode {
     SubscriptionMismatch,
     UpstreamError,
     ResultTooLarge,
+    ArtifactCapacity,
     ExecutionTimeout,
     ExecutionFailed,
     SchemaUnavailable,
@@ -329,6 +330,7 @@ impl AppErrorCode {
             Self::SubscriptionMismatch => "subscription_mismatch",
             Self::UpstreamError => "upstream_error",
             Self::ResultTooLarge => "result_too_large",
+            Self::ArtifactCapacity => "artifact_capacity",
             Self::ExecutionTimeout => "execution_timeout",
             Self::ExecutionFailed => "invalid_request",
             Self::SchemaUnavailable => "schema_unavailable",
@@ -708,6 +710,8 @@ struct WorkerSlot {
     cancellation: watch::Sender<bool>,
     identity_pin: CredentialIdentityPin,
     artifact_namespace: Option<ArtifactNamespace>,
+    artifact_store: Option<Arc<dyn ArtifactStore>>,
+    pending_artifacts: Mutex<Vec<ArtifactStage>>,
     refs: Mutex<RefStore>,
     ref_changed: tokio::sync::Notify,
 }
@@ -785,6 +789,9 @@ impl Drop for RunAbortGuard {
         let id = self.id.clone();
         let inner = self.inner.clone();
         let slot = self.slot.clone();
+        if let Some(slot) = &slot {
+            slot.signal_cancel();
+        }
         let cleanup = async move {
             let Some(inner) = inner.upgrade() else {
                 return;
@@ -822,19 +829,85 @@ impl WorkerSlot {
             cancellation,
             identity_pin,
             artifact_namespace: None,
+            artifact_store: None,
+            pending_artifacts: Mutex::new(Vec::new()),
             refs: Mutex::new(RefStore::default()),
             ref_changed: tokio::sync::Notify::new(),
         }
     }
 
-    fn with_artifact_namespace(mut self, namespace: Option<ArtifactNamespace>) -> Self {
+    fn with_artifact_binding(
+        mut self,
+        namespace: Option<ArtifactNamespace>,
+        store: Option<Arc<dyn ArtifactStore>>,
+    ) -> Self {
         self.artifact_namespace = namespace;
+        self.artifact_store = store;
         self
     }
 
-    async fn cancel(&self) {
+    fn signal_cancel(&self) {
         self.cancellation.send_replace(true);
+    }
+
+    async fn cancel(&self) {
+        self.signal_cancel();
         self.refs.lock().await.clear();
+        let _ = self.rollback_pending_artifacts().await;
+    }
+
+    async fn stage_artifact(&self, stage: ArtifactStage) -> Result<(), ArtifactStage> {
+        let mut pending = self.pending_artifacts.lock().await;
+        if *self.cancellation.borrow() {
+            return Err(stage);
+        }
+        pending.push(stage);
+        Ok(())
+    }
+
+    async fn commit_pending_artifacts(&self) -> Result<(), ArtifactError> {
+        let mut pending = self.pending_artifacts.lock().await;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let (Some(store), Some(namespace)) = (
+            self.artifact_store.as_ref(),
+            self.artifact_namespace.as_ref(),
+        ) else {
+            return Err(ArtifactError::Unavailable);
+        };
+        let stages = pending.clone();
+        if *self.cancellation.borrow() {
+            store.discard_staged(namespace.clone(), stages).await?;
+        } else {
+            store
+                .commit_staged(namespace.clone(), stages.clone())
+                .await?;
+            if *self.cancellation.borrow() {
+                store.discard_staged(namespace.clone(), stages).await?;
+                return Err(ArtifactError::Unavailable);
+            }
+        }
+        pending.clear();
+        Ok(())
+    }
+
+    async fn rollback_pending_artifacts(&self) -> Result<(), ArtifactError> {
+        let mut pending = self.pending_artifacts.lock().await;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let (Some(store), Some(namespace)) = (
+            self.artifact_store.as_ref(),
+            self.artifact_namespace.as_ref(),
+        ) else {
+            return Err(ArtifactError::Unavailable);
+        };
+        store
+            .discard_staged(namespace.clone(), pending.clone())
+            .await?;
+        pending.clear();
+        Ok(())
     }
 
     async fn next_ref_expiry(&self) -> Option<Instant> {
@@ -1165,7 +1238,7 @@ impl Application {
         .and_then(|options| options.with_local_capabilities(args.local_capabilities.clone()))
         .map_err(|_| AppError::new(AppErrorCode::InvalidInput))?;
 
-        let artifact_namespace = if options
+        let (artifact_namespace, artifact_store) = if options
             .local_capabilities()
             .iter()
             .any(|capability| capability == ARTIFACTS_WRITE_CAPABILITY)
@@ -1174,13 +1247,16 @@ impl Application {
                 .artifact_store
                 .as_ref()
                 .ok_or_else(|| AppError::new(AppErrorCode::CapabilityDenied))?;
-            Some(
-                store
-                    .allocate_namespace()
-                    .map_err(|_| AppError::new(AppErrorCode::UpstreamError))?,
+            (
+                Some(
+                    store
+                        .allocate_namespace()
+                        .map_err(|_| AppError::new(AppErrorCode::UpstreamError))?,
+                ),
+                Some(Arc::clone(store)),
             )
         } else {
-            None
+            (None, None)
         };
 
         let mut validation_error = None;
@@ -1231,7 +1307,8 @@ impl Application {
             }
         };
         let slot = Arc::new(
-            WorkerSlot::new(worker, identity_pin).with_artifact_namespace(artifact_namespace),
+            WorkerSlot::new(worker, identity_pin)
+                .with_artifact_binding(artifact_namespace, artifact_store),
         );
         self.inner
             .workers
@@ -1333,7 +1410,6 @@ impl Application {
         });
         let ref_worker = Arc::clone(&worker);
         let adapter_for_handler = adapter.clone();
-        let artifact_store = self.artifact_store.clone();
         let artifact_audit = self.audit_sink.clone();
         let artifact_correlation_id = correlation_id.clone();
         let artifact_error = Arc::new(std::sync::Mutex::new(None));
@@ -1341,7 +1417,6 @@ impl Application {
         let host_handler = Some(Arc::new(move |request: HostCallRequest| {
             let ref_worker = Arc::clone(&ref_worker);
             let adapter = adapter_for_handler.clone();
-            let artifact_store = artifact_store.clone();
             let artifact_audit = artifact_audit.clone();
             let artifact_correlation_id = artifact_correlation_id.clone();
             let artifact_error = Arc::clone(&artifact_error_for_handler);
@@ -1351,7 +1426,6 @@ impl Application {
                 } else if request.method == HOST_METHOD_ARTIFACT_WRITE_JSON {
                     handle_artifact_host_call(
                         ref_worker,
-                        artifact_store,
                         artifact_audit,
                         artifact_correlation_id,
                         artifact_error,
@@ -1422,13 +1496,34 @@ impl Application {
                     },
                 };
                 let value = match result.ref_candidate.take() {
-                    Some(candidate) => materialize_ref(&worker, candidate).await?,
-                    None => std::mem::take(&mut result.value),
+                    Some(candidate) => materialize_ref(&worker, candidate).await,
+                    None => Ok(std::mem::take(&mut result.value)),
                 };
-                drop(lease);
-                run_result(value, result, records, context, correlation_id)
+                match value {
+                    Ok(value) => match worker.commit_pending_artifacts().await {
+                        Ok(()) => {
+                            drop(lease);
+                            run_result(value, result, records, context, correlation_id)
+                        }
+                        Err(error) => {
+                            let _ = worker.rollback_pending_artifacts().await;
+                            drop(lease);
+                            let _ = self.inner.registry.close(id.as_str());
+                            let _ = self.close_worker(id.as_str()).await;
+                            Err(AppError::new(map_artifact_error(error)))
+                        }
+                    },
+                    Err(error) => {
+                        let _ = worker.rollback_pending_artifacts().await;
+                        drop(lease);
+                        let _ = self.inner.registry.close(id.as_str());
+                        let _ = self.close_worker(id.as_str()).await;
+                        Err(error)
+                    }
+                }
             }
             Err(error) => {
+                let rollback_failed = worker.rollback_pending_artifacts().await.is_err();
                 let host_error = match &adapter {
                     Some(adapter) => adapter.take_last_error(),
                     None => None,
@@ -1441,11 +1536,15 @@ impl Application {
                     error,
                     DependencyError::ExecutionTimeout | DependencyError::WorkerCrashed
                 );
-                let app_error = host_error
-                    .map(map_host_error)
-                    .or_else(|| artifact_error.map(AppError::new))
-                    .unwrap_or_else(|| map_worker_dependency(error));
-                if worker_needs_eviction {
+                let app_error = if rollback_failed {
+                    AppError::new(AppErrorCode::UpstreamError)
+                } else {
+                    host_error
+                        .map(map_host_error)
+                        .or_else(|| artifact_error.map(AppError::new))
+                        .unwrap_or_else(|| map_worker_dependency(error))
+                };
+                if worker_needs_eviction || rollback_failed {
                     let _ = self.inner.registry.close(id.as_str());
                     let _ = self.close_worker(id.as_str()).await;
                 } else {
@@ -2002,7 +2101,6 @@ struct ArtifactWriteJsonArguments {
 
 async fn handle_artifact_host_call(
     worker: Arc<WorkerSlot>,
-    store: Option<Arc<dyn ArtifactStore>>,
     audit: Option<Arc<dyn AuditSink>>,
     correlation_id: String,
     last_error: Arc<std::sync::Mutex<Option<AppErrorCode>>>,
@@ -2012,7 +2110,7 @@ async fn handle_artifact_host_call(
         record_artifact_error(&last_error, AppErrorCode::CapabilityDenied);
         return HostCallResult::failure(&request, "artifact writing is not granted");
     };
-    let Some(store) = store else {
+    let Some(store) = worker.artifact_store.clone() else {
         record_artifact_error(&last_error, AppErrorCode::UpstreamError);
         return HostCallResult::failure(&request, "artifact storage is unavailable");
     };
@@ -2028,35 +2126,69 @@ async fn handle_artifact_host_call(
                 return HostCallResult::failure(&request, "invalid artifact arguments");
             }
         };
-    if audit.prepare().is_err() {
-        record_artifact_error(&last_error, AppErrorCode::UpstreamError);
-        return HostCallResult::failure(&request, "artifact audit is unavailable");
-    }
-    let receipt = match store
-        .write_json(namespace.clone(), arguments.name, arguments.value)
-        .await
-    {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            record_artifact_error(&last_error, map_artifact_error(error));
-            return HostCallResult::failure(&request, "artifact write was rejected");
+    let transaction_worker = Arc::clone(&worker);
+    let transaction = tokio::spawn(async move {
+        let prepared = store
+            .prepare_json(arguments.name, arguments.value)
+            .map_err(|error| (map_artifact_error(error), "artifact write was rejected"))?;
+        if audit.prepare().is_err() {
+            return Err((AppErrorCode::UpstreamError, "artifact audit is unavailable"));
         }
-    };
-    let value = match serde_json::to_value(&receipt) {
-        Ok(value) => value,
+        let audit_record = ArtifactWriteAuditRecord::authorized(correlation_id, prepared.bytes());
+        if audit.append_artifact(&audit_record).is_err() {
+            return Err((AppErrorCode::UpstreamError, "artifact audit is unavailable"));
+        }
+        let stage = store
+            .stage_prepared(namespace.clone(), prepared)
+            .await
+            .map_err(|error| (map_artifact_error(error), "artifact write was rejected"))?;
+        let value = serde_json::to_value(stage.receipt()).map_err(|_| {
+            (
+                AppErrorCode::UpstreamError,
+                "artifact receipt is unavailable",
+            )
+        });
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                if store
+                    .discard_staged(namespace.clone(), vec![stage])
+                    .await
+                    .is_err()
+                {
+                    return Err((
+                        AppErrorCode::UpstreamError,
+                        "artifact cleanup is unavailable",
+                    ));
+                }
+                return Err(error);
+            }
+        };
+        if let Err(stage) = transaction_worker.stage_artifact(stage).await {
+            if store.discard_staged(namespace, vec![stage]).await.is_err() {
+                return Err((
+                    AppErrorCode::UpstreamError,
+                    "artifact cleanup is unavailable",
+                ));
+            }
+            return Err((
+                AppErrorCode::UpstreamError,
+                "artifact context is unavailable",
+            ));
+        }
+        Ok(value)
+    });
+    match transaction.await {
+        Ok(Ok(value)) => HostCallResult::success(&request, value),
+        Ok(Err((code, message))) => {
+            record_artifact_error(&last_error, code);
+            HostCallResult::failure(&request, message)
+        }
         Err(_) => {
-            let _ = store.remove_created(namespace, receipt).await;
             record_artifact_error(&last_error, AppErrorCode::UpstreamError);
-            return HostCallResult::failure(&request, "artifact receipt is unavailable");
+            HostCallResult::failure(&request, "artifact storage is unavailable")
         }
-    };
-    let audit_record = ArtifactWriteAuditRecord::allowed(correlation_id, receipt.bytes());
-    if audit.append_artifact(&audit_record).is_err() {
-        let _ = store.remove_created(namespace, receipt).await;
-        record_artifact_error(&last_error, AppErrorCode::UpstreamError);
-        return HostCallResult::failure(&request, "artifact audit is unavailable");
     }
-    HostCallResult::success(&request, value)
 }
 
 fn record_artifact_error(last_error: &std::sync::Mutex<Option<AppErrorCode>>, code: AppErrorCode) {
@@ -2070,11 +2202,13 @@ fn map_artifact_error(error: ArtifactError) -> AppErrorCode {
         ArtifactError::InvalidFileName | ArtifactError::DestinationExists => {
             AppErrorCode::InvalidInput
         }
-        ArtifactError::ValueTooLarge { .. }
-        | ArtifactError::ContextCapacity
-        | ArtifactError::RootCapacity => AppErrorCode::ResultTooLarge,
+        ArtifactError::ValueTooLarge { .. } => AppErrorCode::ResultTooLarge,
+        ArtifactError::ContextCapacity | ArtifactError::RootCapacity => {
+            AppErrorCode::ArtifactCapacity
+        }
         ArtifactError::InvalidRoot
         | ArtifactError::InvalidLimits
+        | ArtifactError::RootInUse
         | ArtifactError::UnsafeRoot
         | ArtifactError::UnsafeNamespace
         | ArtifactError::UnsafeDestination
@@ -2248,7 +2382,9 @@ pub fn default_registry() -> Result<ContextRegistry, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifacts::FileArtifactStore;
+    use crate::artifacts::{
+        ArtifactError, ArtifactFuture, ArtifactNamespace, ArtifactStore, FileArtifactStore,
+    };
     use crate::host::{ClientFactoryError, HttpClientFactory};
     use crate::refs::RefStoreLimits;
     use azmcp_core::{
@@ -2569,6 +2705,113 @@ mod tests {
 
     struct RefFactory;
 
+    struct GatedArtifactStore {
+        delegate: FileArtifactStore,
+        entered: Notify,
+        release: Notify,
+        removed: Notify,
+    }
+
+    struct CommitGatedArtifactStore {
+        delegate: FileArtifactStore,
+        committed: Notify,
+        release: Notify,
+        removed: Notify,
+    }
+
+    impl ArtifactStore for GatedArtifactStore {
+        fn allocate_namespace(&self) -> Result<ArtifactNamespace, ArtifactError> {
+            self.delegate.allocate_namespace()
+        }
+
+        fn prepare_json(
+            &self,
+            file_name: String,
+            value: Value,
+        ) -> Result<crate::artifacts::PreparedArtifact, ArtifactError> {
+            self.delegate.prepare_json(file_name, value)
+        }
+
+        fn stage_prepared<'a>(
+            &'a self,
+            namespace: ArtifactNamespace,
+            prepared: crate::artifacts::PreparedArtifact,
+        ) -> ArtifactFuture<'a, ArtifactStage> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.delegate.stage_prepared(namespace, prepared).await
+            })
+        }
+
+        fn commit_staged<'a>(
+            &'a self,
+            namespace: ArtifactNamespace,
+            stages: Vec<ArtifactStage>,
+        ) -> ArtifactFuture<'a, ()> {
+            self.delegate.commit_staged(namespace, stages)
+        }
+
+        fn discard_staged<'a>(
+            &'a self,
+            namespace: ArtifactNamespace,
+            stages: Vec<ArtifactStage>,
+        ) -> ArtifactFuture<'a, ()> {
+            Box::pin(async move {
+                self.delegate.discard_staged(namespace, stages).await?;
+                self.removed.notify_one();
+                Ok(())
+            })
+        }
+    }
+
+    impl ArtifactStore for CommitGatedArtifactStore {
+        fn allocate_namespace(&self) -> Result<ArtifactNamespace, ArtifactError> {
+            self.delegate.allocate_namespace()
+        }
+
+        fn prepare_json(
+            &self,
+            file_name: String,
+            value: Value,
+        ) -> Result<crate::artifacts::PreparedArtifact, ArtifactError> {
+            self.delegate.prepare_json(file_name, value)
+        }
+
+        fn stage_prepared<'a>(
+            &'a self,
+            namespace: ArtifactNamespace,
+            prepared: crate::artifacts::PreparedArtifact,
+        ) -> ArtifactFuture<'a, ArtifactStage> {
+            self.delegate.stage_prepared(namespace, prepared)
+        }
+
+        fn commit_staged<'a>(
+            &'a self,
+            namespace: ArtifactNamespace,
+            stages: Vec<ArtifactStage>,
+        ) -> ArtifactFuture<'a, ()> {
+            Box::pin(async move {
+                self.delegate.commit_staged(namespace, stages).await?;
+                self.committed.notify_one();
+                self.release.notified().await;
+                Ok(())
+            })
+        }
+
+        fn discard_staged<'a>(
+            &'a self,
+            namespace: ArtifactNamespace,
+            stages: Vec<ArtifactStage>,
+        ) -> ArtifactFuture<'a, ()> {
+            Box::pin(async move {
+                self.delegate.discard_staged(namespace, stages).await?;
+                self.removed.notify_one();
+                Ok(())
+            })
+        }
+    }
+
     impl WorkerFactory for RefFactory {
         fn start<'a>(
             &'a self,
@@ -2589,7 +2832,7 @@ mod tests {
         ) -> BoxFuture<'a, Result<ExecutionResult, DependencyError>> {
             let code = code.to_owned();
             Box::pin(async move {
-                if code == "__artifact__" {
+                if matches!(code.as_str(), "__artifact__" | "__artifact_then_fail__") {
                     let Some(handler) = host_handler else {
                         return Err(DependencyError::ExecutionFailed);
                     };
@@ -2604,6 +2847,9 @@ mod tests {
                     };
                     let response = handler(request).await;
                     if !response.ok {
+                        return Err(DependencyError::ExecutionFailed);
+                    }
+                    if code == "__artifact_then_fail__" {
                         return Err(DependencyError::ExecutionFailed);
                     }
                     return Ok(ExecutionResult {
@@ -2704,6 +2950,43 @@ mod tests {
             state,
             fail: AtomicBool::new(false),
         })
+    }
+
+    #[test]
+    fn artifact_quota_errors_have_a_specific_domain_code() {
+        assert_eq!(
+            map_artifact_error(ArtifactError::ContextCapacity),
+            AppErrorCode::ArtifactCapacity
+        );
+        assert_eq!(
+            map_artifact_error(ArtifactError::RootCapacity),
+            AppErrorCode::ArtifactCapacity
+        );
+        assert_eq!(
+            map_artifact_error(ArtifactError::ValueTooLarge { bytes: 2, limit: 1 }),
+            AppErrorCode::ResultTooLarge
+        );
+    }
+
+    fn artifact_json_files(root: &Path) -> Vec<PathBuf> {
+        let mut files = std::fs::read_dir(root)
+            .expect("artifact root")
+            .filter_map(|entry| {
+                let path = entry.expect("artifact root entry").path();
+                path.is_dir().then_some(path)
+            })
+            .flat_map(|entry| {
+                std::fs::read_dir(entry)
+                    .expect("namespace")
+                    .map(|file| file.expect("artifact entry").path())
+            })
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
     }
 
     #[tokio::test]
@@ -3506,6 +3789,34 @@ mod tests {
             expected_bytes
         );
 
+        let failing_args = ContextOpenArgs {
+            local_capabilities: vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()],
+            ..ContextOpenArgs::default()
+        };
+        let failing = application
+            .context_open(failing_args)
+            .await
+            .expect("failed-run context");
+        assert_eq!(
+            application
+                .run(RunArgs {
+                    context_id: failing.context_id.clone(),
+                    code: "__artifact_then_fail__".to_owned(),
+                    timeout_ms: None,
+                })
+                .await
+                .expect_err("failed run rolls back artifact")
+                .kind(),
+            AppErrorCode::ExecutionFailed
+        );
+        assert_eq!(artifact_json_files(&artifact_root), vec![path.clone()]);
+        application
+            .context_close(ContextCloseArgs {
+                context_id: failing.context_id,
+            })
+            .await
+            .expect("close failed-run context");
+
         audit.reject_artifacts.store(true, Ordering::SeqCst);
         let rejected_args = ContextOpenArgs {
             local_capabilities: vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()],
@@ -3527,25 +3838,159 @@ mod tests {
                 .kind(),
             AppErrorCode::UpstreamError
         );
-        let json_files = std::fs::read_dir(&artifact_root)
-            .expect("artifact root")
-            .flat_map(|entry| {
-                std::fs::read_dir(entry.expect("namespace entry").path())
-                    .expect("namespace")
-                    .map(|file| file.expect("artifact entry").path())
-            })
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "json")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(json_files, vec![path]);
+        assert_eq!(artifact_json_files(&artifact_root), vec![path]);
         application
             .context_close(ContextCloseArgs {
                 context_id: rejected.context_id,
             })
             .await
             .expect("close audit-failure context");
+    }
+
+    #[tokio::test]
+    async fn aborted_artifact_write_finishes_fail_closed_and_removes_the_file() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let artifact_root = temporary.path().join("artifacts");
+        let store = Arc::new(GatedArtifactStore {
+            delegate: FileArtifactStore::new(&artifact_root).expect("artifact store"),
+            entered: Notify::new(),
+            release: Notify::new(),
+            removed: Notify::new(),
+        });
+        let audit = Arc::new(RecordingAudit::default());
+        let application = Application::from_arcs(
+            Config::empty(),
+            default_registry().expect("registry"),
+            Arc::new(MemoryProfileSource::new(profile(&row(
+                SUB,
+                TENANT,
+                "AzureCloud",
+                "alice",
+            )))),
+            Arc::new(Validator::default()),
+            Arc::new(RefFactory),
+            DEFAULT_POLICY_HASH,
+            DEFAULT_POLICY_VERSION,
+        )
+        .expect("application")
+        .with_audit_sink(audit.clone())
+        .with_artifact_store(store.clone());
+        let opened = application
+            .context_open(ContextOpenArgs {
+                local_capabilities: vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()],
+                ..ContextOpenArgs::default()
+            })
+            .await
+            .expect("context");
+        let running = application.clone();
+        let context_id = opened.context_id.clone();
+        let task = tokio::spawn(async move {
+            running
+                .run(RunArgs {
+                    context_id,
+                    code: "__artifact__".to_owned(),
+                    timeout_ms: None,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), store.entered.notified())
+            .await
+            .expect("artifact transaction entered store");
+        task.abort();
+        assert!(task.await.expect_err("aborted run").is_cancelled());
+        store.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), store.removed.notified())
+            .await
+            .expect("cancelled artifact removed");
+        assert!(artifact_json_files(&artifact_root).is_empty());
+        assert_eq!(
+            application
+                .run(RunArgs {
+                    context_id: opened.context_id,
+                    code: "after abort".to_owned(),
+                    timeout_ms: None,
+                })
+                .await
+                .expect_err("aborted context")
+                .kind(),
+            AppErrorCode::ContextNotFound
+        );
+        let artifact_records = audit
+            .artifact_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(artifact_records.len(), 1);
+        assert_eq!(artifact_records[0].decision, "authorized");
+    }
+
+    #[tokio::test]
+    async fn aborted_run_after_artifact_publication_removes_the_unreturned_file() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let artifact_root = temporary.path().join("artifacts");
+        let store = Arc::new(CommitGatedArtifactStore {
+            delegate: FileArtifactStore::new(&artifact_root).expect("artifact store"),
+            committed: Notify::new(),
+            release: Notify::new(),
+            removed: Notify::new(),
+        });
+        let application = Application::from_arcs(
+            Config::empty(),
+            default_registry().expect("registry"),
+            Arc::new(MemoryProfileSource::new(profile(&row(
+                SUB,
+                TENANT,
+                "AzureCloud",
+                "alice",
+            )))),
+            Arc::new(Validator::default()),
+            Arc::new(RefFactory),
+            DEFAULT_POLICY_HASH,
+            DEFAULT_POLICY_VERSION,
+        )
+        .expect("application")
+        .with_audit_sink(Arc::new(RecordingAudit::default()))
+        .with_artifact_store(store.clone());
+        let opened = application
+            .context_open(ContextOpenArgs {
+                local_capabilities: vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()],
+                ..ContextOpenArgs::default()
+            })
+            .await
+            .expect("context");
+        let running = application.clone();
+        let context_id = opened.context_id.clone();
+        let task = tokio::spawn(async move {
+            running
+                .run(RunArgs {
+                    context_id,
+                    code: "__artifact__".to_owned(),
+                    timeout_ms: None,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), store.committed.notified())
+            .await
+            .expect("artifact reached publication boundary");
+        assert_eq!(artifact_json_files(&artifact_root).len(), 1);
+
+        task.abort();
+        assert!(task.await.expect_err("aborted run").is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), store.removed.notified())
+            .await
+            .expect("published artifact removed");
+        assert!(artifact_json_files(&artifact_root).is_empty());
+        assert_eq!(
+            application
+                .run(RunArgs {
+                    context_id: opened.context_id,
+                    code: "after abort".to_owned(),
+                    timeout_ms: None,
+                })
+                .await
+                .expect_err("aborted context")
+                .kind(),
+            AppErrorCode::ContextNotFound
+        );
     }
 
     #[tokio::test]

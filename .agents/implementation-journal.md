@@ -19,10 +19,10 @@
   `azure_accounts` requests over real stdio using a synthetic temporary home, the standard
   config/profile/state paths, and an explicitly injected fake Azure executable.
 - The core test suite uses only synthetic profiles, fake executables, and loopback HTTP.
-  The final combined gate uses a unique Cargo target and passes 202 tests: 74 azmcp unit,
-  one modern observability E2E, one modern stdio, eight worker subprocess, 112 core, and
-  six routegen CLI tests. Formatting, warning-free workspace clippy, default and pinned-input
-  routegen checks, and the complete release build also pass.
+  The current combined gate passes 225 tests: 96 azmcp unit, one modern observability E2E,
+  one modern stdio, eight worker subprocess, 113 core, and six routegen CLI tests.
+  Formatting, warning-free workspace clippy, the 18-route/12-schema routegen check, and the
+  complete release build also pass.
 - The six modern tools are now the exact advertised catalog. A modern-protocol lifecycle test
   covers accounts, context open, persistent run, close, and structured domain failure.
 - `azure_schema_search` and `azure_schema_get` are implemented as context-scoped,
@@ -102,6 +102,12 @@
   RSS, MCP/abort cancellation, TTL disposal, provenance, account-schema, per-context identity,
   request-header, oversized-result, and audit gaps; each checkpoint blocker was fixed and
   regression-tested.
+- The managed-artifact checkpoint is change `ppnvxtyt`. A context must explicitly grant
+  `artifacts.write`; the real worker then exposes `az.artifacts.writeJson({name, value})`
+  through a parent-owned store. Filenames, namespaces, quotas, private modes, create-only
+  publication, receipt-bound rollback, standard data paths, and content-free audit metadata
+  are bounded. The synthetic modern MCP scenario writes actual metrics and Logs Query output,
+  returns only the local receipt through MCP, and proves the file survives context close.
 
 ## Decisions
 
@@ -142,6 +148,17 @@
 - An unavailable durable audit destination fails before credential acquisition or network I/O.
   Audit rows contain reviewed path templates, never raw paths, queries, bodies, handles, or
   token material.
+- Managed artifacts are not general filesystem access. Each granted context receives an opaque
+  random namespace under `$XDG_DATA_HOME/azmcp/artifacts` or
+  `$HOME/.local/share/azmcp/artifacts`, unless config supplies an absolute `[artifacts] root`.
+  Writes are compact JSON, create-only, private, persistent after context disposal, and audited
+  without path, filename, or content. No read, list, delete, overwrite, or caller-chosen path
+  surface is exposed.
+- Artifact writes are prepared once, audited as `authorized`, staged under an opaque ownership
+  ticket, and published only after the complete run succeeds. Cancellation and failure delete
+  only the exact staged inode, including after publication races. A lifetime-held root lock makes
+  quotas and filename reservations root-wide; private dedicated-root validation occurs before
+  mutation, and stale unpublished stages are scavenged only after acquiring that lock.
 
 ## Open risks
 
@@ -164,3 +181,6 @@
   official server-conformance gate for azmcp. The server gate remains unrun.
 - Authenticated two-cloud acceptance is explicitly deferred on this machine because its Azure
   login is production. No ambient Azure profile, token, or endpoint was touched.
+- Managed artifact inputs currently share the worker host-call ceiling, so one file is capped at
+  480 KiB. Multi-megabyte KQL exports need a separately reviewed parent-owned streaming protocol;
+  the current implementation must not widen the worker message bound to simulate streaming.

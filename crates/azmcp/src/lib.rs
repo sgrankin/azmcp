@@ -427,6 +427,7 @@ fn app_error_message(error: &AppError) -> Cow<'static, str> {
         "worker_crashed" => "the isolated JavaScript worker is unavailable",
         "execution_timeout" => "JavaScript execution exceeded its deadline",
         "result_too_large" => "the JavaScript result exceeds the v0 size limit",
+        "artifact_capacity" => "managed artifact storage capacity is exhausted",
         "schema_unavailable" => "the offline schema index is unavailable",
         "schema_not_found" => "the reviewed schema entry was not found",
         "schema_version_not_found" => "the API version is not reviewed for that entry",
