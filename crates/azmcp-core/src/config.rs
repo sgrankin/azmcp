@@ -5,7 +5,11 @@
 //! caller.  A configured primary tenant may be omitted because v0 can resolve
 //! it from exactly one unambiguous cached account candidate later.
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use thiserror::Error;
@@ -444,12 +448,15 @@ pub enum BindingResolutionError {
 pub struct Config {
     #[serde(default)]
     clouds: BTreeMap<AzureCloud, CloudBinding>,
+    #[serde(default)]
+    artifacts: ArtifactConfig,
 }
 
 impl Config {
     pub fn empty() -> Self {
         Self {
             clouds: BTreeMap::new(),
+            artifacts: ArtifactConfig::default(),
         }
     }
 
@@ -464,6 +471,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.artifacts
+            .validate()
+            .map_err(ConfigError::InvalidArtifacts)?;
         for (cloud, binding) in &self.clouds {
             binding
                 .validate()
@@ -483,6 +493,15 @@ impl Config {
         self.clouds.get(&cloud)
     }
 
+    /// Optional explicit root for managed JSON artifacts.
+    ///
+    /// The production embedding resolves an omitted root through its standard
+    /// state-directory rules. Keeping that platform decision outside the
+    /// immutable config parser makes parsing inert and deterministic.
+    pub const fn artifacts(&self) -> &ArtifactConfig {
+        &self.artifacts
+    }
+
     pub fn resolve_binding(
         &self,
         cloud: AzureCloud,
@@ -492,6 +511,44 @@ impl Config {
             .map(|binding| binding.resolve(cloud, candidates))
             .transpose()
     }
+}
+
+/// Filesystem settings for managed JSON artifacts.
+///
+/// Limits remain fixed by the artifact store. The sole configurable value is
+/// an optional absolute root, preventing process working-directory changes
+/// from redirecting customer data.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactConfig {
+    #[serde(default)]
+    root: Option<PathBuf>,
+}
+
+impl ArtifactConfig {
+    pub fn new(root: Option<PathBuf>) -> Result<Self, ArtifactConfigError> {
+        let config = Self { root };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    fn validate(&self) -> Result<(), ArtifactConfigError> {
+        if self.root.as_ref().is_some_and(|root| !root.is_absolute()) {
+            return Err(ArtifactConfigError::RootNotAbsolute);
+        }
+        Ok(())
+    }
+}
+
+/// Invalid managed-artifact settings.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ArtifactConfigError {
+    #[error("artifact root must be an absolute path")]
+    RootNotAbsolute,
 }
 
 /// Configuration parsing and validation failures.
@@ -505,6 +562,8 @@ pub enum ConfigError {
         #[source]
         source: BindingError,
     },
+    #[error("invalid artifact configuration: {0}")]
+    InvalidArtifacts(#[source] ArtifactConfigError),
 }
 
 /// Explicit aliases used by callers that prefer the product name in a type.
@@ -519,6 +578,7 @@ pub type SubscriptionTenantBinding = SubscriptionTenantPair;
 mod tests {
     use super::*;
     use crate::accounts::AccountKey;
+    use std::path::Path;
 
     const SUB_COMMERCIAL: &str = "11111111-1111-1111-1111-111111111111";
     const TENANT_COMMERCIAL: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -545,6 +605,9 @@ mod tests {
     fn parses_valid_two_cloud_configuration() {
         let config = Config::from_toml(&format!(
             r#"
+                [artifacts]
+                root = "/tmp/azmcp-artifacts"
+
                 [clouds.AzureCloud]
                 subscription = "{SUB_COMMERCIAL}"
                 tenant = "{TENANT_COMMERCIAL}"
@@ -561,6 +624,10 @@ mod tests {
         .expect("synthetic two-cloud configuration is valid");
 
         assert_eq!(config.clouds().len(), 2);
+        assert_eq!(
+            config.artifacts().root(),
+            Some(Path::new("/tmp/azmcp-artifacts"))
+        );
         let commercial = config
             .binding(AzureCloud::AzureCloud)
             .expect("commercial binding");
@@ -756,8 +823,43 @@ mod tests {
     fn empty_configuration_does_not_select_a_default_cloud() {
         let config = Config::from_toml("").expect("empty config is valid");
         assert!(config.clouds().is_empty());
+        assert_eq!(config.artifacts(), &ArtifactConfig::default());
         assert!(config.binding(AzureCloud::AzureCloud).is_none());
         assert!(config.binding(AzureCloud::AzureUSGovernment).is_none());
+    }
+
+    #[test]
+    fn artifact_root_is_optional_absolute_and_closed() {
+        let configured = Config::from_toml(
+            r#"
+                [artifacts]
+                root = "/var/tmp/azmcp-artifacts"
+            "#,
+        )
+        .expect("absolute artifact root");
+        assert_eq!(
+            configured.artifacts().root(),
+            Some(Path::new("/var/tmp/azmcp-artifacts"))
+        );
+
+        let relative = Config::from_toml(
+            r#"
+                [artifacts]
+                root = "artifacts"
+            "#,
+        )
+        .expect_err("relative artifact root");
+        assert!(relative.to_string().contains("absolute path"));
+
+        let unknown = Config::from_toml(
+            r#"
+                [artifacts]
+                root = "/tmp/azmcp-artifacts"
+                overwrite = true
+            "#,
+        )
+        .expect_err("artifact config remains closed");
+        assert!(unknown.to_string().contains("unknown field"));
     }
 
     #[test]

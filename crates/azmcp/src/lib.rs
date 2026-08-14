@@ -4,6 +4,7 @@
 //! isolated JavaScript workers and immutable Azure authority records.
 
 pub mod app;
+pub mod artifacts;
 pub mod audit;
 pub mod host;
 pub mod refs;

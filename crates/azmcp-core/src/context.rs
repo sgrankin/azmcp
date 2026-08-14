@@ -24,6 +24,10 @@ const HANDLE_LENGTH: usize = 43;
 const HANDLE_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/// The only local filesystem capability implemented by the first managed
+/// artifact slice.
+pub const ARTIFACTS_WRITE_CAPABILITY: &str = "artifacts.write";
+
 /// The only identity exposed by the v0 context surface.
 ///
 /// Keeping unsupported identities out of this enum prevents them from being
@@ -79,6 +83,7 @@ pub struct ContextOptions {
     identity: Identity,
     arm_tier: ArmTier,
     data_planes: Vec<String>,
+    local_capabilities: Vec<String>,
     resolved_bindings: Vec<ResolvedCloudBinding>,
     binding_sources: BTreeMap<AzureCloud, BindingSource>,
     graph_scopes: BTreeMap<AzureCloud, GraphScope>,
@@ -114,6 +119,7 @@ impl ContextOptions {
             identity,
             arm_tier,
             data_planes,
+            local_capabilities: Vec::new(),
             resolved_bindings,
             binding_sources,
             graph_scopes,
@@ -159,6 +165,16 @@ impl ContextOptions {
         Ok(self)
     }
 
+    /// Replace the closed set of local side-effect capabilities.
+    pub fn with_local_capabilities(
+        mut self,
+        local_capabilities: Vec<String>,
+    ) -> Result<Self, ContextOptionsError> {
+        self.local_capabilities = local_capabilities;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Validate the closed v0 option set.
     pub fn validate(&self) -> Result<(), ContextOptionsError> {
         if self.identity != Identity::User {
@@ -174,6 +190,15 @@ impl ContextOptions {
             }
             if !data_planes.insert(data_plane) {
                 return Err(ContextOptionsError::DuplicateDataPlane);
+            }
+        }
+        let mut local_capabilities = HashSet::with_capacity(self.local_capabilities.len());
+        for capability in &self.local_capabilities {
+            if capability != ARTIFACTS_WRITE_CAPABILITY {
+                return Err(ContextOptionsError::UnsupportedLocalCapability);
+            }
+            if !local_capabilities.insert(capability) {
+                return Err(ContextOptionsError::DuplicateLocalCapability);
             }
         }
         if self.policy_hash.is_empty() {
@@ -253,6 +278,11 @@ impl ContextOptions {
         &self.data_planes
     }
 
+    /// Local side-effect capabilities fixed at context open.
+    pub fn local_capabilities(&self) -> &[String] {
+        &self.local_capabilities
+    }
+
     /// Resolved per-cloud bindings captured at open.
     pub fn resolved_bindings(&self) -> &[ResolvedCloudBinding] {
         &self.resolved_bindings
@@ -299,6 +329,12 @@ pub enum ContextOptionsError {
     /// A grant may appear at most once.
     #[error("context data planes must be unique")]
     DuplicateDataPlane,
+    /// Only managed JSON artifact writes are implemented locally.
+    #[error("context local capability is not supported")]
+    UnsupportedLocalCapability,
+    /// A local capability may appear at most once.
+    #[error("context local capabilities must be unique")]
+    DuplicateLocalCapability,
     /// A Logs scope cannot be present without its data-plane grant.
     #[error("logs scope requires the logs.query data-plane grant")]
     LogsScopeWithoutGrant,
@@ -435,6 +471,7 @@ pub struct Context {
     identity: Identity,
     arm_tier: ArmTier,
     data_planes: Vec<String>,
+    local_capabilities: Vec<String>,
     resolved_bindings: Vec<ResolvedCloudBinding>,
     binding_sources: BTreeMap<AzureCloud, BindingSource>,
     graph_scopes: BTreeMap<AzureCloud, GraphScope>,
@@ -466,6 +503,11 @@ impl Context {
     /// The data-plane grants fixed at open.
     pub fn data_planes(&self) -> &[String] {
         &self.data_planes
+    }
+
+    /// The local side-effect capabilities fixed at open.
+    pub fn local_capabilities(&self) -> &[String] {
+        &self.local_capabilities
     }
 
     /// The resolved cloud bindings fixed at open.
@@ -541,6 +583,7 @@ impl fmt::Debug for Context {
             .field("identity", &self.identity)
             .field("arm_tier", &self.arm_tier)
             .field("data_planes", &self.data_planes)
+            .field("local_capabilities", &self.local_capabilities)
             .field("resolved_bindings", &self.resolved_bindings)
             .field("binding_sources", &self.binding_sources)
             .field("graph_scopes", &self.graph_scopes)
@@ -626,6 +669,7 @@ impl ContextRegistry {
             identity: options.identity,
             arm_tier: options.arm_tier,
             data_planes: options.data_planes,
+            local_capabilities: options.local_capabilities,
             resolved_bindings: options.resolved_bindings,
             binding_sources: options.binding_sources,
             graph_scopes: options.graph_scopes,
@@ -940,11 +984,18 @@ mod tests {
     fn open_captures_immutable_authority_and_expiry_values() {
         let now = Instant::now();
         let registry = registry(2, Duration::from_secs(10), Duration::from_secs(60));
-        let context = registry.open(options(), now).expect("context opens");
+        let options = options()
+            .with_local_capabilities(vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()])
+            .expect("artifact write grant");
+        let context = registry.open(options, now).expect("context opens");
 
         assert_eq!(context.identity(), Identity::User);
         assert_eq!(context.arm_tier(), ArmTier::Inspect);
         assert!(context.data_planes().is_empty());
+        assert_eq!(
+            context.local_capabilities(),
+            &[ARTIFACTS_WRITE_CAPABILITY.to_owned()]
+        );
         assert_eq!(context.resolved_bindings().len(), 1);
         assert_eq!(
             context.graph_scopes(),
@@ -1178,6 +1229,22 @@ mod tests {
             )
             .expect_err("a context needs a cloud"),
             ContextOptionsError::MissingCloudBinding
+        );
+
+        assert_eq!(
+            options()
+                .with_local_capabilities(vec!["filesystem.write".to_owned()])
+                .expect_err("unknown local capability"),
+            ContextOptionsError::UnsupportedLocalCapability
+        );
+        assert_eq!(
+            options()
+                .with_local_capabilities(vec![
+                    ARTIFACTS_WRITE_CAPABILITY.to_owned(),
+                    ARTIFACTS_WRITE_CAPABILITY.to_owned(),
+                ])
+                .expect_err("duplicate local capability"),
+            ContextOptionsError::DuplicateLocalCapability
         );
     }
 
