@@ -187,6 +187,16 @@ mod tests {
                     )
                     .is_ok()
             );
+            assert_eq!(
+                policy.classify(
+                    cloud,
+                    RoutePurpose::Request,
+                    HttpMethod::Post,
+                    &logs,
+                    LOGS_QUERY_API_VERSION,
+                ),
+                Err(PolicyDenial::UnknownRoute)
+            );
         }
     }
 
@@ -252,6 +262,16 @@ mod tests {
                     .rbac_action(),
                 "Microsoft.Insights/Metrics/Read"
             );
+            assert_eq!(
+                policy.classify(
+                    cloud,
+                    RoutePurpose::Request,
+                    HttpMethod::Get,
+                    &single,
+                    METRICS_API_VERSION,
+                ),
+                Err(PolicyDenial::UnknownRoute)
+            );
 
             let batch = RelativeRequestTarget::parse(
                 "/subscriptions/11111111-1111-1111-1111-111111111111/metrics:getBatch?metricnamespace=Microsoft.Compute&metricnames=Percentage%20CPU&filter=Location%20eq%20%27west%27",
@@ -273,6 +293,16 @@ mod tests {
                     cloud,
                     RoutePurpose::MetricsBatch,
                     HttpMethod::Get,
+                    &batch,
+                    METRICS_API_VERSION,
+                ),
+                Err(PolicyDenial::UnknownRoute)
+            );
+            assert_eq!(
+                policy.classify(
+                    cloud,
+                    RoutePurpose::Request,
+                    HttpMethod::Post,
                     &batch,
                     METRICS_API_VERSION,
                 ),

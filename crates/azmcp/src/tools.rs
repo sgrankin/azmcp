@@ -9,9 +9,10 @@ use serde_json::{Value, json};
 use azmcp_core::{
     cloud::AzureCloud,
     schema::{
-        DEFAULT_SEARCH_LIMIT, MAX_API_VERSION_BYTES, MAX_API_VERSIONS, MAX_CLI_EQUIVALENT_BYTES,
-        MAX_DATA_PLANE_GRANT_BYTES, MAX_DESCRIPTION_BYTES, MAX_DISPLAY_NAME_BYTES,
-        MAX_ENTRY_ID_BYTES, MAX_OPERATION_BYTES, MAX_PATH_TEMPLATE_BYTES, MAX_QUERY_BYTES,
+        DEFAULT_SEARCH_LIMIT, MAX_API_VERSION_BYTES, MAX_API_VERSIONS, MAX_AUDIENCE_BYTES,
+        MAX_CLI_EQUIVALENT_BYTES, MAX_DATA_PLANE_BYTES, MAX_DATA_PLANE_GRANT_BYTES,
+        MAX_DATA_SCOPE_BYTES, MAX_DESCRIPTION_BYTES, MAX_DISPLAY_NAME_BYTES, MAX_ENTRY_ID_BYTES,
+        MAX_EXECUTION_SURFACE_BYTES, MAX_OPERATION_BYTES, MAX_PATH_TEMPLATE_BYTES, MAX_QUERY_BYTES,
         MAX_QUERY_PARAMETER_BYTES, MAX_QUERY_PARAMETERS, MAX_RBAC_ACTION_BYTES,
         MAX_RESOURCE_TYPE_BYTES, MAX_SEARCH_LIMIT,
     },
@@ -471,7 +472,7 @@ fn run() -> Tool {
 fn schema_search() -> Tool {
     tool(
         SCHEMA_SEARCH_TOOL,
-        "Search the offline reviewed az.request route index for a retained context. Results include exact caller paths, API versions, policy requirements, and context executability.",
+        "Search the offline reviewed route and helper catalog for a retained context. Results include the exact execution surface (az.request, az.metrics.single, az.metrics.batch, or az.logs.query), audiences, scope requirements, reviewed versions, and context executability; use azure_schema_get for closed helper arguments.",
         json!({
             "type": "object",
             "properties": {
@@ -502,7 +503,7 @@ fn schema_search() -> Tool {
 fn schema_get() -> Tool {
     tool(
         SCHEMA_GET_TOOL,
-        "Get reviewed route metadata for one azure_schema_search entry and exact API version; body schemas are metadataOnly unless a checked-in fixture exists.",
+        "Get one offline reviewed route or helper entry at an exact API version. Helper argument schemas are closed and separate from host-owned HTTP body schemas; response schemas are metadataOnly unless a checked-in fixture exists.",
         json!({
             "type": "object",
             "properties": {
@@ -724,10 +725,12 @@ fn schema_hit_schema() -> Value {
             "entryId": {"type": "string", "minLength": 1, "maxLength": MAX_ENTRY_ID_BYTES},
             "resourceType": {"type": "string", "minLength": 1, "maxLength": MAX_RESOURCE_TYPE_BYTES},
             "operation": {"type": "string", "minLength": 1, "maxLength": MAX_OPERATION_BYTES},
+            "executionSurface": {"type": "string", "minLength": 1, "maxLength": MAX_EXECUTION_SURFACE_BYTES},
             "displayName": {"type": "string", "minLength": 1, "maxLength": MAX_DISPLAY_NAME_BYTES},
             "description": {"type": "string", "minLength": 1, "maxLength": MAX_DESCRIPTION_BYTES},
             "cliEquivalent": optional_string_schema(MAX_CLI_EQUIVALENT_BYTES),
             "cloud": cloud_schema(),
+            "audience": {"type": "string", "minLength": 1, "maxLength": MAX_AUDIENCE_BYTES},
             "method": method_schema(),
             "pathTemplate": {"type": "string", "minLength": 1, "maxLength": MAX_PATH_TEMPLATE_BYTES},
             "canonicalPathTemplate": {"type": "string", "minLength": 1, "maxLength": MAX_PATH_TEMPLATE_BYTES},
@@ -735,10 +738,12 @@ fn schema_hit_schema() -> Value {
             "rbacAction": {"type": "string", "minLength": 1, "maxLength": MAX_RBAC_ACTION_BYTES},
             "armTier": arm_tier_schema(),
             "dataPlaneGrant": optional_string_schema(MAX_DATA_PLANE_GRANT_BYTES),
+            "dataPlane": optional_string_schema(MAX_DATA_PLANE_BYTES),
+            "dataScope": optional_string_schema(MAX_DATA_SCOPE_BYTES),
             "allowedQueryParameters": {"type": "array", "maxItems": MAX_QUERY_PARAMETERS, "items": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_PARAMETER_BYTES}},
             "access": access_schema()
         },
-        "required": ["entryId", "resourceType", "operation", "displayName", "description", "cliEquivalent", "cloud", "method", "pathTemplate", "canonicalPathTemplate", "apiVersions", "rbacAction", "armTier", "dataPlaneGrant", "allowedQueryParameters", "access"],
+        "required": ["entryId", "resourceType", "operation", "executionSurface", "displayName", "description", "cliEquivalent", "cloud", "audience", "method", "pathTemplate", "canonicalPathTemplate", "apiVersions", "rbacAction", "armTier", "dataPlaneGrant", "dataPlane", "dataScope", "allowedQueryParameters", "access"],
         "additionalProperties": false
     })
 }
@@ -750,10 +755,12 @@ fn schema_detail_schema() -> Value {
             "entryId": {"type": "string", "minLength": 1, "maxLength": MAX_ENTRY_ID_BYTES},
             "resourceType": {"type": "string", "minLength": 1, "maxLength": MAX_RESOURCE_TYPE_BYTES},
             "operation": {"type": "string", "minLength": 1, "maxLength": MAX_OPERATION_BYTES},
+            "executionSurface": {"type": "string", "minLength": 1, "maxLength": MAX_EXECUTION_SURFACE_BYTES},
             "displayName": {"type": "string", "minLength": 1, "maxLength": MAX_DISPLAY_NAME_BYTES},
             "description": {"type": "string", "minLength": 1, "maxLength": MAX_DESCRIPTION_BYTES},
             "cliEquivalent": optional_string_schema(MAX_CLI_EQUIVALENT_BYTES),
             "cloud": cloud_schema(),
+            "audience": {"type": "string", "minLength": 1, "maxLength": MAX_AUDIENCE_BYTES},
             "method": method_schema(),
             "pathTemplate": {"type": "string", "minLength": 1, "maxLength": MAX_PATH_TEMPLATE_BYTES},
             "canonicalPathTemplate": {"type": "string", "minLength": 1, "maxLength": MAX_PATH_TEMPLATE_BYTES},
@@ -762,13 +769,16 @@ fn schema_detail_schema() -> Value {
             "rbacAction": {"type": "string", "minLength": 1, "maxLength": MAX_RBAC_ACTION_BYTES},
             "armTier": arm_tier_schema(),
             "dataPlaneGrant": optional_string_schema(MAX_DATA_PLANE_GRANT_BYTES),
+            "dataPlane": optional_string_schema(MAX_DATA_PLANE_BYTES),
+            "dataScope": optional_string_schema(MAX_DATA_SCOPE_BYTES),
             "allowedQueryParameters": {"type": "array", "maxItems": MAX_QUERY_PARAMETERS, "items": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_PARAMETER_BYTES}},
+            "argumentSchema": {"oneOf": [schema_document_schema(), {"type": "null"}]},
             "requestBodySchema": {"oneOf": [schema_document_schema(), {"type": "null"}]},
             "responseBodySchema": {"oneOf": [schema_document_schema(), {"type": "null"}]},
             "schemaAvailability": {"enum": ["metadataOnly", "full"]},
             "access": access_schema()
         },
-        "required": ["entryId", "resourceType", "operation", "displayName", "description", "cliEquivalent", "cloud", "method", "pathTemplate", "canonicalPathTemplate", "apiVersion", "apiVersions", "rbacAction", "armTier", "dataPlaneGrant", "allowedQueryParameters", "requestBodySchema", "responseBodySchema", "schemaAvailability", "access"],
+        "required": ["entryId", "resourceType", "operation", "executionSurface", "displayName", "description", "cliEquivalent", "cloud", "audience", "method", "pathTemplate", "canonicalPathTemplate", "apiVersion", "apiVersions", "rbacAction", "armTier", "dataPlaneGrant", "dataPlane", "dataScope", "allowedQueryParameters", "argumentSchema", "requestBodySchema", "responseBodySchema", "schemaAvailability", "access"],
         "additionalProperties": false
     })
 }
@@ -784,7 +794,7 @@ mod tests {
         assert_eq!(catalog().len(), 6);
         let encoded = serde_json::to_string(&first).unwrap();
         assert!(!encoded.contains("$ref"));
-        assert_eq!(encoded.matches("2020-12").count(), 14);
+        assert_eq!(encoded.matches("2020-12").count(), 15);
     }
 
     #[test]

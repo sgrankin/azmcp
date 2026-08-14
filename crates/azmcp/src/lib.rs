@@ -898,7 +898,7 @@ mod tests {
             .send(call_tool_request(
                 2,
                 SCHEMA_SEARCH_TOOL,
-                json!({"contextId": context_id, "query": "provider"}),
+                json!({"contextId": context_id, "query": "namespace"}),
             ))
             .await
             .unwrap();
@@ -916,6 +916,12 @@ mod tests {
             searched["results"][0]["pathTemplate"],
             "/providers/{namespace}"
         );
+        assert_eq!(searched["results"][0]["executionSurface"], "az.request");
+        assert_eq!(
+            searched["results"][0]["audience"],
+            "https://management.azure.com/"
+        );
+        assert_eq!(searched["results"][0]["dataPlane"], Value::Null);
 
         client
             .send(call_tool_request(
@@ -933,14 +939,45 @@ mod tests {
             .await
             .expect("schema get response");
         assert_eq!(found.is_error, Some(false));
-        assert_eq!(
-            found.structured_content.unwrap()["schema"]["schemaAvailability"],
-            "metadataOnly"
-        );
+        let found = found.structured_content.unwrap();
+        assert_eq!(found["schema"]["schemaAvailability"], "metadataOnly");
+        assert_eq!(found["schema"]["executionSurface"], "az.request");
+        assert_eq!(found["schema"]["audience"], "https://management.azure.com/");
+        assert_eq!(found["schema"]["dataPlane"], Value::Null);
+        assert_eq!(found["schema"]["dataScope"], Value::Null);
+        assert_eq!(found["schema"]["argumentSchema"], Value::Null);
 
         client
             .send(call_tool_request(
                 4,
+                SCHEMA_GET_TOOL,
+                json!({
+                    "contextId": context_id,
+                    "entryId": "AzureCloud.metrics.single",
+                    "apiVersion": azmcp_core::routes::METRICS_API_VERSION
+                }),
+            ))
+            .await
+            .unwrap();
+        let helper = tokio::time::timeout(Duration::from_secs(1), receive_tool_result(&mut client))
+            .await
+            .expect("helper schema get response");
+        assert_eq!(helper.is_error, Some(false));
+        let helper = helper.structured_content.unwrap()["schema"].clone();
+        assert_eq!(helper["executionSurface"], "az.metrics.single");
+        assert_eq!(helper["audience"], "https://management.azure.com/");
+        assert_eq!(helper["dataPlane"], Value::Null);
+        assert_eq!(helper["dataScope"], "boundSubscription");
+        assert_eq!(helper["requestBodySchema"], Value::Null);
+        assert_eq!(helper["argumentSchema"]["additionalProperties"], false);
+        assert_eq!(
+            helper["argumentSchema"]["required"],
+            json!(["cloud", "resourceId", "metricNames"])
+        );
+
+        client
+            .send(call_tool_request(
+                5,
                 SCHEMA_GET_TOOL,
                 json!({
                     "contextId": context_id,
@@ -962,7 +999,7 @@ mod tests {
 
         client
             .send(call_tool_request(
-                5,
+                6,
                 CONTEXT_CLOSE_TOOL,
                 json!({"contextId": context_id}),
             ))

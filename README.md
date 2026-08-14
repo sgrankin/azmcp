@@ -18,9 +18,11 @@ v0 is deliberately small. It exposes:
 - `azure_schema_search`
 - `azure_schema_get`
 
-Schema discovery is offline and tied to the reviewed `az.request` policy. The
-bootstrap catalog currently returns route metadata with `metadataOnly` body
-schemas because no response fixtures are checked in.
+Schema discovery is offline and tied to the reviewed route policy. The catalog
+includes the executable surfaces for `az.request`, `az.metrics.single`,
+`az.metrics.batch`, and `az.logs.query`; helper argument schemas are closed and
+separate from host-owned HTTP body schemas. Response schemas remain
+`metadataOnly` because no response fixtures are checked in.
 
 Inside `azure_run`, JavaScript has only `console`, `az.request`, `az.graph`, and
 the reviewed `az.metrics` and `az.logs` helpers. There is no `fetch`, `Deno`,

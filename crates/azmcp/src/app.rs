@@ -1007,7 +1007,7 @@ impl Application {
         Ok(AccountsResult { accounts })
     }
 
-    /// Search reviewed request metadata without acquiring credentials or
+    /// Search reviewed route and helper metadata without acquiring credentials or
     /// touching the worker or HTTP client.
     pub async fn schema_search(
         &self,
@@ -1040,7 +1040,7 @@ impl Application {
         })
     }
 
-    /// Get one exact reviewed request entry and API version without any Azure
+    /// Get one exact reviewed route/helper entry and API version without any Azure
     /// or worker activity.
     pub async fn schema_get(&self, args: SchemaGetArgs) -> Result<SchemaGetResult, AppError> {
         args.validate()
@@ -2300,7 +2300,7 @@ mod tests {
         let search = application
             .schema_search(SchemaSearchArgs {
                 context_id: opened.context_id.clone(),
-                query: "provider".to_owned(),
+                query: "namespace".to_owned(),
                 cloud: None,
                 limit: None,
             })
