@@ -2,10 +2,13 @@
 
 ## Current plan
 
-1. Complete the modern MCP `2026-07-28` v0 execution slice.
-2. Preserve the synthetic-only local test boundary.
-3. Run official server conformance when its pinned runner is available.
-4. Run authenticated commercial/Government acceptance only in a separately authorized
+1. Build the v1 reviewed-route generator and compact offline schema index.
+2. Add cross-cloud Azure Monitor metrics, including regional multi-resource batch.
+3. Add direct cross-cloud Log Analytics Query for workspace-backed logs and
+   Application Insights.
+4. Add bounded paging, retries, result caps, and large-result references.
+5. Preserve the synthetic-only local test boundary and run the complete modern MCP gate.
+6. Run authenticated Commercial/Government acceptance only in a separately authorized
    non-production environment.
 
 ## Verified facts
@@ -22,6 +25,11 @@
   The current workspace gate is 112 tests plus warning-free clippy.
 - The four v0 tools are now the exact advertised catalog. A modern-protocol lifecycle test
   covers accounts, context open, persistent run, close, and structured domain failure.
+- `azure_schema_search` and `azure_schema_get` are implemented as context-scoped,
+  offline tools tied to the executable reviewed route policy. The bootstrap catalog
+  exposes exact route metadata only; it does not invent request or response schemas.
+- The schema checkpoint is change `vxkvytws`. Its isolated and integrated test gate is
+  118 tests plus formatting and warning-free clippy.
 - One current-thread V8 worker process is retained per context. Subprocess tests cover
   persistence, hard close and MCP cancellation, abort poisoning, timeout poisoning, heap/RSS
   pressure, TTL disposal, and an eight-call concurrency bound under `Promise.all`.
@@ -61,6 +69,18 @@
 
 - v0 is modern-only. Legacy MCP is deferred until a concrete host requirement justifies a
   second lifecycle.
+- Schema discovery searches only executable `RoutePurpose::Request` rows and leases the
+  caller's context without starting a worker, acquiring a credential, or making an HTTP
+  request. Search results report non-executable rows when the context tier or data-plane
+  grant is insufficient.
+- The first metrics surface will expose explicit `az.metrics.single` and
+  `az.metrics.batch` helpers. Batch requires an explicit reviewed region, groups at most
+  50 resources from one subscription/region/resource type, and uses the regional Monitor
+  audience rather than ARM.
+- The first Logs Query surface uses only `POST /v1/workspaces/{workspaceId}/query` and a
+  `logs.query` context grant. Its initial scope is deliberately `allAccessible`: an
+  apparent workspace allowlist would be porous through KQL cross-workspace references and
+  stored functions.
 - A normal installation needs no azmcp-specific environment variables. Codex's stdio protocol
   marker remains in the client registration, but Codex consumes it before launching azmcp.
 - This machine's Azure CLI session targets real production. Development and validation
@@ -92,6 +112,9 @@
   unresolved; the direct child is killed and pipe readers are bounded/aborted.
 - Generic paging, exact-origin continuation handling, idempotent retry/backoff, and automatic
   first-real-scenario ARM route generation are not implemented in this v0 checkpoint.
+- Schema bodies remain `metadataOnly` until pinned, generated fixtures are checked in.
+  The current index covers only the four existing Commercial/Government subscription and
+  provider metadata routes; broad API discovery depends on the v1 route generator.
 - The RSS implementation currently targets macOS and Linux through `sysinfo`; other targets
   must add an equivalent OS process sampler before relying on the documented ceiling.
 - The local Codex repository contains a pinned official MCP client-conformance driver, not an
