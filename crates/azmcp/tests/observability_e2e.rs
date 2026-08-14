@@ -41,6 +41,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::Barrier,
 };
 
 const SUBSCRIPTION: &str = "11111111-1111-1111-1111-111111111111";
@@ -200,7 +201,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         ))
         .await
         .expect("send context open");
-    let opened = receive_tool_result(&mut client).await;
+    let opened = receive_tool_result(&mut client, 1).await;
     assert_eq!(opened.is_error, Some(false));
     let opened = opened.structured_content.expect("context result");
     let context_id = opened["contextId"].as_str().expect("context id").to_owned();
@@ -241,7 +242,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         ))
         .await
         .expect("send observability run");
-    let ran = receive_tool_result(&mut client).await;
+    let ran = receive_tool_result(&mut client, 2).await;
     assert_eq!(ran.is_error, Some(false));
     let ran = ran.structured_content.expect("run result");
     assert_eq!(ran["value"]["metrics"]["body"]["kind"], "synthetic-metrics");
@@ -282,7 +283,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         ))
         .await
         .expect("send persistence run");
-    let persisted = receive_tool_result(&mut client).await;
+    let persisted = receive_tool_result(&mut client, 3).await;
     assert_eq!(persisted.is_error, Some(false));
     let persisted = persisted.structured_content.expect("persistence result");
     assert_eq!(persisted["value"], 42);
@@ -296,7 +297,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         ))
         .await
         .expect("send close");
-    let closed = receive_tool_result(&mut client).await;
+    let closed = receive_tool_result(&mut client, 4).await;
     assert_eq!(closed.is_error, Some(false));
     assert_eq!(closed.structured_content, Some(json!({"closed": true})));
 
@@ -308,7 +309,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         ))
         .await
         .expect("send post-close run");
-    let evicted = receive_tool_result(&mut client).await;
+    let evicted = receive_tool_result(&mut client, 5).await;
     assert_eq!(evicted.is_error, Some(true));
     assert_eq!(
         evicted.structured_content.expect("domain error")["code"],
@@ -407,8 +408,9 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
     }));
 
     drop(client);
-    server_task
+    tokio::time::timeout(Duration::from_secs(5), server_task)
         .await
+        .expect("MCP service shutdown timeout")
         .expect("MCP service task")
         .expect("clean MCP shutdown");
 }
@@ -439,7 +441,10 @@ fn tool_request(id: i64, name: &'static str, arguments: Value) -> ClientJsonRpcM
     )
 }
 
-async fn receive_tool_result(client: &mut impl Transport<rmcp::RoleClient>) -> CallToolResult {
+async fn receive_tool_result(
+    client: &mut impl Transport<rmcp::RoleClient>,
+    expected_id: i64,
+) -> CallToolResult {
     let message = tokio::time::timeout(Duration::from_secs(10), client.receive())
         .await
         .expect("MCP response timeout")
@@ -447,6 +452,7 @@ async fn receive_tool_result(client: &mut impl Transport<rmcp::RoleClient>) -> C
     let ServerJsonRpcMessage::Response(response) = message else {
         panic!("expected MCP response")
     };
+    assert_eq!(response.id, RequestId::Number(expected_id));
     let ServerResult::CallToolResult(result) = response.result else {
         panic!("expected tool result")
     };
@@ -468,16 +474,20 @@ async fn synthetic_upstream() -> (String, tokio::task::JoinHandle<Vec<String>>) 
         .expect("loopback listener");
     let address = listener.local_addr().expect("loopback address");
     let task = tokio::spawn(async move {
+        let validation_stream = accept_loopback(&listener).await;
+        let validation = handle_upstream_request(validation_stream, None).await;
+        assert!(validation.starts_with(&format!("GET /subscriptions/{SUBSCRIPTION}?")));
+
+        let observability_barrier = Arc::new(Barrier::new(2));
         let mut handlers = Vec::new();
-        for _ in 0..3 {
-            let (stream, peer) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("expected loopback request")
-                .expect("accept loopback request");
-            assert!(peer.ip().is_loopback());
-            handlers.push(tokio::spawn(handle_upstream_request(stream)));
+        for _ in 0..2 {
+            let stream = accept_loopback(&listener).await;
+            handlers.push(tokio::spawn(handle_upstream_request(
+                stream,
+                Some(Arc::clone(&observability_barrier)),
+            )));
         }
-        let mut requests = Vec::new();
+        let mut requests = vec![validation];
         for handler in handlers {
             requests.push(handler.await.expect("upstream handler"));
         }
@@ -486,9 +496,22 @@ async fn synthetic_upstream() -> (String, tokio::task::JoinHandle<Vec<String>>) 
     (format!("http://{address}/"), task)
 }
 
-async fn handle_upstream_request(mut stream: TcpStream) -> String {
+async fn accept_loopback(listener: &TcpListener) -> TcpStream {
+    let (stream, peer) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("expected loopback request")
+        .expect("accept loopback request");
+    assert!(peer.ip().is_loopback());
+    stream
+}
+
+async fn handle_upstream_request(
+    mut stream: TcpStream,
+    observability_barrier: Option<Arc<Barrier>>,
+) -> String {
     let request = read_http_request(&mut stream).await;
-    let body = if request.starts_with(&format!("GET /subscriptions/{SUBSCRIPTION}?")) {
+    let is_validation = request.starts_with(&format!("GET /subscriptions/{SUBSCRIPTION}?"));
+    let body = if is_validation {
         json!({"subscriptionId": SUBSCRIPTION})
     } else if request.contains("/providers/Microsoft.Insights/metrics?") {
         json!({"kind": "synthetic-metrics", "value": [{"average": 12.5}]})
@@ -503,6 +526,14 @@ async fn handle_upstream_request(mut stream: TcpStream) -> String {
     } else {
         panic!("unexpected synthetic request: {request}");
     };
+    if is_validation {
+        assert!(observability_barrier.is_none());
+    } else {
+        let barrier = observability_barrier.expect("observability concurrency barrier");
+        tokio::time::timeout(Duration::from_secs(2), barrier.wait())
+            .await
+            .expect("metrics and Logs requests must overlap");
+    }
     let body = serde_json::to_vec(&body).expect("response JSON");
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Ms-Ratelimit-Remaining-Subscription-Reads: 99\r\n\r\n",
