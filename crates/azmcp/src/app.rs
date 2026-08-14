@@ -728,6 +728,7 @@ struct ArtifactTransaction {
     accepting: bool,
     stages: Vec<ArtifactStage>,
     streams: HashMap<String, ActiveArtifactStream>,
+    streams_touched: bool,
 }
 
 struct ActiveArtifactStream {
@@ -889,6 +890,7 @@ impl WorkerSlot {
             || transaction.run_id.is_some()
             || !transaction.stages.is_empty()
             || !transaction.streams.is_empty()
+            || transaction.streams_touched
         {
             return Err(ArtifactError::Unavailable);
         }
@@ -910,8 +912,11 @@ impl WorkerSlot {
             self.discard_artifact_transaction(&mut transaction).await?;
             return Err(ArtifactError::Unavailable);
         }
-        if !transaction.streams.is_empty() {
-            self.discard_artifact_transaction(&mut transaction).await?;
+        let had_active_streams = !transaction.streams.is_empty();
+        self.discard_artifact_streams(&mut transaction).await?;
+        if had_active_streams {
+            self.discard_artifact_stages(&mut transaction).await?;
+            transaction.run_id = None;
             return Err(ArtifactError::Unavailable);
         }
         if transaction.stages.is_empty() {
@@ -949,6 +954,7 @@ impl WorkerSlot {
         if transaction.run_id.is_none()
             && transaction.stages.is_empty()
             && transaction.streams.is_empty()
+            && !transaction.streams_touched
         {
             return Ok(());
         }
@@ -963,25 +969,16 @@ impl WorkerSlot {
             self.artifact_store.as_ref(),
             self.artifact_namespace.as_ref(),
         ) else {
-            if transaction.stages.is_empty() && transaction.streams.is_empty() {
+            if transaction.stages.is_empty()
+                && transaction.streams.is_empty()
+                && !transaction.streams_touched
+            {
                 transaction.run_id = None;
                 return Ok(());
             }
             return Err(ArtifactError::Unavailable);
         };
-        let streams = transaction
-            .streams
-            .drain()
-            .map(|(_, active)| active.stream)
-            .collect::<Vec<_>>();
-        let mut first_error = if streams.is_empty() {
-            None
-        } else {
-            store
-                .discard_streams(namespace.clone(), streams)
-                .await
-                .err()
-        };
+        let mut first_error = self.discard_artifact_streams(transaction).await.err();
         if !transaction.stages.is_empty() {
             match store
                 .discard_staged(namespace.clone(), transaction.stages.clone())
@@ -996,6 +993,45 @@ impl WorkerSlot {
             transaction.run_id = None;
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    async fn discard_artifact_streams(
+        &self,
+        transaction: &mut ArtifactTransaction,
+    ) -> Result<(), ArtifactError> {
+        if !transaction.streams_touched {
+            return Ok(());
+        }
+        let (Some(store), Some(namespace)) = (
+            self.artifact_store.as_ref(),
+            self.artifact_namespace.as_ref(),
+        ) else {
+            return Err(ArtifactError::Unavailable);
+        };
+        store.discard_streams(namespace.clone()).await?;
+        transaction.streams.clear();
+        transaction.streams_touched = false;
+        Ok(())
+    }
+
+    async fn discard_artifact_stages(
+        &self,
+        transaction: &mut ArtifactTransaction,
+    ) -> Result<(), ArtifactError> {
+        if transaction.stages.is_empty() {
+            return Ok(());
+        }
+        let (Some(store), Some(namespace)) = (
+            self.artifact_store.as_ref(),
+            self.artifact_namespace.as_ref(),
+        ) else {
+            return Err(ArtifactError::Unavailable);
+        };
+        store
+            .discard_staged(namespace.clone(), transaction.stages.clone())
+            .await?;
+        transaction.stages.clear();
+        Ok(())
     }
 
     async fn next_ref_expiry(&self) -> Option<Instant> {
@@ -2406,6 +2442,7 @@ async fn handle_artifact_stream_host_call(
                         "artifact context is unavailable",
                     ));
                 }
+                state.streams_touched = true;
                 let stream = store
                     .begin_json_stream(namespace.clone(), name, compression, format)
                     .await
@@ -2478,6 +2515,7 @@ async fn handle_artifact_stream_host_call(
                     return Err((AppErrorCode::InvalidInput, "artifact stream is unavailable"));
                 };
                 if active.format != format
+                    || active.format != active.stream.format()
                     || active.compression != active.stream.compression()
                     || active.next_sequence != sequence
                 {
@@ -2550,6 +2588,7 @@ async fn handle_artifact_stream_host_call(
                     return Err((AppErrorCode::InvalidInput, "artifact stream is unavailable"));
                 };
                 if active.format != format
+                    || active.format != active.stream.format()
                     || active.compression != active.stream.compression()
                     || active.next_sequence != chunks
                     || active.items != items
@@ -2648,7 +2687,7 @@ async fn handle_artifact_stream_host_call(
                         )
                     });
                 };
-                if active.format != format {
+                if active.format != format || active.format != active.stream.format() {
                     state.streams.insert(stream_id, active);
                     return serde_json::to_value(ArtifactWriteJsonStreamAbortResult {
                         aborted: false,
@@ -3377,6 +3416,8 @@ mod tests {
                     code.as_str(),
                     "__artifact_stream__"
                         | "__artifact_stream_unfinished__"
+                        | "__artifact_stream_abort__"
+                        | "__artifact_stream_bad_totals__"
                         | "__artifact_stream_then_fail__"
                 ) {
                     let Some(handler) = host_handler else {
@@ -3404,6 +3445,21 @@ mod tests {
                             ref_candidate: None,
                         });
                     }
+                    if code == "__artifact_stream_abort__" {
+                        let aborted = artifact_host_call(
+                            &handler,
+                            2,
+                            HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY,
+                            json!({"phase": "abort", "streamId": stream_id}),
+                        )
+                        .await?;
+                        return Ok(ExecutionResult {
+                            value: aborted,
+                            logs: Vec::new(),
+                            logs_omitted: 0,
+                            ref_candidate: None,
+                        });
+                    }
                     artifact_host_call(
                         &handler,
                         2,
@@ -3423,7 +3479,7 @@ mod tests {
                         json!({
                             "phase": "finish",
                             "streamId": stream_id,
-                            "chunks": 1,
+                            "chunks": if code == "__artifact_stream_bad_totals__" { 2 } else { 1 },
                             "items": 2,
                         }),
                     )
@@ -4678,6 +4734,45 @@ mod tests {
                 .expect_err("unfinished stream rejects successful run")
                 .kind(),
             AppErrorCode::UpstreamError
+        );
+        assert_eq!(artifact_data_files(&artifact_root).len(), 2);
+
+        let aborted = application
+            .context_open(ContextOpenArgs {
+                local_capabilities: vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()],
+                ..ContextOpenArgs::default()
+            })
+            .await
+            .expect("aborted-stream context");
+        let aborted = application
+            .run(RunArgs {
+                context_id: aborted.context_id,
+                code: "__artifact_stream_abort__".to_owned(),
+                timeout_ms: None,
+            })
+            .await
+            .expect("explicit stream abort");
+        assert_eq!(aborted.value, json!({"aborted": true}));
+        assert_eq!(artifact_data_files(&artifact_root).len(), 2);
+
+        let invalid = application
+            .context_open(ContextOpenArgs {
+                local_capabilities: vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()],
+                ..ContextOpenArgs::default()
+            })
+            .await
+            .expect("invalid-totals context");
+        assert_eq!(
+            application
+                .run(RunArgs {
+                    context_id: invalid.context_id,
+                    code: "__artifact_stream_bad_totals__".to_owned(),
+                    timeout_ms: None,
+                })
+                .await
+                .expect_err("parent rejects mismatched stream totals")
+                .kind(),
+            AppErrorCode::InvalidInput
         );
         assert_eq!(artifact_data_files(&artifact_root).len(), 2);
 
