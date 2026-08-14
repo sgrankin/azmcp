@@ -25,6 +25,7 @@ pub const RUN_TOOL: &str = "azure_run";
 pub const SCHEMA_SEARCH_TOOL: &str = "azure_schema_search";
 pub const SCHEMA_GET_TOOL: &str = "azure_schema_get";
 pub const LOGS_QUERY_DATA_PLANE: &str = "logs.query";
+pub const ARTIFACT_WRITE_LOCAL_CAPABILITY: &str = "artifacts.write";
 
 pub const DEFAULT_RUN_TIMEOUT_MS: u64 = 60_000;
 pub const MAX_RUN_TIMEOUT_MS: u64 = 3_600_000;
@@ -202,6 +203,8 @@ pub struct ContextOpenArgs {
     #[serde(default)]
     pub data_planes: Vec<String>,
     #[serde(default)]
+    pub local_capabilities: Vec<String>,
+    #[serde(default)]
     pub bindings: BindingOverrides,
     #[serde(default)]
     pub allowed_subscriptions: AllowedSubscriptionOverrides,
@@ -231,6 +234,25 @@ impl ContextOpenArgs {
             })
         {
             return Err("dataPlanes contains a duplicate");
+        }
+        if self
+            .local_capabilities
+            .iter()
+            .any(|capability| capability != ARTIFACT_WRITE_LOCAL_CAPABILITY)
+        {
+            return Err("unsupported local capability");
+        }
+        if self
+            .local_capabilities
+            .iter()
+            .enumerate()
+            .any(|(index, capability)| {
+                self.local_capabilities[..index]
+                    .iter()
+                    .any(|prior| prior == capability)
+            })
+        {
+            return Err("localCapabilities contains a duplicate");
         }
         for cloud in [AzureCloud::AzureCloud, AzureCloud::AzureUSGovernment] {
             let additional = self.allowed_subscriptions.get(cloud);
@@ -382,13 +404,14 @@ fn accounts() -> Tool {
 fn context_open() -> Tool {
     tool(
         CONTEXT_OPEN_TOOL,
-        "Open a persistent, inspect-only JavaScript context with immutable Azure cloud bindings. Cloud is never defaulted inside a run.",
+        "Open a persistent, Azure-inspect-only JavaScript context with immutable cloud bindings and optional managed local capabilities. Cloud is never defaulted inside a run.",
         json!({
             "type": "object",
             "properties": {
                 "identity": {"const": "user", "default": "user"},
                 "armTier": {"const": "inspect", "default": "inspect"},
                 "dataPlanes": {"type": "array", "maxItems": 1, "uniqueItems": true, "items": {"const": "logs.query"}, "default": []},
+                "localCapabilities": {"type": "array", "maxItems": 1, "uniqueItems": true, "items": {"const": "artifacts.write"}, "default": []},
                 "bindings": bindings_schema(),
                 "allowedSubscriptions": allowed_subscriptions_schema(),
                 "graphScopes": graph_scopes_schema(),
@@ -403,13 +426,14 @@ fn context_open() -> Tool {
                 "identity": {"const": "user"},
                 "armTier": {"const": "inspect"},
                 "dataPlanes": {"type": "array", "maxItems": 1, "items": {"const": "logs.query"}},
+                "localCapabilities": {"type": "array", "maxItems": 1, "items": {"const": "artifacts.write"}},
                 "resolvedBindings": {"type": "array", "minItems": 1, "items": resolved_binding_schema()},
                 "allowedSubscriptions": allowed_subscriptions_schema(),
                 "graphScopes": graph_scopes_schema(),
                 "logsScopes": logs_scopes_schema(),
                 "expiresAt": {"type": "string", "format": "date-time"}
             },
-            "required": ["contextId", "identity", "armTier", "dataPlanes", "resolvedBindings", "allowedSubscriptions", "graphScopes", "logsScopes", "expiresAt"],
+            "required": ["contextId", "identity", "armTier", "dataPlanes", "localCapabilities", "resolvedBindings", "allowedSubscriptions", "graphScopes", "logsScopes", "expiresAt"],
             "additionalProperties": false
         }),
         annotations(true, false, false),
@@ -439,7 +463,7 @@ fn context_close() -> Tool {
 fn run() -> Tool {
     tool(
         RUN_TOOL,
-        "Execute JavaScript in a retained inspect-only context. Use az.graph for fleet inventory, az.request for reviewed ARM routes, az.metrics.single({cloud, resourceId, metricNames, timespan?, interval?, aggregation?, top?, orderBy?, filter?, resultType?, metricNamespace?, autoAdjustTimegrain?, validateDimensions?, rollupBy?}) for one resource, az.metrics.batch({cloud, region, resourceIds, metricNamespace, metricNames, startTime?, endTime?, interval?, aggregation?, top?, orderBy?, filter?, rollupBy?}) for up to 50 same-type resources, and az.logs.query({cloud, subscription?, workspaceId, query, timespan}) for explicitly granted Log Analytics KQL. Every helper requires an explicit cloud; metrics batch also requires an explicit regional endpoint. Oversized serializable results expose a context-scoped ref envelope; use await az.ref(refId) in the same context to rehydrate it or az.peek(value) for a bounded shape summary.",
+        "Execute JavaScript in a retained Azure-inspect-only context. Use az.graph for fleet inventory, az.request for reviewed ARM routes, az.metrics.single({cloud, resourceId, metricNames, timespan?, interval?, aggregation?, top?, orderBy?, filter?, resultType?, metricNamespace?, autoAdjustTimegrain?, validateDimensions?, rollupBy?}) for one resource, az.metrics.batch({cloud, region, resourceIds, metricNamespace, metricNames, startTime?, endTime?, interval?, aggregation?, top?, orderBy?, filter?, rollupBy?}) for up to 50 same-type resources, and az.logs.query({cloud, subscription?, workspaceId, query, timespan}) for explicitly granted Log Analytics KQL. Every Azure helper requires an explicit cloud; metrics batch also requires an explicit regional endpoint. With localCapabilities: [\"artifacts.write\"], az.artifacts.writeJson({name, value}) creates one bounded private JSON file and returns its local receipt. Oversized serializable results expose a context-scoped ref envelope; use await az.ref(refId) in the same context to rehydrate it or az.peek(value) for a bounded shape summary.",
         json!({
             "type": "object",
             "properties": {
@@ -465,7 +489,7 @@ fn run() -> Tool {
             "required": ["value", "console", "consoleOmitted", "calls", "callsOmitted", "context", "sensitivity", "correlationId"],
             "additionalProperties": false
         }),
-        annotations(true, false, true),
+        annotations(false, false, true),
     )
 }
 
@@ -806,6 +830,11 @@ mod tests {
             serde_json::from_value(json!({"dataPlanes": ["logs.query"]})).unwrap();
         assert!(args.validate().is_ok());
         let args: ContextOpenArgs = serde_json::from_value(json!({
+            "localCapabilities": ["artifacts.write"]
+        }))
+        .unwrap();
+        assert!(args.validate().is_ok());
+        let args: ContextOpenArgs = serde_json::from_value(json!({
             "dataPlanes": ["logs.query"],
             "logsScopes": {"AzureCloud": {"scope": "allAccessible"}}
         }))
@@ -822,6 +851,22 @@ mod tests {
                 .unwrap()
                 .validate()
                 .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ContextOpenArgs>(json!({
+                "localCapabilities": ["filesystem.write"]
+            }))
+            .unwrap()
+            .validate()
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ContextOpenArgs>(json!({
+                "localCapabilities": ["artifacts.write", "artifacts.write"]
+            }))
+            .unwrap()
+            .validate()
+            .is_err()
         );
         assert!(
             serde_json::from_value::<ContextCloseArgs>(json!({"contextId": "x", "force": true}))
@@ -855,5 +900,18 @@ mod tests {
             timeout_ms: None,
         };
         assert!(args.timeout_ms().is_err());
+    }
+
+    #[test]
+    fn artifact_capability_makes_run_non_read_only() {
+        let run = catalog()
+            .into_iter()
+            .find(|tool| tool.name == RUN_TOOL)
+            .expect("run tool");
+        assert_eq!(
+            run.annotations
+                .and_then(|annotations| annotations.read_only_hint),
+            Some(false)
+        );
     }
 }
