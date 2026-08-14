@@ -29,7 +29,8 @@ use crate::{
     app::{AppError, Application},
     tools::{
         ACCOUNTS_TOOL, AccountsArgs, CONTEXT_CLOSE_TOOL, CONTEXT_OPEN_TOOL, ContextCloseArgs,
-        ContextOpenArgs, RUN_TOOL, RunArgs,
+        ContextOpenArgs, RUN_TOOL, RunArgs, SCHEMA_GET_TOOL, SCHEMA_SEARCH_TOOL, SchemaGetArgs,
+        SchemaSearchArgs,
     },
     worker::ResultTooLargeSummary,
 };
@@ -189,6 +190,14 @@ impl ServerHandler for AzmcpServer {
                         )
                     }
                 }
+            }
+            SCHEMA_SEARCH_TOOL => {
+                let args = parse_tool_args::<SchemaSearchArgs>(request.arguments)?;
+                tool_result(self.application.schema_search(args).await)
+            }
+            SCHEMA_GET_TOOL => {
+                let args = parse_tool_args::<SchemaGetArgs>(request.arguments)?;
+                tool_result(self.application.schema_get(args).await)
             }
             _ => Err(ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,
@@ -352,6 +361,10 @@ fn app_error_message(error: &AppError) -> Cow<'static, str> {
         "worker_crashed" => "the isolated JavaScript worker is unavailable",
         "execution_timeout" => "JavaScript execution exceeded its deadline",
         "result_too_large" => "the JavaScript result exceeds the v0 size limit",
+        "schema_unavailable" => "the offline schema index is unavailable",
+        "schema_not_found" => "the reviewed schema entry was not found",
+        "schema_version_not_found" => "the API version is not reviewed for that entry",
+        "schema_cloud_not_bound" => "the schema cloud is not bound by the context",
         "route_denied" => "the request is not in the reviewed route policy",
         "capability_denied" => "the context does not authorize that operation scope",
         "upstream_error" => "the upstream operation could not complete",
@@ -551,7 +564,7 @@ mod tests {
             worker_factory,
             Arc::new(NoClientFactory),
             "test-policy-hash",
-            "test-policy-version",
+            azmcp_core::routes::V0_POLICY_VERSION,
         )
         .unwrap()
         .with_audit_sink(Arc::new(TestAudit));
@@ -588,7 +601,7 @@ mod tests {
         let first = serde_json::to_value(AzmcpServer::tools()).unwrap();
         let second = serde_json::to_value(AzmcpServer::tools()).unwrap();
         assert_eq!(first, second);
-        assert_eq!(AzmcpServer::tools().len(), 4);
+        assert_eq!(AzmcpServer::tools().len(), 6);
         assert_eq!(AzmcpServer::tools()[0].name, ACCOUNTS_TOOL);
         for tool in AzmcpServer::tools() {
             assert_eq!(
@@ -811,7 +824,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn four_tool_lifecycle_is_explicit_and_structured() {
+    async fn tool_lifecycle_is_explicit_and_structured() {
         let (mut client, server_task) = modern_client().await;
         client
             .send(call_tool_request(1, CONTEXT_OPEN_TOOL, json!({})))

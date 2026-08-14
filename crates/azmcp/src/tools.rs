@@ -6,12 +6,17 @@ use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use azmcp_core::cloud::AzureCloud;
+use azmcp_core::{
+    cloud::AzureCloud,
+    schema::{DEFAULT_SEARCH_LIMIT, MAX_QUERY_BYTES, MAX_SEARCH_LIMIT},
+};
 
 pub const ACCOUNTS_TOOL: &str = "azure_accounts";
 pub const CONTEXT_OPEN_TOOL: &str = "azure_context_open";
 pub const CONTEXT_CLOSE_TOOL: &str = "azure_context_close";
 pub const RUN_TOOL: &str = "azure_run";
+pub const SCHEMA_SEARCH_TOOL: &str = "azure_schema_search";
+pub const SCHEMA_GET_TOOL: &str = "azure_schema_get";
 
 pub const DEFAULT_RUN_TIMEOUT_MS: u64 = 60_000;
 pub const MAX_RUN_TIMEOUT_MS: u64 = 3_600_000;
@@ -208,6 +213,54 @@ pub struct RunArgs {
     pub timeout_ms: Option<u64>,
 }
 
+/// Input for deterministic, context-scoped offline route discovery.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SchemaSearchArgs {
+    pub context_id: String,
+    pub query: String,
+    #[serde(default)]
+    pub cloud: Option<AzureCloud>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
+impl SchemaSearchArgs {
+    pub fn limit(&self) -> Result<usize, &'static str> {
+        let limit = self.limit.unwrap_or(DEFAULT_SEARCH_LIMIT as u64);
+        let limit = usize::try_from(limit).map_err(|_| "schema search limit is invalid")?;
+        if !(1..=MAX_SEARCH_LIMIT).contains(&limit)
+            || self.query.trim().is_empty()
+            || self.query.len() > MAX_QUERY_BYTES
+        {
+            return Err("schema search arguments are outside the supported range");
+        }
+        Ok(limit)
+    }
+}
+
+impl SchemaGetArgs {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.entry_id.is_empty()
+            || self.entry_id.len() > 256
+            || self.api_version.is_empty()
+            || self.api_version.len() > 64
+        {
+            return Err("schema get arguments are outside the supported range");
+        }
+        Ok(())
+    }
+}
+
+/// Input for one exact context-scoped schema entry and API version.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SchemaGetArgs {
+    pub context_id: String,
+    pub entry_id: String,
+    pub api_version: String,
+}
+
 impl RunArgs {
     pub fn timeout_ms(&self) -> Result<u64, &'static str> {
         let timeout = self.timeout_ms.unwrap_or(DEFAULT_RUN_TIMEOUT_MS);
@@ -221,10 +274,16 @@ impl RunArgs {
     }
 }
 
-/// The exact deterministic v0 catalog. The server advertises it only after all four
-/// handlers are wired in the running server.
+/// The exact deterministic catalog of implemented tools.
 pub fn catalog() -> Vec<Tool> {
-    vec![accounts(), context_open(), context_close(), run()]
+    vec![
+        accounts(),
+        context_open(),
+        context_close(),
+        run(),
+        schema_search(),
+        schema_get(),
+    ]
 }
 
 fn accounts() -> Tool {
@@ -345,6 +404,65 @@ fn run() -> Tool {
             "additionalProperties": false
         }),
         annotations(true, false, true),
+    )
+}
+
+fn schema_search() -> Tool {
+    tool(
+        SCHEMA_SEARCH_TOOL,
+        "Search the offline reviewed az.request route index for a retained context. Results include exact caller paths, API versions, policy requirements, and context executability.",
+        json!({
+            "type": "object",
+            "properties": {
+                "contextId": context_id_schema(),
+                "query": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_BYTES},
+                "cloud": cloud_schema(),
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SEARCH_LIMIT, "default": DEFAULT_SEARCH_LIMIT}
+            },
+            "required": ["contextId", "query"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "policyHash": {"type": "string", "minLength": 1, "maxLength": 256},
+                "policyVersion": {"type": "string", "minLength": 1, "maxLength": 256},
+                "query": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_BYTES},
+                "results": {"type": "array", "maxItems": MAX_SEARCH_LIMIT, "items": schema_hit_schema()},
+                "omitted": {"type": "integer", "minimum": 0}
+            },
+            "required": ["policyHash", "policyVersion", "query", "results", "omitted"],
+            "additionalProperties": false
+        }),
+        annotations(true, true, false),
+    )
+}
+
+fn schema_get() -> Tool {
+    tool(
+        SCHEMA_GET_TOOL,
+        "Get reviewed route metadata for one azure_schema_search entry and exact API version; body schemas are metadataOnly unless a checked-in fixture exists.",
+        json!({
+            "type": "object",
+            "properties": {
+                "contextId": context_id_schema(),
+                "entryId": {"type": "string", "minLength": 1, "maxLength": 256},
+                "apiVersion": {"type": "string", "minLength": 1, "maxLength": 64}
+            },
+            "required": ["contextId", "entryId", "apiVersion"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "policyHash": {"type": "string", "minLength": 1, "maxLength": 256},
+                "policyVersion": {"type": "string", "minLength": 1, "maxLength": 256},
+                "schema": schema_detail_schema()
+            },
+            "required": ["policyHash", "policyVersion", "schema"],
+            "additionalProperties": false
+        }),
+        annotations(true, true, false),
     )
 }
 
@@ -481,6 +599,99 @@ fn resolved_binding_schema() -> Value {
     })
 }
 
+fn arm_tier_schema() -> Value {
+    json!({"enum": ["inspect", "read", "write"]})
+}
+
+fn method_schema() -> Value {
+    json!({"enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]})
+}
+
+fn optional_string_schema(max_length: usize) -> Value {
+    json!({
+        "oneOf": [
+            {"type": "string", "maxLength": max_length},
+            {"type": "null"}
+        ]
+    })
+}
+
+fn access_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "executable": {"type": "boolean"},
+            "denialReason": optional_string_schema(64)
+        },
+        "required": ["executable", "denialReason"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_document_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "A bounded, embedded JSON Schema 2020-12 document.",
+        "additionalProperties": true
+    })
+}
+
+fn schema_hit_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "entryId": {"type": "string", "minLength": 1, "maxLength": 256},
+            "resourceType": {"type": "string", "minLength": 1, "maxLength": 256},
+            "operation": {"type": "string", "minLength": 1, "maxLength": 128},
+            "displayName": {"type": "string", "minLength": 1, "maxLength": 256},
+            "description": {"type": "string", "minLength": 1, "maxLength": 2048},
+            "cliEquivalent": optional_string_schema(512),
+            "cloud": cloud_schema(),
+            "method": method_schema(),
+            "pathTemplate": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "canonicalPathTemplate": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "apiVersions": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 64}},
+            "rbacAction": {"type": "string", "minLength": 1, "maxLength": 512},
+            "armTier": arm_tier_schema(),
+            "dataPlaneGrant": optional_string_schema(128),
+            "allowedQueryParameters": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+            "access": access_schema()
+        },
+        "required": ["entryId", "resourceType", "operation", "displayName", "description", "cliEquivalent", "cloud", "method", "pathTemplate", "canonicalPathTemplate", "apiVersions", "rbacAction", "armTier", "dataPlaneGrant", "allowedQueryParameters", "access"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_detail_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "entryId": {"type": "string", "minLength": 1, "maxLength": 256},
+            "resourceType": {"type": "string", "minLength": 1, "maxLength": 256},
+            "operation": {"type": "string", "minLength": 1, "maxLength": 128},
+            "displayName": {"type": "string", "minLength": 1, "maxLength": 256},
+            "description": {"type": "string", "minLength": 1, "maxLength": 2048},
+            "cliEquivalent": optional_string_schema(512),
+            "cloud": cloud_schema(),
+            "method": method_schema(),
+            "pathTemplate": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "canonicalPathTemplate": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "apiVersion": {"type": "string", "minLength": 1, "maxLength": 64},
+            "apiVersions": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 64}},
+            "rbacAction": {"type": "string", "minLength": 1, "maxLength": 512},
+            "armTier": arm_tier_schema(),
+            "dataPlaneGrant": optional_string_schema(128),
+            "allowedQueryParameters": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+            "requestBodySchema": {"oneOf": [schema_document_schema(), {"type": "null"}]},
+            "responseBodySchema": {"oneOf": [schema_document_schema(), {"type": "null"}]},
+            "schemaAvailability": {"enum": ["metadataOnly", "full"]},
+            "access": access_schema()
+        },
+        "required": ["entryId", "resourceType", "operation", "displayName", "description", "cliEquivalent", "cloud", "method", "pathTemplate", "canonicalPathTemplate", "apiVersion", "apiVersions", "rbacAction", "armTier", "dataPlaneGrant", "allowedQueryParameters", "requestBodySchema", "responseBodySchema", "schemaAvailability", "access"],
+        "additionalProperties": false
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,10 +700,10 @@ mod tests {
     fn catalog_is_deterministic_modern_and_ref_free() {
         let first = serde_json::to_value(catalog()).unwrap();
         assert_eq!(first, serde_json::to_value(catalog()).unwrap());
-        assert_eq!(catalog().len(), 4);
+        assert_eq!(catalog().len(), 6);
         let encoded = serde_json::to_string(&first).unwrap();
         assert!(!encoded.contains("$ref"));
-        assert_eq!(encoded.matches("2020-12").count(), 8);
+        assert_eq!(encoded.matches("2020-12").count(), 14);
     }
 
     #[test]
@@ -506,6 +717,21 @@ mod tests {
         assert!(
             serde_json::from_value::<ContextCloseArgs>(json!({"contextId": "x", "force": true}))
                 .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SchemaSearchArgs>(json!({
+                "contextId": "x",
+                "query": "provider",
+                "future": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SchemaGetArgs>(json!({
+                "contextId": "x",
+                "entryId": "provider"
+            }))
+            .is_err()
         );
     }
 

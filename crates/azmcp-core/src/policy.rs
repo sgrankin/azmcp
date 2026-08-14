@@ -133,6 +133,11 @@ impl ReviewedRoute {
         &self.template.source
     }
 
+    /// The exact API versions reviewed for this route.
+    pub fn api_versions(&self) -> &[String] {
+        &self.api_versions
+    }
+
     /// The reviewed RBAC operation name.
     pub fn rbac_action(&self) -> &str {
         &self.rbac_action
@@ -141,6 +146,11 @@ impl ReviewedRoute {
     /// The required ARM tier.
     pub fn tier(&self) -> ArmTier {
         self.tier
+    }
+
+    /// The exact query parameter names reviewed for this route.
+    pub fn allowed_query_parameters(&self) -> &[String] {
+        &self.allowed_query_parameters
     }
 
     fn matches(
@@ -193,6 +203,11 @@ impl PolicyBundle {
     /// The immutable bundle version or content hash.
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    /// Every reviewed route in this immutable bundle.
+    pub fn routes(&self) -> &[ReviewedRoute] {
+        &self.routes
     }
 
     /// Classify a request by its most-specific reviewed route.

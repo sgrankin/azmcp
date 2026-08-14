@@ -594,7 +594,24 @@ impl HostAdapter {
         {
             return Err(HostError::invalid());
         }
-        let target_text = format!("/subscriptions/{}{}", binding.subscription_id(), relative);
+        // `az.request` joins ordinary paths below the selected subscription.
+        // The root path is the one exception: preserve its query, if any,
+        // without introducing a trailing slash that ARM treats as a different
+        // target.
+        let relative_text = relative.to_string();
+        let target_text = if relative.path() == "/" {
+            format!(
+                "/subscriptions/{}{}",
+                binding.subscription_id(),
+                relative_text.strip_prefix('/').unwrap_or_default()
+            )
+        } else {
+            format!(
+                "/subscriptions/{}{}",
+                binding.subscription_id(),
+                relative_text
+            )
+        };
         let target =
             RelativeRequestTarget::parse(&target_text).map_err(|_| HostError::invalid())?;
         let client = self.client_for(&binding)?;
@@ -1311,6 +1328,42 @@ mod tests {
         assert_eq!(smuggled.unwrap_err().code, HostErrorCode::InvalidRequest);
         assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn subscription_root_request_does_not_add_a_trailing_slash() {
+        let (origin, server_task) = server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+        )
+        .await;
+        let factory = Arc::new(TestFactory {
+            credentials: Arc::new(FakeCredentials::default()),
+            origins: [(AzureCloud::AzureCloud, origin)].into_iter().collect(),
+            policy: policy(),
+        });
+        let context = context(
+            GraphScope::Subscriptions(vec![SubscriptionId::new(SUBSCRIPTION).unwrap()]),
+            false,
+        );
+        let adapter = HostAdapter::new(&context, factory);
+        let value = adapter
+            .dispatch(
+                HOST_METHOD_REQUEST,
+                json!({
+                    "cloud": "AzureCloud",
+                    "method": "GET",
+                    "path": "/",
+                    "apiVersion": azmcp_core::routes::SUBSCRIPTIONS_API_VERSION
+                }),
+            )
+            .await
+            .expect("subscription root");
+        assert_eq!(value["body"], json!({"ok": true}));
+        let request = String::from_utf8(server_task.await.expect("server")).expect("request");
+        assert!(
+            request.starts_with(&format!("GET /subscriptions/{SUBSCRIPTION}?api-version=")),
+            "{request}"
+        );
     }
 
     #[tokio::test]

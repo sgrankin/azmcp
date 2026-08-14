@@ -8,4 +8,5 @@ pub mod credential;
 pub mod http;
 pub mod policy;
 pub mod routes;
+pub mod schema;
 pub mod target;

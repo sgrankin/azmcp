@@ -15,6 +15,12 @@ v0 is deliberately small. It exposes:
 - `azure_context_open`
 - `azure_run`
 - `azure_context_close`
+- `azure_schema_search`
+- `azure_schema_get`
+
+Schema discovery is offline and tied to the reviewed `az.request` policy. The
+bootstrap catalog currently returns route metadata with `metadataOnly` body
+schemas because no response fixtures are checked in.
 
 Inside `azure_run`, JavaScript has only `console`, `az.request`, and `az.graph`.
 There is no `fetch`, `Deno`, token access, ambient cloud, or ambient

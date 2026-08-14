@@ -32,6 +32,7 @@ pub async fn production_application() -> anyhow::Result<Application> {
         anyhow::bail!("Azure CLI agent-session attribution is unavailable");
     }
     let policy = routes::v0_policy()?;
+    let schema_index = Arc::new(azmcp_core::schema::SchemaIndex::v0(&policy)?);
     let clients: Arc<dyn HttpClientFactory> =
         Arc::new(ReviewedHttpClientFactory::new(broker, policy.clone()));
     let audit: Arc<dyn AuditSink> = Arc::new(FileAuditLog::new(audit_config()?));
@@ -42,13 +43,14 @@ pub async fn production_application() -> anyhow::Result<Application> {
             policy.version(),
         ),
     );
-    let application = Application::from_arcs_with_host_clients(
+    let application = Application::from_arcs_with_host_clients_and_schema(
         config,
         default_registry()?,
         Arc::new(profile),
         validator,
         Arc::new(worker),
         clients,
+        schema_index,
         routes::V0_POLICY_VERSION,
         policy.version(),
     )?

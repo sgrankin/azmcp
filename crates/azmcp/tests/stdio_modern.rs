@@ -115,7 +115,7 @@ fn built_server_uses_standard_paths_for_modern_synthetic_accounts() {
             .as_array()
             .unwrap_or_else(|| panic!("tools/list response: {}", responses[&2]))
             .len(),
-        4
+        6
     );
     assert_eq!(
         responses[&3]["result"]["structuredContent"]["accounts"][0]["subscriptionId"],

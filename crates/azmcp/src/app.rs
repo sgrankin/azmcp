@@ -28,6 +28,7 @@ use azmcp_core::{
     http::{HttpError, HttpRequest},
     policy::{HttpMethod, RoutePurpose},
     routes::SUBSCRIPTIONS_API_VERSION,
+    schema::{SchemaDetails, SchemaError, SchemaIndex, SchemaSearchHit},
     target::RelativeRequestTarget,
 };
 use serde::Serialize;
@@ -39,7 +40,7 @@ use crate::{
     host::{CallDecision, CallRecord, CallRecords, HostAdapter, HttpClientFactory},
     tools::{
         AccountsArgs, ContextCloseArgs, ContextOpenArgs, GraphScopeArgs, GraphSubscriptionsArgs,
-        RunArgs,
+        RunArgs, SchemaGetArgs, SchemaSearchArgs,
     },
     worker::{ExecutionResult, HostCallHandler, ResultTooLargeSummary, WorkerProcess},
 };
@@ -279,6 +280,10 @@ pub enum AppErrorCode {
     ResultTooLarge,
     ExecutionTimeout,
     ExecutionFailed,
+    SchemaUnavailable,
+    SchemaNotFound,
+    SchemaVersionNotFound,
+    SchemaCloudNotBound,
 }
 
 impl AppErrorCode {
@@ -311,6 +316,10 @@ impl AppErrorCode {
             Self::ResultTooLarge => "result_too_large",
             Self::ExecutionTimeout => "execution_timeout",
             Self::ExecutionFailed => "invalid_request",
+            Self::SchemaUnavailable => "schema_unavailable",
+            Self::SchemaNotFound => "schema_not_found",
+            Self::SchemaVersionNotFound => "schema_version_not_found",
+            Self::SchemaCloudNotBound => "schema_cloud_not_bound",
         }
     }
 }
@@ -482,6 +491,26 @@ pub struct RunResult {
     pub correlation_id: String,
 }
 
+/// Bounded metadata returned by context-scoped schema search.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaSearchResult {
+    pub policy_hash: String,
+    pub policy_version: String,
+    pub query: String,
+    pub results: Vec<SchemaSearchHit>,
+    pub omitted: usize,
+}
+
+/// Full reviewed route metadata returned by schema get.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaGetResult {
+    pub policy_hash: String,
+    pub policy_version: String,
+    pub schema: SchemaDetails,
+}
+
 /// A small in-memory profile source useful for tests and embedding callers that
 /// already own a synthetic profile.  It never reads a filesystem path.
 #[derive(Clone, Debug)]
@@ -625,6 +654,7 @@ struct ApplicationInner {
     binding_validator: Arc<dyn BindingValidator>,
     worker_factory: Arc<dyn WorkerFactory>,
     host_client_factory: Option<Arc<dyn HttpClientFactory>>,
+    schema_index: Arc<SchemaIndex>,
     workers: Mutex<HashMap<String, Arc<WorkerSlot>>>,
 }
 
@@ -760,7 +790,7 @@ impl WorkerSlot {
     }
 }
 
-/// Stateful orchestration for the four v0 application tools.
+/// Stateful orchestration for the v0 application tools.
 #[derive(Clone)]
 pub struct Application {
     inner: Arc<ApplicationInner>,
@@ -828,6 +858,7 @@ impl Application {
         policy_hash: impl Into<String>,
         policy_version: impl Into<String>,
     ) -> Result<Self, AppError> {
+        let schema_index = default_schema_index()?;
         Self::from_parts(
             config,
             registry,
@@ -835,6 +866,7 @@ impl Application {
             binding_validator,
             worker_factory,
             None,
+            schema_index,
             policy_hash.into(),
             policy_version.into(),
         )
@@ -852,6 +884,7 @@ impl Application {
         policy_hash: impl Into<String>,
         policy_version: impl Into<String>,
     ) -> Result<Self, AppError> {
+        let schema_index = default_schema_index()?;
         Self::from_parts(
             config,
             registry,
@@ -859,6 +892,34 @@ impl Application {
             binding_validator,
             worker_factory,
             Some(host_client_factory),
+            schema_index,
+            policy_hash.into(),
+            policy_version.into(),
+        )
+    }
+
+    /// Construct a fully executable application with an explicitly aligned
+    /// offline schema index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_arcs_with_host_clients_and_schema(
+        config: Config,
+        registry: ContextRegistry,
+        profile_source: Arc<dyn ProfileSource>,
+        binding_validator: Arc<dyn BindingValidator>,
+        worker_factory: Arc<dyn WorkerFactory>,
+        host_client_factory: Arc<dyn HttpClientFactory>,
+        schema_index: Arc<SchemaIndex>,
+        policy_hash: impl Into<String>,
+        policy_version: impl Into<String>,
+    ) -> Result<Self, AppError> {
+        Self::from_parts(
+            config,
+            registry,
+            profile_source,
+            binding_validator,
+            worker_factory,
+            Some(host_client_factory),
+            schema_index,
             policy_hash.into(),
             policy_version.into(),
         )
@@ -872,6 +933,7 @@ impl Application {
         binding_validator: Arc<dyn BindingValidator>,
         worker_factory: Arc<dyn WorkerFactory>,
         host_client_factory: Option<Arc<dyn HttpClientFactory>>,
+        schema_index: Arc<SchemaIndex>,
         policy_hash: String,
         policy_version: String,
     ) -> Result<Self, AppError> {
@@ -891,6 +953,7 @@ impl Application {
                 binding_validator,
                 worker_factory,
                 host_client_factory,
+                schema_index,
                 workers: Mutex::new(HashMap::new()),
             }),
             audit_sink: None,
@@ -933,6 +996,66 @@ impl Application {
             .map(account_result)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(AccountsResult { accounts })
+    }
+
+    /// Search reviewed request metadata without acquiring credentials or
+    /// touching the worker or HTTP client.
+    pub async fn schema_search(
+        &self,
+        args: SchemaSearchArgs,
+    ) -> Result<SchemaSearchResult, AppError> {
+        let limit = args
+            .limit()
+            .map_err(|_| AppError::new(AppErrorCode::InvalidInput))?;
+        let id = parse_context_id(&args.context_id)?;
+        self.reap_expired_workers(Instant::now()).await;
+        let lease = match self.inner.registry.lease(id.as_str(), Instant::now()) {
+            Ok(lease) => lease,
+            Err(ContextRegistryError::ContextEvicted) => {
+                let _ = self.close_worker(&id).await;
+                return Err(AppError::new(AppErrorCode::ContextEvicted));
+            }
+            Err(error) => return Err(map_registry_error(error)),
+        };
+        let result = self
+            .inner
+            .schema_index
+            .search(lease.context(), &args.query, args.cloud, limit)
+            .map_err(map_schema_error)?;
+        Ok(SchemaSearchResult {
+            policy_hash: lease.context().policy_hash().to_owned(),
+            policy_version: result.policy_version,
+            query: args.query,
+            results: result.results,
+            omitted: result.omitted,
+        })
+    }
+
+    /// Get one exact reviewed request entry and API version without any Azure
+    /// or worker activity.
+    pub async fn schema_get(&self, args: SchemaGetArgs) -> Result<SchemaGetResult, AppError> {
+        args.validate()
+            .map_err(|_| AppError::new(AppErrorCode::InvalidInput))?;
+        let id = parse_context_id(&args.context_id)?;
+        self.reap_expired_workers(Instant::now()).await;
+        let lease = match self.inner.registry.lease(id.as_str(), Instant::now()) {
+            Ok(lease) => lease,
+            Err(ContextRegistryError::ContextEvicted) => {
+                let _ = self.close_worker(&id).await;
+                return Err(AppError::new(AppErrorCode::ContextEvicted));
+            }
+            Err(error) => return Err(map_registry_error(error)),
+        };
+        let schema = self
+            .inner
+            .schema_index
+            .get(lease.context(), &args.entry_id, &args.api_version)
+            .map_err(map_schema_error)?;
+        Ok(SchemaGetResult {
+            policy_hash: lease.context().policy_hash().to_owned(),
+            policy_version: self.inner.schema_index.policy_version().to_owned(),
+            schema,
+        })
     }
 
     /// Open a persistent context and its one worker.
@@ -1604,6 +1727,30 @@ fn map_registry_error(error: ContextRegistryError) -> AppError {
     })
 }
 
+fn default_schema_index() -> Result<Arc<SchemaIndex>, AppError> {
+    let policy = azmcp_core::routes::v0_policy()
+        .map_err(|_| AppError::new(AppErrorCode::InvalidConfiguration))?;
+    let index =
+        SchemaIndex::v0(&policy).map_err(|_| AppError::new(AppErrorCode::InvalidConfiguration))?;
+    Ok(Arc::new(index))
+}
+
+fn map_schema_error(error: SchemaError) -> AppError {
+    AppError::new(match error {
+        SchemaError::InvalidQuery
+        | SchemaError::InvalidLimit
+        | SchemaError::UnrepresentablePath => AppErrorCode::InvalidInput,
+        SchemaError::CloudNotBound => AppErrorCode::SchemaCloudNotBound,
+        SchemaError::EntryNotFound => AppErrorCode::SchemaNotFound,
+        SchemaError::ApiVersionNotFound => AppErrorCode::SchemaVersionNotFound,
+        SchemaError::PolicyMismatch
+        | SchemaError::DuplicateEntry
+        | SchemaError::UnreviewedSource
+        | SchemaError::MissingSource
+        | SchemaError::InvalidSchema => AppErrorCode::SchemaUnavailable,
+    })
+}
+
 fn map_worker_dependency(error: DependencyError) -> AppError {
     match error {
         DependencyError::ExecutionFailed => AppError::new(AppErrorCode::ExecutionFailed),
@@ -2080,6 +2227,60 @@ mod tests {
             lease.context().binding_sources()[&AzureCloud::AzureCloud],
             BindingSource::ContextOverride
         );
+    }
+
+    #[tokio::test]
+    async fn schema_discovery_is_offline_and_context_scoped() {
+        let state = state(None);
+        let application = Application::from_arcs(
+            Config::empty(),
+            default_registry().expect("registry"),
+            Arc::new(MemoryProfileSource::new(b"not a profile".to_vec())),
+            Arc::new(Validator::default()),
+            factory(Arc::clone(&state)),
+            DEFAULT_POLICY_HASH,
+            DEFAULT_POLICY_VERSION,
+        )
+        .expect("application");
+        let mut open = ContextOpenArgs::default();
+        open.bindings.commercial = Some(crate::tools::BindingArgs {
+            subscription: SUB.to_owned(),
+            tenant: Some(TENANT.to_owned()),
+        });
+        let opened = application.context_open(open).await.expect("context");
+        assert_eq!(state.starts.load(Ordering::SeqCst), 1);
+
+        let search = application
+            .schema_search(SchemaSearchArgs {
+                context_id: opened.context_id.clone(),
+                query: "provider".to_owned(),
+                cloud: None,
+                limit: None,
+            })
+            .await
+            .expect("schema search");
+        assert_eq!(search.policy_version, DEFAULT_POLICY_VERSION);
+        assert_eq!(search.results.len(), 1);
+        assert_eq!(search.results[0].path_template, "/providers/{namespace}");
+        assert!(search.results[0].access.executable);
+
+        let details = application
+            .schema_get(SchemaGetArgs {
+                context_id: opened.context_id.clone(),
+                entry_id: "AzureCloud.providers.get".to_owned(),
+                api_version: azmcp_core::routes::PROVIDERS_API_VERSION.to_owned(),
+            })
+            .await
+            .expect("schema get");
+        assert_eq!(details.schema.schema_availability, "metadataOnly");
+        assert!(details.schema.response_body_schema.is_none());
+        assert_eq!(state.starts.load(Ordering::SeqCst), 1);
+        application
+            .context_close(ContextCloseArgs {
+                context_id: opened.context_id,
+            })
+            .await
+            .expect("close");
     }
 
     #[tokio::test]
