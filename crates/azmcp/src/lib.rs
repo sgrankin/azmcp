@@ -59,9 +59,12 @@ pub struct AzmcpServer {
 }
 
 impl AzmcpServer {
-    /// Construct a server only when both JavaScript host operations are real.
+    /// Construct a server only when every advertised host operation is real.
     pub fn new(application: Application) -> Result<Self, ServerConfigurationError> {
-        if !application.host_calls_ready() || !application.audit_ready() {
+        if !application.host_calls_ready()
+            || !application.audit_ready()
+            || !application.artifact_writes_ready()
+        {
             return Err(ServerConfigurationError);
         }
         Ok(Self { application })
@@ -91,7 +94,9 @@ impl AzmcpServer {
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
-#[error("the v0 server requires semantic Azure host calls and a durable audit sink")]
+#[error(
+    "the v0 server requires semantic Azure host calls, a durable audit sink, and managed artifact storage"
+)]
 pub struct ServerConfigurationError;
 
 impl ServerHandler for AzmcpServer {
@@ -636,7 +641,13 @@ mod tests {
             azmcp_core::routes::V0_POLICY_VERSION,
         )
         .unwrap()
-        .with_audit_sink(Arc::new(TestAudit));
+        .with_audit_sink(Arc::new(TestAudit))
+        .with_artifact_store(Arc::new(
+            crate::artifacts::FileArtifactStore::new(
+                std::env::temp_dir().join("azmcp-lib-test-artifacts"),
+            )
+            .expect("artifact store"),
+        ));
         AzmcpServer::new(application).unwrap()
     }
 
@@ -663,6 +674,25 @@ mod tests {
         assert!(first.capabilities.prompts.is_none());
         assert!(first.capabilities.resources.is_none());
         assert!(first.capabilities.logging.is_none());
+    }
+
+    #[test]
+    fn server_rejects_an_unavailable_managed_artifact_writer() {
+        let application = Application::from_arcs_with_host_clients(
+            Config::empty(),
+            default_registry().expect("registry"),
+            Arc::new(MemoryProfileSource::new(
+                br#"{"subscriptions":[{"id":"11111111-1111-1111-1111-111111111111","name":"synthetic","state":"Enabled","tenantId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","environmentName":"AzureCloud","user":{"name":"test@example.invalid"}}]}"#.to_vec(),
+            )),
+            Arc::new(AllowValidator),
+            Arc::new(TestWorkerFactory),
+            Arc::new(NoClientFactory),
+            crate::app::DEFAULT_POLICY_HASH,
+            azmcp_core::routes::V0_POLICY_VERSION,
+        )
+        .expect("application")
+        .with_audit_sink(Arc::new(TestAudit));
+        assert!(AzmcpServer::new(application).is_err());
     }
 
     #[test]

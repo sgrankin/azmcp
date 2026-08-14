@@ -13,6 +13,7 @@ use crate::{
         Application, FileProfileSource, HttpBindingValidator, ProcessWorkerFactory,
         default_registry,
     },
+    artifacts::{ArtifactStore, FileArtifactStore},
     audit::{
         AuditSink, DEFAULT_MAX_AUDIT_BYTES, DEFAULT_RETAINED_AUDIT_FILES, FileAuditConfig,
         FileAuditLog,
@@ -22,6 +23,8 @@ use crate::{
 
 pub async fn production_application() -> anyhow::Result<Application> {
     let config = load_config().await?;
+    let artifact_store: Arc<dyn ArtifactStore> =
+        Arc::new(FileArtifactStore::new(artifact_root(&config)?)?);
     let profile = FileProfileSource::new(azure_profile_path()?);
     let worker = ProcessWorkerFactory::new(std::env::current_exe()?);
     let broker = Arc::new(AzureCliBroker::new(
@@ -54,8 +57,19 @@ pub async fn production_application() -> anyhow::Result<Application> {
         routes::V0_POLICY_HASH,
         policy.version(),
     )?
-    .with_audit_sink(audit);
+    .with_audit_sink(audit)
+    .with_artifact_store(artifact_store);
     Ok(application)
+}
+
+fn artifact_root(config: &Config) -> anyhow::Result<PathBuf> {
+    if let Some(root) = config.artifacts().root() {
+        return Ok(root.to_path_buf());
+    }
+    if let Some(root) = nonempty_env_path("XDG_DATA_HOME")? {
+        return Ok(root.join("azmcp/artifacts"));
+    }
+    Ok(home_dir()?.join(".local/share/azmcp/artifacts"))
 }
 
 fn audit_config() -> anyhow::Result<FileAuditConfig> {

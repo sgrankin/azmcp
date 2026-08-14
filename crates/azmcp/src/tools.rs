@@ -25,7 +25,7 @@ pub const RUN_TOOL: &str = "azure_run";
 pub const SCHEMA_SEARCH_TOOL: &str = "azure_schema_search";
 pub const SCHEMA_GET_TOOL: &str = "azure_schema_get";
 pub const LOGS_QUERY_DATA_PLANE: &str = "logs.query";
-pub const ARTIFACT_WRITE_LOCAL_CAPABILITY: &str = "artifacts.write";
+pub const ARTIFACT_WRITE_LOCAL_CAPABILITY: &str = azmcp_core::context::ARTIFACTS_WRITE_CAPABILITY;
 
 pub const DEFAULT_RUN_TIMEOUT_MS: u64 = 60_000;
 pub const MAX_RUN_TIMEOUT_MS: u64 = 3_600_000;

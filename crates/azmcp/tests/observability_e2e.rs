@@ -12,7 +12,8 @@ use azmcp::{
         Application, HttpBindingValidator, MemoryProfileSource, ProcessWorkerFactory,
         default_registry,
     },
-    audit::{AuditError, AuditSink},
+    artifacts::FileArtifactStore,
+    audit::{ArtifactWriteAuditRecord, AuditError, AuditSink},
     host::{CallDecision, CallRecord, ClientFactoryError, HttpClientFactory},
     tools::{CONTEXT_CLOSE_TOOL, CONTEXT_OPEN_TOOL, RUN_TOOL},
 };
@@ -74,6 +75,7 @@ impl CredentialProvider for FakeCredentials {
 struct MemoryAudit {
     prepares: AtomicUsize,
     records: Mutex<Vec<CallRecord>>,
+    artifact_records: Mutex<Vec<ArtifactWriteAuditRecord>>,
 }
 
 impl AuditSink for MemoryAudit {
@@ -92,8 +94,12 @@ impl AuditSink for MemoryAudit {
 
     fn append_artifact(
         &self,
-        _record: &azmcp::audit::ArtifactWriteAuditRecord,
+        record: &azmcp::audit::ArtifactWriteAuditRecord,
     ) -> Result<(), AuditError> {
+        self.artifact_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(record.clone());
         Ok(())
     }
 }
@@ -155,6 +161,11 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
     let audit = Arc::new(MemoryAudit::default());
     let policy = routes::v0_policy().expect("reviewed policy");
     let schema = Arc::new(SchemaIndex::v0(&policy).expect("aligned schema"));
+    let artifact_directory = tempfile::tempdir().expect("synthetic artifact directory");
+    let artifact_root = artifact_directory.path().join("artifacts");
+    let artifact_store =
+        Arc::new(FileArtifactStore::new(&artifact_root).expect("synthetic artifact store"));
+    assert!(!artifact_root.exists());
 
     let (origin, upstream) = synthetic_upstream().await;
     let credential_provider: Arc<dyn CredentialProvider> = credentials.clone();
@@ -183,7 +194,8 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         policy.version(),
     )
     .expect("synthetic application")
-    .with_audit_sink(audit_sink);
+    .with_audit_sink(audit_sink)
+    .with_artifact_store(artifact_store);
     let server = AzmcpServer::new(application).expect("executable server");
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
@@ -203,6 +215,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
             CONTEXT_OPEN_TOOL,
             json!({
                 "dataPlanes": ["logs.query"],
+                "localCapabilities": ["artifacts.write"],
                 "logsScopes": {"AzureCloud": {"scope": "allAccessible"}}
             }),
         ))
@@ -213,6 +226,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
     let opened = opened.structured_content.expect("context result");
     let context_id = opened["contextId"].as_str().expect("context id").to_owned();
     assert_eq!(opened["dataPlanes"], json!(["logs.query"]));
+    assert_eq!(opened["localCapabilities"], json!(["artifacts.write"]));
     assert_eq!(
         opened["logsScopes"],
         json!({"AzureCloud": {"scope": "allAccessible"}})
@@ -237,7 +251,10 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
       timespan: "PT1H"
     }})
   ]);
-  return {{metrics, logs}};
+  return await az.artifacts.writeJson({{
+    name: "observability.json",
+    value: {{metrics, logs}}
+  }});
 }})()
 "#
     );
@@ -252,9 +269,21 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
     let ran = receive_tool_result(&mut client, 2).await;
     assert_eq!(ran.is_error, Some(false));
     let ran = ran.structured_content.expect("run result");
-    assert_eq!(ran["value"]["metrics"]["body"]["kind"], "synthetic-metrics");
-    assert_eq!(ran["value"]["metrics"]["body"]["value"][0]["average"], 12.5);
-    assert_eq!(ran["value"]["logs"]["tables"][0]["rows"][0], json!([17]));
+    let artifact_path = std::path::PathBuf::from(
+        ran["value"]["path"]
+            .as_str()
+            .expect("artifact receipt path"),
+    );
+    assert!(artifact_path.starts_with(&artifact_root));
+    assert_eq!(ran["value"]["mediaType"], "application/json");
+    assert_eq!(ran["value"]["sensitivity"], "customerData");
+    let artifact_bytes = std::fs::read(&artifact_path).expect("artifact bytes");
+    assert_eq!(artifact_bytes.last(), Some(&b'\n'));
+    assert_eq!(ran["value"]["bytes"], artifact_bytes.len());
+    let artifact: Value = serde_json::from_slice(&artifact_bytes).expect("artifact JSON");
+    assert_eq!(artifact["metrics"]["body"]["kind"], "synthetic-metrics");
+    assert_eq!(artifact["metrics"]["body"]["value"][0]["average"], 12.5);
+    assert_eq!(artifact["logs"]["tables"][0]["rows"][0], json!([17]));
     assert_eq!(ran["callsOmitted"], 0);
     assert_eq!(ran["calls"].as_array().map(Vec::len), Some(2));
     let metrics_call = call(&ran, "az.metrics.single");
@@ -322,6 +351,10 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         evicted.structured_content.expect("domain error")["code"],
         "context_evicted"
     );
+    assert_eq!(
+        std::fs::read(&artifact_path).expect("artifact survives context close"),
+        artifact_bytes
+    );
 
     let token_requests = credentials
         .requests
@@ -356,7 +389,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         request.audience == TokenAudience::LogAnalytics
             && request.resource() == "https://api.loganalytics.io"
     }));
-    assert_eq!(audit.prepares.load(Ordering::SeqCst), 3);
+    assert_eq!(audit.prepares.load(Ordering::SeqCst), 4);
     let records = audit
         .records
         .lock()
@@ -386,6 +419,30 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
     let encoded_audit = serde_json::to_string(&records).expect("audit JSON");
     for secret in [TOKEN, METRIC, KQL, WORKSPACE, "e2e-rg", "e2e-vm"] {
         assert!(!encoded_audit.contains(secret), "audit disclosed {secret}");
+    }
+    let artifact_records = audit
+        .artifact_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(artifact_records.len(), 1);
+    assert_eq!(artifact_records[0].operation, "az.artifacts.writeJson");
+    assert_eq!(artifact_records[0].bytes, artifact_bytes.len());
+    assert_eq!(artifact_records[0].sensitivity, "customerData");
+    assert_eq!(artifact_records[0].correlation_id, ran["correlationId"]);
+    let encoded_artifact_audit =
+        serde_json::to_string(&artifact_records).expect("artifact audit JSON");
+    for secret in [
+        "observability.json",
+        METRIC,
+        KQL,
+        WORKSPACE,
+        artifact_path.to_string_lossy().as_ref(),
+    ] {
+        assert!(
+            !encoded_artifact_audit.contains(secret),
+            "artifact audit disclosed {secret}"
+        );
     }
 
     let requests = tokio::time::timeout(Duration::from_secs(5), upstream)

@@ -23,6 +23,7 @@ fn built_server_uses_standard_paths_for_modern_synthetic_accounts() {
     let config = directory.path().join(".config/azmcp/config.toml");
     let profile = directory.path().join(".azure/azureProfile.json");
     let audit = directory.path().join(".local/state/azmcp/requests.jsonl");
+    let artifacts = directory.path().join(".local/share/azmcp/artifacts");
     let az_marker = directory.path().join("fake-az-invoked");
     let fake_az = directory.path().join("fake-az");
     fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
@@ -128,5 +129,9 @@ fn built_server_uses_standard_paths_for_modern_synthetic_accounts() {
     assert!(
         !audit.exists(),
         "startup and profile-only discovery must not create request logs"
+    );
+    assert!(
+        !artifacts.exists(),
+        "startup and profile-only discovery must not create artifact storage"
     );
 }
