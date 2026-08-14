@@ -89,7 +89,11 @@ pub struct ResultTooLargeSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keys_omitted: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub keys_sampled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub counts: Option<BTreeMap<String, usize>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counts_omitted: Option<usize>,
 }
 
 impl ResultTooLargeSummary {
@@ -97,13 +101,24 @@ impl ResultTooLargeSummary {
     /// value. Object keys are retained because they describe the shape, while
     /// all object and array values are intentionally omitted.
     pub fn from_json(value: &Value, encoded_bytes: usize, limit_bytes: usize) -> Self {
-        let (value_type, length, key_count, keys, keys_omitted, counts) = match value {
-            Value::Null => ("null", None, None, None, None, None),
-            Value::Bool(_) => ("boolean", None, None, None, None, None),
-            Value::Number(_) => ("number", None, None, None, None, None),
+        let (
+            value_type,
+            length,
+            key_count,
+            keys,
+            keys_omitted,
+            keys_sampled,
+            counts,
+            counts_omitted,
+        ) = match value {
+            Value::Null => ("null", None, None, None, None, None, None, None),
+            Value::Bool(_) => ("boolean", None, None, None, None, None, None, None),
+            Value::Number(_) => ("number", None, None, None, None, None, None, None),
             Value::String(value) => (
                 "string",
                 Some(value.chars().count()),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -115,16 +130,19 @@ impl ResultTooLargeSummary {
                 None,
                 None,
                 None,
-                Some(type_counts(values.iter())),
+                None,
+                Some(type_counts(values.iter().take(MAX_RESULT_SUMMARY_KEYS))),
+                (values.len() > MAX_RESULT_SUMMARY_KEYS)
+                    .then_some(values.len() - MAX_RESULT_SUMMARY_KEYS),
             ),
             Value::Object(values) => {
                 let key_count = values.len();
                 let mut keys = values
                     .keys()
+                    .take(MAX_RESULT_SUMMARY_KEYS)
                     .map(|key| truncate_utf8(key, MAX_RESULT_SUMMARY_KEY_BYTES))
                     .collect::<Vec<_>>();
                 keys.sort_unstable();
-                keys.truncate(MAX_RESULT_SUMMARY_KEYS);
                 let keys_omitted = key_count.saturating_sub(keys.len());
                 (
                     "object",
@@ -132,7 +150,10 @@ impl ResultTooLargeSummary {
                     Some(key_count),
                     Some(keys),
                     (keys_omitted > 0).then_some(keys_omitted),
-                    Some(type_counts(values.values())),
+                    (keys_omitted > 0).then_some(true),
+                    Some(type_counts(values.values().take(MAX_RESULT_SUMMARY_KEYS))),
+                    (key_count > MAX_RESULT_SUMMARY_KEYS)
+                        .then_some(key_count.saturating_sub(MAX_RESULT_SUMMARY_KEYS)),
                 )
             }
         };
@@ -145,9 +166,118 @@ impl ResultTooLargeSummary {
             key_count,
             keys,
             keys_omitted,
+            keys_sampled,
             counts,
+            counts_omitted,
         }
     }
+}
+
+fn validate_result_too_large_summary(summary: &ResultTooLargeSummary) -> Result<(), String> {
+    const MAX_SUMMARY_TYPES: usize = 6;
+    if summary.value_type.len() > MAX_ERROR_BYTES
+        || !matches!(
+            summary.value_type.as_str(),
+            "null" | "boolean" | "number" | "string" | "array" | "object"
+        )
+        || summary.limit_bytes != MAX_RESULT_BYTES
+        || summary.encoded_bytes <= summary.limit_bytes
+        || summary.encoded_bytes > MAX_HEAP_BYTES
+    {
+        return Err("invalid result_too_large summary bounds".to_owned());
+    }
+
+    let key_count = summary.key_count;
+    if summary.keys.as_ref().is_some_and(|keys| {
+        keys.len() > MAX_RESULT_SUMMARY_KEYS
+            || keys
+                .iter()
+                .any(|key| key.len() > MAX_RESULT_SUMMARY_KEY_BYTES)
+    }) {
+        return Err("invalid result_too_large summary keys".to_owned());
+    }
+    if summary.keys_omitted.is_some() && (key_count.is_none() || summary.keys.is_none()) {
+        return Err("invalid result_too_large summary omitted keys".to_owned());
+    }
+    if let (Some(omitted), Some(key_count), Some(keys)) =
+        (summary.keys_omitted, key_count, summary.keys.as_ref())
+        && omitted > key_count.saturating_sub(keys.len())
+    {
+        return Err("invalid result_too_large summary key count".to_owned());
+    }
+    if summary.keys_sampled.is_some() != summary.keys_omitted.is_some() {
+        return Err("invalid result_too_large summary key sampling".to_owned());
+    }
+
+    let cardinality = match summary.value_type.as_str() {
+        "array" | "string" => summary.length,
+        "object" => summary.key_count,
+        _ => None,
+    };
+    if summary.value_type == "object" {
+        if summary.length.is_some() || summary.key_count.is_none() || summary.keys.is_none() {
+            return Err("invalid result_too_large object summary".to_owned());
+        }
+    } else if summary.value_type == "array" || summary.value_type == "string" {
+        if summary.length.is_none()
+            || summary.key_count.is_some()
+            || summary.keys.is_some()
+            || summary.keys_omitted.is_some()
+            || summary.keys_sampled.is_some()
+        {
+            return Err("invalid result_too_large sequence summary".to_owned());
+        }
+    } else if summary.length.is_some()
+        || summary.key_count.is_some()
+        || summary.keys.is_some()
+        || summary.keys_omitted.is_some()
+        || summary.keys_sampled.is_some()
+        || summary.counts.is_some()
+        || summary.counts_omitted.is_some()
+    {
+        return Err("invalid result_too_large scalar summary".to_owned());
+    }
+
+    if cardinality.is_some_and(|count| count > MAX_HEAP_BYTES) {
+        return Err("invalid result_too_large summary cardinality".to_owned());
+    }
+    if summary.counts.as_ref().is_some_and(|counts| {
+        counts.len() > MAX_SUMMARY_TYPES
+            || counts.iter().any(|(value_type, count)| {
+                !matches!(
+                    value_type.as_str(),
+                    "null" | "boolean" | "number" | "string" | "array" | "object"
+                ) || cardinality.is_some_and(|limit| *count > limit)
+            })
+    }) {
+        return Err("invalid result_too_large summary counts".to_owned());
+    }
+    let counted = summary
+        .counts
+        .as_ref()
+        .map(|counts| counts.values().copied().sum::<usize>());
+    if summary.counts_omitted.is_some() && counted.is_none() {
+        return Err("invalid result_too_large omitted counts".to_owned());
+    }
+    if let (Some(omitted), Some(cardinality), Some(counted)) =
+        (summary.counts_omitted, cardinality, counted)
+        && omitted > cardinality.saturating_sub(counted)
+    {
+        return Err("invalid result_too_large count total".to_owned());
+    }
+    if summary
+        .counts_omitted
+        .is_some_and(|_| cardinality.is_none())
+    {
+        return Err("invalid result_too_large count cardinality".to_owned());
+    }
+
+    let encoded_summary = serde_json::to_vec(summary)
+        .map_err(|_| "invalid result_too_large summary encoding".to_owned())?;
+    if encoded_summary.len() >= MAX_OUTPUT_BYTES {
+        return Err("invalid result_too_large summary size".to_owned());
+    }
+    Ok(())
 }
 
 fn type_counts<'a>(values: impl IntoIterator<Item = &'a Value>) -> BTreeMap<String, usize> {
@@ -828,6 +958,10 @@ impl WorkerProcess {
                         "result_too_large response omitted its shape summary".to_owned(),
                     )
                 })?;
+                if let Err(message) = validate_result_too_large_summary(&summary) {
+                    self.poison().await;
+                    return Err(WorkerError::Protocol(message));
+                }
                 Err(WorkerError::ResultTooLarge {
                     summary: Box::new(summary),
                 })
@@ -1731,21 +1865,35 @@ const WORKER_BOOTSTRAP: &str = r#"
           counts[childType] = (counts[childType] || 0) + 1;
         }
         const result = { type, length: value.length, counts };
-        if (value.length > count) result.itemsOmitted = value.length - count;
+        if (value.length > count) {
+          result.itemsOmitted = value.length - count;
+          result.countsSampled = true;
+        }
         return result;
       }
       if (type === "object") {
-        const allKeys = Object.keys(value).sort();
-        const keys = allKeys.slice(0, PEEK_LIMIT).map((key) =>
+        const sampledKeys = [];
+        let keyCount = 0;
+        for (const key in value) {
+          if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+          keyCount += 1;
+          if (sampledKeys.length < PEEK_LIMIT) sampledKeys.push(key);
+        }
+        const keys = sampledKeys.map((key) =>
           key.length > 128 ? key.slice(0, 128) : key);
+        keys.sort();
         const counts = Object.create(null);
-        for (const key of allKeys.slice(0, PEEK_LIMIT)) {
+        for (const key of sampledKeys) {
           let childType = "unavailable";
           try { childType = shapeType(value[key]); } catch (_) {}
           counts[childType] = (counts[childType] || 0) + 1;
         }
-        const result = { type, keyCount: allKeys.length, keys, counts };
-        if (allKeys.length > keys.length) result.keysOmitted = allKeys.length - keys.length;
+        const result = { type, keyCount, keys, counts };
+        if (keyCount > keys.length) {
+          result.keysOmitted = keyCount - keys.length;
+          result.keysSampled = true;
+          result.countsSampled = true;
+        }
         return result;
       }
       return { type };
@@ -2225,6 +2373,37 @@ mod tests {
                 .unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn malformed_worker_summaries_are_rejected_before_the_error_boundary() {
+        let value = json!({"records": [1, 2, 3]});
+        let encoded_bytes = serde_json::to_vec(&value).unwrap().len();
+        let mut summary = ResultTooLargeSummary::from_json(
+            &value,
+            MAX_RESULT_BYTES + encoded_bytes,
+            MAX_RESULT_BYTES,
+        );
+        assert!(validate_result_too_large_summary(&summary).is_ok());
+
+        summary.limit_bytes = MAX_RESULT_BYTES + 1;
+        assert!(validate_result_too_large_summary(&summary).is_err());
+
+        let mut summary = ResultTooLargeSummary::from_json(
+            &value,
+            MAX_RESULT_BYTES + encoded_bytes,
+            MAX_RESULT_BYTES,
+        );
+        summary.keys = Some(vec!["x".to_owned(); MAX_RESULT_SUMMARY_KEYS + 1]);
+        assert!(validate_result_too_large_summary(&summary).is_err());
+
+        let mut summary = ResultTooLargeSummary::from_json(
+            &json!({"x": 1}),
+            MAX_RESULT_BYTES + encoded_bytes,
+            MAX_RESULT_BYTES,
+        );
+        summary.counts_omitted = Some(1);
+        assert!(validate_result_too_large_summary(&summary).is_err());
     }
 
     #[tokio::test]

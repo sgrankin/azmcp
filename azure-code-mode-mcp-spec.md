@@ -878,11 +878,12 @@ There are two related mechanisms:
   the original JS value was not retained. `az.peek(x)` forces a structural summary on
   demand.
 
-Ref IDs are random opaque handles, not sequential authority. Stored values carry content
-labels such as `secret` or `customerData`; secret-labeled values receive shape-only
-previews with no samples. Rehydrating one is allowed only in the same `read` context and
-marks the whole run secret-sensitive. Cyclic or non-serializable values return a typed
-summary or a serialization error, never partial JSON.
+Ref IDs are random opaque handles, not sequential authority. The current bounded slice
+labels returned runs as `customerData` and does not infer or propagate secret labels;
+key names and string lengths in structural previews are therefore customer-data metadata.
+Previews contain no samples for any value. Rehydrating one is allowed only in the same
+`read` context. Cyclic or non-serializable values return a typed summary or a
+serialization error, never partial JSON.
 
 This is the single largest determinant of whether code mode feels good or drowns the
 context window.

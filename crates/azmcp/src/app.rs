@@ -493,7 +493,7 @@ pub struct ContextCloseResult {
 }
 
 /// The bounded result returned by one isolated JavaScript turn.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunResult {
     pub value: Value,
@@ -504,6 +504,27 @@ pub struct RunResult {
     pub context: Value,
     pub sensitivity: &'static str,
     pub correlation_id: String,
+}
+
+impl std::fmt::Debug for RunResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunResult")
+            .field(
+                "value_bytes",
+                &serde_json::to_vec(&self.value)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or_default(),
+            )
+            .field("console_entries", &self.console.len())
+            .field("console_omitted", &self.console_omitted)
+            .field("call_count", &self.calls.len())
+            .field("calls_omitted", &self.calls_omitted)
+            .field("context", &self.context)
+            .field("sensitivity", &self.sensitivity)
+            .field("correlation_id", &self.correlation_id)
+            .finish()
+    }
 }
 
 /// Bounded metadata returned by context-scoped schema search.
@@ -683,6 +704,7 @@ struct WorkerSlot {
     cancellation: watch::Sender<bool>,
     identity_pin: CredentialIdentityPin,
     refs: Mutex<RefStore>,
+    ref_changed: tokio::sync::Notify,
 }
 
 /// Cancellation guard for the gap between registry insertion and worker
@@ -777,7 +799,7 @@ impl Drop for RunAbortGuard {
                 };
                 slot
             };
-            slot.cancel();
+            slot.cancel().await;
             let mut handle = slot.worker.lock().await;
             let _ = handle.terminate().await;
         };
@@ -795,14 +817,25 @@ impl WorkerSlot {
             cancellation,
             identity_pin,
             refs: Mutex::new(RefStore::default()),
+            ref_changed: tokio::sync::Notify::new(),
         }
     }
 
-    fn cancel(&self) {
+    async fn cancel(&self) {
         self.cancellation.send_replace(true);
-        if let Ok(mut refs) = self.refs.try_lock() {
-            refs.clear();
-        }
+        self.refs.lock().await.clear();
+    }
+
+    async fn next_ref_expiry(&self) -> Option<Instant> {
+        self.refs.lock().await.next_expiry()
+    }
+
+    async fn evict_expired_refs(&self, now: Instant) -> usize {
+        self.refs.lock().await.evict_expired(now)
+    }
+
+    fn notify_ref_change(&self) {
+        self.ref_changed.notify_one();
     }
 
     fn subscribe(&self) -> watch::Receiver<bool> {
@@ -1373,9 +1406,14 @@ impl Application {
                         return;
                     }
                 };
-                let delay = expiration.saturating_duration_since(Instant::now());
+                let next_ref_expiry = slot.next_ref_expiry().await;
+                let next_expiry = next_ref_expiry
+                    .filter(|ref_expiry| *ref_expiry < expiration)
+                    .unwrap_or(expiration);
+                let delay = next_expiry.saturating_duration_since(Instant::now());
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
+                    _ = slot.ref_changed.notified() => { continue; }
                     changed = cancellation.changed() => {
                         if changed.is_err() || *cancellation.borrow() {
                             return;
@@ -1394,6 +1432,13 @@ impl Application {
                     }
                 };
                 if current_expiration > now {
+                    if slot
+                        .next_ref_expiry()
+                        .await
+                        .is_some_and(|ref_expiry| ref_expiry <= now)
+                    {
+                        slot.evict_expired_refs(now).await;
+                    }
                     continue;
                 }
                 if registry.close(&id).is_err() {
@@ -1548,7 +1593,7 @@ async fn close_worker_inner(inner: &ApplicationInner, id: &str) -> Result<(), Ap
     let Some(worker) = worker else {
         return Ok(());
     };
-    worker.cancel();
+    worker.cancel().await;
     let Ok(mut handle) = worker.worker.try_lock() else {
         // An active run owns the worker mutex and will hard-terminate it
         // after observing the cancellation signal.
@@ -1931,6 +1976,7 @@ async fn materialize_ref(
         .await
         .put(candidate.value, Instant::now())
         .map_err(|_| AppError::result_too_large(Box::new(summary.clone())))?;
+    worker.notify_ref_change();
     let mut envelope = serde_json::to_value(summary)
         .expect("reference preview is a serializable structural summary");
     if let Value::Object(fields) = &mut envelope {
@@ -2040,6 +2086,7 @@ pub fn default_registry() -> Result<ContextRegistry, AppError> {
 mod tests {
     use super::*;
     use crate::host::{ClientFactoryError, HttpClientFactory};
+    use crate::refs::RefStoreLimits;
     use azmcp_core::{
         credential::TokenAudience,
         http::{ArmOrigin, BearerCredential, CredentialFuture, CredentialProvider, HttpClient},
@@ -3013,8 +3060,105 @@ mod tests {
             assert_eq!(refs.len(), 1);
         }
 
-        slot.cancel();
+        slot.cancel().await;
 
+        assert!(slot.refs.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_context_reaper_evicts_expired_refs_without_a_run() {
+        let state = state(None);
+        let application = app(
+            profile(&row(SUB, TENANT, "AzureCloud", "alice")),
+            Arc::new(Validator::default()),
+            factory(Arc::clone(&state)),
+        );
+        let opened = application
+            .context_open(ContextOpenArgs::default())
+            .await
+            .expect("context");
+        let slot = application
+            .inner
+            .workers
+            .lock()
+            .await
+            .get(&opened.context_id)
+            .cloned()
+            .expect("worker slot");
+        {
+            let mut refs = slot.refs.lock().await;
+            *refs = RefStore::new(RefStoreLimits::new(
+                4,
+                256,
+                Duration::from_millis(20),
+                48,
+                48,
+            ))
+            .expect("short test TTL");
+            refs.put(serde_json::json!({"private": true}), Instant::now())
+                .expect("reference");
+        }
+        slot.notify_ref_change();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if slot.refs.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("idle reaper evicted expired ref");
+        application
+            .context_close(ContextCloseArgs {
+                context_id: opened.context_id,
+            })
+            .await
+            .expect("close");
+    }
+
+    #[tokio::test]
+    async fn context_close_waits_for_ref_store_contention_before_disposal() {
+        let state = state(None);
+        let application = app(
+            profile(&row(SUB, TENANT, "AzureCloud", "alice")),
+            Arc::new(Validator::default()),
+            factory(Arc::clone(&state)),
+        );
+        let opened = application
+            .context_open(ContextOpenArgs::default())
+            .await
+            .expect("context");
+        let slot = application
+            .inner
+            .workers
+            .lock()
+            .await
+            .get(&opened.context_id)
+            .cloned()
+            .expect("worker slot");
+        slot.refs
+            .lock()
+            .await
+            .put(serde_json::json!({"private": true}), Instant::now())
+            .expect("reference");
+        let refs_guard = slot.refs.lock().await;
+        let closing = {
+            let application = application.clone();
+            let context_id = opened.context_id.clone();
+            tokio::spawn(async move {
+                application
+                    .context_close(ContextCloseArgs { context_id })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!closing.is_finished());
+        drop(refs_guard);
+        closing
+            .await
+            .expect("close task")
+            .expect("close waits and succeeds");
         assert!(slot.refs.lock().await.is_empty());
     }
 
@@ -3066,6 +3210,9 @@ mod tests {
         let rendered = serde_json::to_string(&ref_result.value).expect("preview JSON");
         assert!(!rendered.contains("secret-value"));
         assert!(!rendered.contains(&"x".repeat(70_000)));
+        let debug = format!("{ref_result:?}");
+        assert!(!debug.contains("__ref"));
+        assert!(!debug.contains(&ref_id));
 
         let restored = application
             .run(RunArgs {

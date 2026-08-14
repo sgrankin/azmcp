@@ -208,7 +208,9 @@ refs with a structural preview; JavaScript can rehydrate one with
 shape-only summary. Cyclic, non-serializable, or over-hard-cap values fail
 closed with shape-only diagnostics, never truncated JSON. Reference IDs and
 stored values are disposed with context close, expiry, or capacity eviction;
-previews contain no value samples. At most eight host calls run concurrently.
+previews contain no value samples. Key names and string lengths are
+`customerData` metadata; this slice does not infer or propagate secret labels.
+At most eight host calls run concurrently.
 Cancellation, timeout, heap pressure, RSS pressure, worker death, close, TTL
 expiry, or credential-identity change dispose the affected context. The RSS
 sampler uses OS process APIs through `sysinfo`; it does not invoke `ps` or

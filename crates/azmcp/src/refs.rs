@@ -305,6 +305,16 @@ impl RefStore {
         removed
     }
 
+    /// Return the earliest expiry among retained values.
+    pub fn next_expiry(&self) -> Option<Instant> {
+        self.entries.values().map(|entry| entry.expires_at).min()
+    }
+
+    #[cfg(test)]
+    fn fifo_metadata_len(&self) -> usize {
+        self.order.len()
+    }
+
     /// Number of retained values. Expired values are removed when an operation
     /// observes them; call [`Self::evict_expired`] to sweep proactively.
     pub fn len(&self) -> usize {
@@ -354,6 +364,7 @@ impl RefStore {
 
     fn remove(&mut self, id: &RefId) -> Option<StoredRef> {
         let entry = self.entries.remove(id)?;
+        self.order.retain(|queued| queued != id);
         self.bytes = self.bytes.saturating_sub(entry.encoded_bytes);
         Some(entry)
     }
@@ -462,6 +473,21 @@ mod tests {
         assert_eq!(store.get(&first, now), Err(RefStoreError::NotFound));
         assert_eq!(store.get(&second, now), Ok(serde_json::json!("second")));
         assert_eq!(store.get(&third, now), Ok(serde_json::json!("third")));
+    }
+
+    #[test]
+    fn expired_entries_do_not_leave_fifo_metadata_behind() {
+        let now = Instant::now();
+        let mut store = RefStore::new(RefStoreLimits::new(4, 256, Duration::from_secs(1), 48, 48))
+            .expect("limits");
+        for index in 0..128 {
+            store
+                .put(serde_json::json!({"index": index}), now)
+                .expect("reference");
+            store.evict_expired(now + Duration::from_secs(2));
+            assert_eq!(store.len(), 0);
+            assert_eq!(store.fifo_metadata_len(), 0);
+        }
     }
 
     #[test]
