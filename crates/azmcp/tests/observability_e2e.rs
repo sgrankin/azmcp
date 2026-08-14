@@ -89,6 +89,13 @@ impl AuditSink for MemoryAudit {
             .push(record.clone());
         Ok(())
     }
+
+    fn append_artifact(
+        &self,
+        _record: &azmcp::audit::ArtifactWriteAuditRecord,
+    ) -> Result<(), AuditError> {
+        Ok(())
+    }
 }
 
 struct LoopbackClientFactory {

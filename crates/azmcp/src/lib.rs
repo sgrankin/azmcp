@@ -600,6 +600,13 @@ mod tests {
         fn append(&self, _record: &CallRecord) -> Result<(), AuditError> {
             Ok(())
         }
+
+        fn append_artifact(
+            &self,
+            _record: &crate::audit::ArtifactWriteAuditRecord,
+        ) -> Result<(), AuditError> {
+            Ok(())
+        }
     }
 
     impl HttpClientFactory for NoClientFactory {

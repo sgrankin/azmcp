@@ -34,6 +34,32 @@ pub trait AuditSink: Send + Sync {
 
     /// Append one already-redacted record.
     fn append(&self, record: &CallRecord) -> Result<(), AuditError>;
+
+    /// Append one content-free record for a managed local artifact write.
+    fn append_artifact(&self, record: &ArtifactWriteAuditRecord) -> Result<(), AuditError>;
+}
+
+/// Redacted metadata for one successful managed artifact write.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactWriteAuditRecord {
+    pub correlation_id: String,
+    pub operation: &'static str,
+    pub decision: &'static str,
+    pub bytes: usize,
+    pub sensitivity: &'static str,
+}
+
+impl ArtifactWriteAuditRecord {
+    pub fn allowed(correlation_id: impl Into<String>, bytes: usize) -> Self {
+        Self {
+            correlation_id: correlation_id.into(),
+            operation: "az.artifacts.writeJson",
+            decision: "allowed",
+            bytes,
+            sensitivity: "customerData",
+        }
+    }
 }
 
 /// Validated file rotation and retention settings.
@@ -165,6 +191,16 @@ impl AuditSink for FileAuditLog {
     }
 
     fn append(&self, record: &CallRecord) -> Result<(), AuditError> {
+        self.append_record(record)
+    }
+
+    fn append_artifact(&self, record: &ArtifactWriteAuditRecord) -> Result<(), AuditError> {
+        self.append_record(record)
+    }
+}
+
+impl FileAuditLog {
+    fn append_record<T: Serialize>(&self, record: &T) -> Result<(), AuditError> {
         let envelope = AuditEnvelope {
             timestamp_unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -195,11 +231,11 @@ impl AuditSink for FileAuditLog {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AuditEnvelope<'a> {
+#[serde(rename_all = "camelCase", bound(serialize = "T: Serialize"))]
+struct AuditEnvelope<'a, T> {
     timestamp_unix_ms: u64,
     #[serde(flatten)]
-    record: &'a CallRecord,
+    record: &'a T,
 }
 
 /// Sanitized failures from the durable logging boundary.
@@ -347,6 +383,24 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn appends_artifact_metadata_without_path_or_content() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("audit/requests.jsonl");
+        let sink = FileAuditLog::new(FileAuditConfig::with_defaults(&path).expect("config"));
+        sink.append_artifact(&ArtifactWriteAuditRecord::allowed("corr-2", 123))
+            .expect("append artifact");
+
+        let line = fs::read_to_string(&path).expect("audit file");
+        let value: serde_json::Value = serde_json::from_str(line.trim()).expect("json record");
+        assert_eq!(value["operation"], "az.artifacts.writeJson");
+        assert_eq!(value["bytes"], 123);
+        assert_eq!(value["sensitivity"], "customerData");
+        assert!(value.get("path").is_none());
+        assert!(value.get("name").is_none());
+        assert!(value.get("value").is_none());
     }
 
     #[test]

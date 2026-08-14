@@ -1934,6 +1934,13 @@ mod tests {
                 .push(record.clone());
             Ok(())
         }
+
+        fn append_artifact(
+            &self,
+            _record: &crate::audit::ArtifactWriteAuditRecord,
+        ) -> Result<(), AuditError> {
+            Ok(())
+        }
     }
 
     struct TestFactory {

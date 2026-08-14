@@ -2167,6 +2167,13 @@ mod tests {
                 .push(record.clone());
             Ok(())
         }
+
+        fn append_artifact(
+            &self,
+            _record: &crate::audit::ArtifactWriteAuditRecord,
+        ) -> Result<(), crate::audit::AuditError> {
+            Ok(())
+        }
     }
 
     impl HttpClientFactory for ValidationClientFactory {
