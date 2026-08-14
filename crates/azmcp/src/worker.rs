@@ -49,6 +49,18 @@ pub const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 pub const MAX_HOST_METHOD_BYTES: usize = 64;
 pub const MAX_HOST_CALLS_PER_EXECUTION: usize = 256;
 pub const MAX_PENDING_HOST_CALLS: usize = 8;
+/// Maximum serialized NDJSON frame for one worker-to-parent host call.
+pub const MAX_HOST_CALL_FRAME_BYTES: usize = MAX_INPUT_BYTES;
+/// Maximum compact JSON bytes carried by one streamed artifact chunk.
+///
+/// The remaining 128 KiB covers the tagged host-call envelope, stream ID,
+/// sequence number, and any escaping differences between V8 and serde_json.
+pub const MAX_ARTIFACT_STREAM_CHUNK_BYTES: usize = 384 * 1024;
+/// Bound one streamed artifact below the worker's global per-execution call cap.
+/// This permits more than 32 MiB of JSON while retaining headroom for other
+/// calls and for begin, finish, or best-effort abort.
+pub const MAX_ARTIFACT_STREAM_CHUNKS: u16 = 128;
+pub const MAX_ARTIFACT_STREAM_ID_BYTES: usize = 128;
 /// Maximum resident set size for one isolated worker process.
 ///
 /// The V8 heap ceiling is intentionally lower than this process ceiling. The
@@ -65,6 +77,10 @@ pub const HOST_METHOD_LOGS_QUERY: &str = "az.logs.query";
 /// Parent-owned, context-gated JSON artifact output. JavaScript never receives
 /// a filesystem primitive or chooses a directory.
 pub const HOST_METHOD_ARTIFACT_WRITE_JSON: &str = "az.artifacts.writeJson";
+/// Parent-owned array transaction protocol behind `az.artifacts.writeJsonArray`.
+pub const HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY: &str = "az.artifacts.writeJsonArray";
+/// Parent-owned transaction protocol behind `az.artifacts.writeJsonLines`.
+pub const HOST_METHOD_ARTIFACT_WRITE_JSON_LINES: &str = "az.artifacts.writeJsonLines";
 /// Internal worker-to-parent capability used by the JavaScript `az.ref`
 /// global. It is intentionally not an MCP tool.
 pub const HOST_METHOD_REF: &str = "az.ref";
@@ -369,6 +385,128 @@ pub struct HostCallRequest {
     pub call_id: u64,
     pub method: String,
     pub arguments: Value,
+}
+
+/// Closed transaction messages shared by the streamed JSON artifact helpers.
+///
+/// The JavaScript wrapper emits one `begin`, bounded non-empty `append`
+/// messages in sequence, and one `finish`. It attempts `abort` after a local
+/// validation or host failure so a caller may catch the JavaScript exception
+/// without intentionally retaining an unfinished parent-side transaction.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(tag = "phase", deny_unknown_fields)]
+pub enum ArtifactWriteJsonStreamArguments {
+    #[serde(rename = "begin")]
+    Begin { name: String },
+    #[serde(rename = "append")]
+    Append {
+        #[serde(rename = "streamId")]
+        stream_id: String,
+        sequence: u16,
+        values: Vec<Value>,
+    },
+    #[serde(rename = "finish")]
+    Finish {
+        #[serde(rename = "streamId")]
+        stream_id: String,
+        chunks: u16,
+        items: u64,
+    },
+    #[serde(rename = "abort")]
+    Abort {
+        #[serde(rename = "streamId")]
+        stream_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ArtifactWriteJsonStreamBeginResult {
+    pub stream_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ArtifactWriteJsonStreamAppendResult {
+    pub accepted_sequence: u16,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactWriteJsonStreamAbortResult {
+    pub aborted: bool,
+}
+
+impl ArtifactWriteJsonStreamArguments {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Begin { name } => {
+                if name.is_empty() {
+                    return Err("artifact stream name is empty");
+                }
+            }
+            Self::Append {
+                stream_id,
+                sequence,
+                values,
+            } => {
+                validate_artifact_stream_id(stream_id)?;
+                if *sequence >= MAX_ARTIFACT_STREAM_CHUNKS {
+                    return Err("artifact stream sequence exceeds the chunk limit");
+                }
+                if values.is_empty() {
+                    return Err("artifact stream append is empty");
+                }
+                let bytes = serde_json::to_vec(values)
+                    .map_err(|_| "artifact stream chunk is not JSON serializable")?;
+                if bytes.len() > MAX_ARTIFACT_STREAM_CHUNK_BYTES {
+                    return Err("artifact stream chunk exceeds the byte limit");
+                }
+            }
+            Self::Finish {
+                stream_id,
+                chunks,
+                items,
+            } => {
+                validate_artifact_stream_id(stream_id)?;
+                if *chunks > MAX_ARTIFACT_STREAM_CHUNKS
+                    || (*chunks == 0 && *items != 0)
+                    || (*chunks != 0 && *items == 0)
+                {
+                    return Err("artifact stream totals are invalid");
+                }
+            }
+            Self::Abort { stream_id } => validate_artifact_stream_id(stream_id)?,
+        }
+        Ok(())
+    }
+}
+
+fn validate_artifact_stream_id(stream_id: &str) -> Result<(), &'static str> {
+    if stream_id.is_empty()
+        || stream_id.len() > MAX_ARTIFACT_STREAM_ID_BYTES
+        || !stream_id.is_ascii()
+        || stream_id
+            .bytes()
+            .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'_'))
+    {
+        return Err("artifact stream ID is invalid");
+    }
+    Ok(())
+}
+
+impl HostCallRequest {
+    /// Serialized NDJSON frame size, including the trailing newline.
+    pub fn encoded_frame_bytes(&self) -> Option<usize> {
+        serde_json::to_vec(&WorkerResponse::HostCall {
+            id: self.id,
+            call_id: self.call_id,
+            method: self.method.clone(),
+            arguments: self.arguments.clone(),
+        })
+        .ok()
+        .map(|bytes| bytes.len().saturating_add(1))
+    }
 }
 
 impl fmt::Debug for HostCallRequest {
@@ -1840,6 +1978,147 @@ const WORKER_BOOTSTRAP: &str = r#"
 (() => {
   const op = Deno.core.ops.op_worker_console;
   const hostCall = Deno.core.ops.op_worker_host_call;
+  const apply = Reflect.apply;
+  const arrayIsArray = Array.isArray;
+  const arrayPush = Array.prototype.push;
+  const charCodeAt = String.prototype.charCodeAt;
+  const hasOwnProperty = Object.prototype.hasOwnProperty;
+  const jsonParse = JSON.parse;
+  const jsonStringify = JSON.stringify;
+  const objectKeys = Object.keys;
+  const asyncIteratorSymbol = Symbol.asyncIterator;
+  const iteratorSymbol = Symbol.iterator;
+  const ARTIFACT_STREAM_CHUNK_BYTES = 384 * 1024;
+  const ARTIFACT_STREAM_CHUNKS = 128;
+  const ARTIFACT_ARRAY_METHOD = "az.artifacts.writeJsonArray";
+  const ARTIFACT_LINES_METHOD = "az.artifacts.writeJsonLines";
+  const utf8Length = (text) => {
+    let bytes = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      const code = apply(charCodeAt, text, [index]);
+      if (code < 0x80) {
+        bytes += 1;
+      } else if (code < 0x800) {
+        bytes += 2;
+      } else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length) {
+        const next = apply(charCodeAt, text, [index + 1]);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          bytes += 4;
+          index += 1;
+        } else {
+          bytes += 3;
+        }
+      } else {
+        bytes += 3;
+      }
+    }
+    return bytes;
+  };
+  const hasOwn = (value, key) => apply(hasOwnProperty, value, [key]);
+  const writeJsonStream = async (helperName, method, arguments) => {
+    if (arguments === null || typeof arguments !== "object" || arrayIsArray(arguments)) {
+      throw new TypeError(`${helperName} expects {name, values}`);
+    }
+    const keys = objectKeys(arguments);
+    if (keys.length !== 2 || !hasOwn(arguments, "name") || !hasOwn(arguments, "values")) {
+      throw new TypeError(`${helperName} expects only name and values`);
+    }
+    const name = arguments.name;
+    const values = arguments.values;
+    if (typeof name !== "string" || name.length === 0) {
+      throw new TypeError(`${helperName} name must be a non-empty string`);
+    }
+    const iterable = values !== null
+      && (typeof values === "object" || typeof values === "function")
+      && (typeof values[asyncIteratorSymbol] === "function"
+        || typeof values[iteratorSymbol] === "function");
+    if (!iterable) {
+      throw new TypeError(`${helperName} values must be an iterable or async iterable`);
+    }
+
+    let streamId = null;
+    try {
+      const opened = await hostCall(method, {phase: "begin", name});
+      const openedKeys = opened !== null && typeof opened === "object" && !arrayIsArray(opened)
+        ? objectKeys(opened)
+        : [];
+      if (openedKeys.length !== 1
+        || openedKeys[0] !== "streamId"
+        || typeof opened.streamId !== "string"
+        || opened.streamId.length === 0) {
+        throw new Error("artifact stream begin returned an invalid stream ID");
+      }
+      streamId = opened.streamId;
+
+      let chunk = [];
+      let chunkBytes = 2;
+      let sequence = 0;
+      let items = 0;
+      const append = async () => {
+        if (chunk.length === 0) return;
+        if (sequence >= ARTIFACT_STREAM_CHUNKS) {
+          throw new RangeError("artifact stream exceeds the chunk limit");
+        }
+        const appended = await hostCall(method, {
+          phase: "append",
+          streamId,
+          sequence,
+          values: chunk,
+        });
+        const appendedKeys = appended !== null
+          && typeof appended === "object"
+          && !arrayIsArray(appended)
+          ? objectKeys(appended)
+          : [];
+        if (appendedKeys.length !== 1
+          || appendedKeys[0] !== "acceptedSequence"
+          || appended.acceptedSequence !== sequence) {
+          throw new Error("artifact stream append returned an invalid acknowledgement");
+        }
+        sequence += 1;
+        chunk = [];
+        chunkBytes = 2;
+      };
+
+      for await (const value of values) {
+        const encoded = jsonStringify(value);
+        if (encoded === undefined) {
+          throw new TypeError("artifact stream items must be JSON serializable");
+        }
+        const encodedBytes = utf8Length(encoded);
+        if (encodedBytes + 2 > ARTIFACT_STREAM_CHUNK_BYTES) {
+          throw new RangeError("one artifact stream item exceeds the chunk limit");
+        }
+        const separatorBytes = chunk.length === 0 ? 0 : 1;
+        if (chunkBytes + separatorBytes + encodedBytes > ARTIFACT_STREAM_CHUNK_BYTES) {
+          await append();
+        }
+        apply(arrayPush, chunk, [jsonParse(encoded)]);
+        chunkBytes += (chunk.length === 1 ? 0 : 1) + encodedBytes;
+        items += 1;
+      }
+      await append();
+      const receipt = await hostCall(method, {
+        phase: "finish",
+        streamId,
+        chunks: sequence,
+        items,
+      });
+      streamId = null;
+      return receipt;
+    } catch (error) {
+      if (streamId !== null) {
+        try {
+          await hostCall(method, {phase: "abort", streamId});
+        } catch (_) {}
+      }
+      throw error;
+    }
+  };
+  const writeJsonArray = (arguments) =>
+    writeJsonStream("writeJsonArray", ARTIFACT_ARRAY_METHOD, arguments);
+  const writeJsonLines = (arguments) =>
+    writeJsonStream("writeJsonLines", ARTIFACT_LINES_METHOD, arguments);
   const text = (args) => args.map((value) => {
     try {
       if (typeof value === "string") return value;
@@ -1939,6 +2218,8 @@ const WORKER_BOOTSTRAP: &str = r#"
       })),
       artifacts: Object.freeze(Object.assign(Object.create(null), {
         writeJson: (arguments) => hostCall("az.artifacts.writeJson", arguments),
+        writeJsonArray,
+        writeJsonLines,
       })),
     })),
     writable: false,
@@ -2097,6 +2378,8 @@ fn validate_host_call_request(request: &HostCallRequest) -> Result<(), String> {
         && request.method != HOST_METHOD_METRICS_BATCH
         && request.method != HOST_METHOD_LOGS_QUERY
         && request.method != HOST_METHOD_ARTIFACT_WRITE_JSON
+        && request.method != HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY
+        && request.method != HOST_METHOD_ARTIFACT_WRITE_JSON_LINES
         && request.method != HOST_METHOD_REF
     {
         return Err("unknown host-call method".to_owned());
@@ -2114,7 +2397,25 @@ fn validate_host_call_request(request: &HostCallRequest) -> Result<(), String> {
     if encoded.len() > MAX_INPUT_BYTES {
         return Err("host-call arguments exceed the input limit".to_owned());
     }
+    if request.method == HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY
+        || request.method == HOST_METHOD_ARTIFACT_WRITE_JSON_LINES
+    {
+        let arguments = serde_json::from_value::<ArtifactWriteJsonStreamArguments>(
+            request.arguments.clone(),
+        )
+        .map_err(|_| "artifact stream arguments do not match the closed schema".to_owned())?;
+        arguments.validate().map_err(str::to_owned)?;
+    }
+    if encoded_host_call_frame_bytes(request)? > MAX_HOST_CALL_FRAME_BYTES {
+        return Err("host-call frame exceeds the input limit".to_owned());
+    }
     Ok(())
+}
+
+fn encoded_host_call_frame_bytes(request: &HostCallRequest) -> Result<usize, String> {
+    request
+        .encoded_frame_bytes()
+        .ok_or_else(|| "host-call frame is not JSON serializable".to_owned())
 }
 
 fn validate_host_call_result(
@@ -2226,7 +2527,12 @@ where
 {
     let bytes = serde_json::to_vec(response)
         .map_err(|error| WorkerError::Serialization(error.to_string()))?;
-    if bytes.len() + 1 > MAX_OUTPUT_BYTES {
+    let limit = if matches!(response, WorkerResponse::HostCall { .. }) {
+        MAX_HOST_CALL_FRAME_BYTES
+    } else {
+        MAX_OUTPUT_BYTES
+    };
+    if bytes.len() + 1 > limit {
         return Err(WorkerError::Limit("output"));
     }
     writer.write_all(&bytes).await.map_err(WorkerError::Io)?;
@@ -2354,6 +2660,115 @@ mod tests {
         );
         assert!(!rss_limit_exceeded(256, 256));
         assert!(rss_limit_exceeded(257, 256));
+    }
+
+    #[test]
+    fn streamed_json_messages_have_closed_bounded_schemas() {
+        let request = |method: &str, arguments| HostCallRequest {
+            id: u64::MAX,
+            call_id: u64::MAX,
+            method: method.to_owned(),
+            arguments,
+        };
+        let stream_id = "stream_0123456789abcdef";
+        let valid_arguments = [
+            json!({"phase": "begin", "name": "rows.json"}),
+            json!({
+                "phase": "append",
+                "streamId": stream_id,
+                "sequence": 0,
+                "values": [{"row": 1}],
+            }),
+            json!({
+                "phase": "finish",
+                "streamId": stream_id,
+                "chunks": 1,
+                "items": 1,
+            }),
+            json!({"phase": "abort", "streamId": stream_id}),
+        ];
+        for method in [
+            HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY,
+            HOST_METHOD_ARTIFACT_WRITE_JSON_LINES,
+        ] {
+            for arguments in valid_arguments.iter().cloned() {
+                let request = request(method, arguments);
+                assert!(validate_host_call_request(&request).is_ok());
+                assert!(
+                    encoded_host_call_frame_bytes(&request).unwrap() <= MAX_HOST_CALL_FRAME_BYTES
+                );
+            }
+        }
+
+        let invalid_arguments = [
+            json!({"phase": "begin", "name": "rows.json", "extra": true}),
+            json!({
+                "phase": "append",
+                "streamId": stream_id,
+                "sequence": 0,
+                "values": [],
+            }),
+            json!({
+                "phase": "append",
+                "streamId": "../not-a-stream",
+                "sequence": 0,
+                "values": [null],
+            }),
+            json!({
+                "phase": "append",
+                "streamId": stream_id,
+                "sequence": MAX_ARTIFACT_STREAM_CHUNKS,
+                "values": [null],
+            }),
+            json!({
+                "phase": "finish",
+                "streamId": stream_id,
+                "chunks": 0,
+                "items": 1,
+            }),
+            json!({"phase": "future", "streamId": stream_id}),
+        ];
+        for method in [
+            HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY,
+            HOST_METHOD_ARTIFACT_WRITE_JSON_LINES,
+        ] {
+            for arguments in invalid_arguments.iter().cloned() {
+                assert!(validate_host_call_request(&request(method, arguments)).is_err());
+            }
+        }
+
+        let oversized_chunk = request(
+            HOST_METHOD_ARTIFACT_WRITE_JSON_LINES,
+            json!({
+                "phase": "append",
+                "streamId": stream_id,
+                "sequence": 0,
+                "values": ["x".repeat(MAX_ARTIFACT_STREAM_CHUNK_BYTES)],
+            }),
+        );
+        assert!(
+            validate_host_call_request(&oversized_chunk)
+                .expect_err("oversized stream chunk")
+                .contains("chunk exceeds")
+        );
+
+        let envelope_overflow = HostCallRequest {
+            id: u64::MAX,
+            call_id: u64::MAX,
+            method: HOST_METHOD_REQUEST.to_owned(),
+            arguments: json!({"value": "x".repeat(MAX_INPUT_BYTES - 32)}),
+        };
+        assert!(
+            serde_json::to_vec(&envelope_overflow.arguments)
+                .unwrap()
+                .len()
+                < MAX_INPUT_BYTES
+        );
+        assert!(
+            validate_host_call_request(&envelope_overflow)
+                .expect_err("full frame, not only arguments, is bounded")
+                .contains("frame exceeds")
+        );
     }
 
     #[test]
@@ -2590,6 +3005,206 @@ mod tests {
                 {"method": HOST_METHOD_ARTIFACT_WRITE_JSON, "n": 4}
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_streams_json_arrays_as_bounded_sequential_chunks() {
+        let (response_tx, mut response_rx) = mpsc::channel(8);
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let bridge = HostBridge::new(response_tx, request_rx);
+        bridge.begin_execution(13);
+        let mut runtime = WorkerRuntime::new_with_host_bridge(bridge.clone()).unwrap();
+        let mut execution = Box::pin(runtime.execute(
+            r#"az.artifacts.writeJsonArray({
+                name: "rows.json",
+                values: (async function* () {
+                    for (let index = 0; index < 3; index += 1) {
+                        yield {index, payload: "x".repeat(220 * 1024)};
+                    }
+                })(),
+            })"#,
+            Duration::from_secs(3),
+        ));
+        let mut next_sequence = 0;
+        let mut item_count = 0_u64;
+        let result = loop {
+            tokio::select! {
+                result = &mut execution => break result,
+                response = response_rx.recv() => {
+                    let Some(WorkerResponse::HostCall { id, call_id, method, arguments }) = response else {
+                        panic!("stream host-call channel closed before execution completed");
+                    };
+                    assert_eq!(method, HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY);
+                    let request = HostCallRequest { id, call_id, method, arguments: arguments.clone() };
+                    assert!(encoded_host_call_frame_bytes(&request).unwrap() <= MAX_HOST_CALL_FRAME_BYTES);
+                    let phase = serde_json::from_value::<ArtifactWriteJsonStreamArguments>(arguments)
+                        .expect("closed stream phase");
+                    phase.validate().expect("valid stream phase");
+                    let value = match phase {
+                        ArtifactWriteJsonStreamArguments::Begin { name } => {
+                            assert_eq!(name, "rows.json");
+                            json!({"streamId": "stream_13"})
+                        }
+                        ArtifactWriteJsonStreamArguments::Append { sequence, values, .. } => {
+                            assert_eq!(sequence, next_sequence);
+                            next_sequence += 1;
+                            item_count += u64::try_from(values.len()).unwrap();
+                            json!({"acceptedSequence": sequence})
+                        }
+                        ArtifactWriteJsonStreamArguments::Finish { chunks, items, .. } => {
+                            assert_eq!(chunks, next_sequence);
+                            assert_eq!(items, item_count);
+                            json!({"path": "/synthetic/rows.json", "bytes": 675_000})
+                        }
+                        ArtifactWriteJsonStreamArguments::Abort { .. } => {
+                            panic!("successful stream must not abort")
+                        }
+                    };
+                    request_tx.send(WorkerRequest::HostCallResult {
+                        id,
+                        call_id,
+                        ok: true,
+                        value: Some(value),
+                        error: None,
+                    }).await.unwrap();
+                }
+            }
+        };
+        bridge.end_execution();
+        let result = result.expect("streamed array execution");
+        assert_eq!(next_sequence, 3);
+        assert_eq!(item_count, 3);
+        assert_eq!(result.value["path"], "/synthetic/rows.json");
+    }
+
+    #[tokio::test]
+    async fn runtime_streams_normalized_json_lines_through_the_lines_method() {
+        let (response_tx, mut response_rx) = mpsc::channel(4);
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let bridge = HostBridge::new(response_tx, request_rx);
+        bridge.begin_execution(16);
+        let mut runtime = WorkerRuntime::new_with_host_bridge(bridge.clone()).unwrap();
+        let mut execution = Box::pin(runtime.execute(
+            r#"az.artifacts.writeJsonLines({
+                name: "rows.jsonl",
+                values: [
+                    {toJSON() { return {normalized: true}; }},
+                    "text",
+                    null,
+                ],
+            })"#,
+            Duration::from_secs(2),
+        ));
+        let mut received = Vec::new();
+        let result = loop {
+            tokio::select! {
+                result = &mut execution => break result,
+                response = response_rx.recv() => {
+                    let Some(WorkerResponse::HostCall { id, call_id, method, arguments }) = response else {
+                        panic!("stream host-call channel closed before execution completed");
+                    };
+                    assert_eq!(method, HOST_METHOD_ARTIFACT_WRITE_JSON_LINES);
+                    let phase = serde_json::from_value::<ArtifactWriteJsonStreamArguments>(arguments)
+                        .expect("closed stream phase");
+                    phase.validate().expect("valid stream phase");
+                    let value = match phase {
+                        ArtifactWriteJsonStreamArguments::Begin { name } => {
+                            assert_eq!(name, "rows.jsonl");
+                            json!({"streamId": "stream_16"})
+                        }
+                        ArtifactWriteJsonStreamArguments::Append { sequence, values, .. } => {
+                            assert_eq!(sequence, 0);
+                            received.extend(values);
+                            json!({"acceptedSequence": sequence})
+                        }
+                        ArtifactWriteJsonStreamArguments::Finish { chunks, items, .. } => {
+                            assert_eq!(chunks, 1);
+                            assert_eq!(items, 3);
+                            json!({
+                                "path": "/synthetic/rows.jsonl",
+                                "bytes": 31,
+                                "mediaType": "application/x-ndjson",
+                            })
+                        }
+                        ArtifactWriteJsonStreamArguments::Abort { .. } => {
+                            panic!("successful stream must not abort")
+                        }
+                    };
+                    request_tx.send(WorkerRequest::HostCallResult {
+                        id,
+                        call_id,
+                        ok: true,
+                        value: Some(value),
+                        error: None,
+                    }).await.unwrap();
+                }
+            }
+        };
+        bridge.end_execution();
+        assert_eq!(
+            received,
+            [json!({"normalized": true}), json!("text"), Value::Null]
+        );
+        assert_eq!(
+            result.expect("streamed JSON Lines execution").value["mediaType"],
+            "application/x-ndjson"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_aborts_a_stream_after_local_item_validation_fails() {
+        let (response_tx, mut response_rx) = mpsc::channel(4);
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let bridge = HostBridge::new(response_tx, request_rx);
+        bridge.begin_execution(14);
+        let mut runtime = WorkerRuntime::new_with_host_bridge(bridge.clone()).unwrap();
+        let mut execution = Box::pin(runtime.execute(
+            r#"az.artifacts.writeJsonArray({
+                name: "rows.json",
+                values: [{payload: "x".repeat(400 * 1024)}],
+            })"#,
+            Duration::from_secs(2),
+        ));
+        let mut phases = Vec::new();
+        let result = loop {
+            tokio::select! {
+                result = &mut execution => break result,
+                response = response_rx.recv() => {
+                    let Some(WorkerResponse::HostCall { id, call_id, arguments, .. }) = response else {
+                        panic!("stream host-call channel closed before execution completed");
+                    };
+                    let phase = arguments["phase"].as_str().unwrap().to_owned();
+                    phases.push(phase.clone());
+                    let value = match phase.as_str() {
+                        "begin" => json!({"streamId": "stream_14"}),
+                        "abort" => json!({"aborted": true}),
+                        _ => panic!("oversized item must not emit {phase}"),
+                    };
+                    request_tx.send(WorkerRequest::HostCallResult {
+                        id,
+                        call_id,
+                        ok: true,
+                        value: Some(value),
+                        error: None,
+                    }).await.unwrap();
+                }
+            }
+        };
+        drop(execution);
+        bridge.end_execution();
+        assert!(matches!(result, Err(WorkerError::Execution { .. })));
+        assert_eq!(phases, ["begin", "abort"]);
+
+        bridge.begin_execution(15);
+        assert_eq!(
+            runtime
+                .execute("1 + 1", Duration::from_secs(1))
+                .await
+                .expect("local stream rejection does not poison the runtime")
+                .value,
+            2
+        );
+        bridge.end_execution();
     }
 
     #[tokio::test]

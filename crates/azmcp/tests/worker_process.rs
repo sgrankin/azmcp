@@ -8,7 +8,9 @@ use std::{
 
 use azmcp::refs::{RefId, RefStore};
 use azmcp::worker::{
-    HOST_METHOD_REF, HostCallHandler, HostCallResult, MAX_PENDING_HOST_CALLS, WorkerError,
+    ArtifactWriteJsonStreamArguments, HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY,
+    HOST_METHOD_ARTIFACT_WRITE_JSON_LINES, HOST_METHOD_REF, HostCallHandler, HostCallResult,
+    MAX_ARTIFACT_STREAM_CHUNKS, MAX_HOST_CALL_FRAME_BYTES, MAX_PENDING_HOST_CALLS, WorkerError,
     WorkerProcess,
 };
 use serde_json::{Value, json};
@@ -138,6 +140,191 @@ async fn subprocess_host_calls_bound_parent_handler_concurrency() {
         observed_maximum.load(Ordering::SeqCst),
         MAX_PENDING_HOST_CALLS
     );
+    worker.close().await.expect("clean close");
+}
+
+#[derive(Default)]
+struct ArtifactStreamStats {
+    chunks: u16,
+    items: u64,
+    json_bytes: usize,
+    maximum_frame_bytes: usize,
+    aborted: bool,
+}
+
+#[tokio::test]
+async fn subprocess_streams_a_json_array_larger_than_32_mib_in_bounded_frames() {
+    let mut worker = WorkerProcess::start(env!("CARGO_BIN_EXE_azmcp"))
+        .await
+        .expect("start isolated worker");
+    let stats = Arc::new(Mutex::new(ArtifactStreamStats {
+        json_bytes: 2,
+        ..ArtifactStreamStats::default()
+    }));
+    let observed = Arc::clone(&stats);
+    let handler: HostCallHandler = Arc::new(move |request| {
+        let stats = Arc::clone(&stats);
+        Box::pin(async move {
+            assert_eq!(request.method, HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY);
+            let frame_bytes = request
+                .encoded_frame_bytes()
+                .expect("serializable host frame");
+            assert!(frame_bytes <= MAX_HOST_CALL_FRAME_BYTES);
+            let phase = serde_json::from_value::<ArtifactWriteJsonStreamArguments>(
+                request.arguments.clone(),
+            )
+            .expect("closed stream phase");
+            phase.validate().expect("bounded stream phase");
+            let mut stats = stats.lock().await;
+            stats.maximum_frame_bytes = stats.maximum_frame_bytes.max(frame_bytes);
+            match phase {
+                ArtifactWriteJsonStreamArguments::Begin { name } => {
+                    assert_eq!(name, "large-rows.json");
+                    HostCallResult::success(&request, json!({"streamId": "stream_large_rows"}))
+                }
+                ArtifactWriteJsonStreamArguments::Append {
+                    sequence, values, ..
+                } => {
+                    assert_eq!(sequence, stats.chunks);
+                    for value in &values {
+                        if stats.items != 0 {
+                            stats.json_bytes += 1;
+                        }
+                        stats.json_bytes += serde_json::to_vec(value).unwrap().len();
+                        stats.items += 1;
+                    }
+                    stats.chunks += 1;
+                    HostCallResult::success(&request, json!({"acceptedSequence": sequence}))
+                }
+                ArtifactWriteJsonStreamArguments::Finish { chunks, items, .. } => {
+                    assert_eq!(chunks, stats.chunks);
+                    assert_eq!(items, stats.items);
+                    let bytes = stats.json_bytes;
+                    HostCallResult::success(
+                        &request,
+                        json!({
+                            "path": "/synthetic/large-rows.json",
+                            "bytes": bytes,
+                            "mediaType": "application/json",
+                        }),
+                    )
+                }
+                ArtifactWriteJsonStreamArguments::Abort { .. } => {
+                    stats.aborted = true;
+                    HostCallResult::success(&request, json!({"aborted": true}))
+                }
+            }
+        })
+    });
+    let result = worker
+        .execute_with_host_handler(
+            r#"az.artifacts.writeJsonArray({
+                name: "large-rows.json",
+                values: (async function* () {
+                    for (let index = 0; index < 96; index += 1) {
+                        yield {index, payload: "x".repeat(360 * 1024)};
+                    }
+                })(),
+            })"#,
+            Duration::from_secs(20),
+            handler,
+        )
+        .await
+        .expect("stream large JSON array through subprocess");
+    let stats = observed.lock().await;
+    assert!(stats.json_bytes > 32 * 1024 * 1024);
+    assert_eq!(stats.items, 96);
+    assert!(stats.chunks <= MAX_ARTIFACT_STREAM_CHUNKS);
+    assert!(stats.maximum_frame_bytes <= MAX_HOST_CALL_FRAME_BYTES);
+    assert!(!stats.aborted);
+    assert_eq!(
+        result.value["bytes"].as_u64(),
+        Some(u64::try_from(stats.json_bytes).unwrap())
+    );
+    drop(stats);
+    worker.close().await.expect("clean close");
+}
+
+#[tokio::test]
+async fn subprocess_streams_json_lines_as_normalized_values() {
+    let mut worker = WorkerProcess::start(env!("CARGO_BIN_EXE_azmcp"))
+        .await
+        .expect("start isolated worker");
+    let streamed = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&streamed);
+    let handler: HostCallHandler = Arc::new(move |request| {
+        let streamed = Arc::clone(&streamed);
+        Box::pin(async move {
+            assert_eq!(request.method, HOST_METHOD_ARTIFACT_WRITE_JSON_LINES);
+            assert!(
+                request
+                    .encoded_frame_bytes()
+                    .expect("serializable host frame")
+                    <= MAX_HOST_CALL_FRAME_BYTES
+            );
+            let phase = serde_json::from_value::<ArtifactWriteJsonStreamArguments>(
+                request.arguments.clone(),
+            )
+            .expect("closed stream phase");
+            phase.validate().expect("bounded stream phase");
+            match phase {
+                ArtifactWriteJsonStreamArguments::Begin { name } => {
+                    assert_eq!(name, "rows.jsonl");
+                    HostCallResult::success(&request, json!({"streamId": "stream_json_lines"}))
+                }
+                ArtifactWriteJsonStreamArguments::Append {
+                    sequence, values, ..
+                } => {
+                    assert_eq!(sequence, 0);
+                    streamed.lock().await.extend(values);
+                    HostCallResult::success(&request, json!({"acceptedSequence": sequence}))
+                }
+                ArtifactWriteJsonStreamArguments::Finish { chunks, items, .. } => {
+                    assert_eq!(chunks, 1);
+                    assert_eq!(
+                        items,
+                        u64::try_from(streamed.lock().await.len()).expect("item count fits u64")
+                    );
+                    HostCallResult::success(
+                        &request,
+                        json!({
+                            "path": "/synthetic/rows.jsonl",
+                            "mediaType": "application/x-ndjson",
+                        }),
+                    )
+                }
+                ArtifactWriteJsonStreamArguments::Abort { .. } => {
+                    panic!("successful stream must not abort")
+                }
+            }
+        })
+    });
+    let result = worker
+        .execute_with_host_handler(
+            r#"az.artifacts.writeJsonLines({
+                name: "rows.jsonl",
+                values: (async function* () {
+                    yield {index: 0, toJSON() { return {index: this.index}; }};
+                    yield ["nested", true];
+                    yield "text";
+                    yield null;
+                })(),
+            })"#,
+            Duration::from_secs(2),
+            handler,
+        )
+        .await
+        .expect("stream JSON Lines through subprocess");
+    let streamed = observed.lock().await;
+    let lines = streamed
+        .iter()
+        .map(|value| serde_json::to_string(value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(lines, "{\"index\":0}\n[\"nested\",true]\n\"text\"\nnull\n");
+    assert_eq!(result.value["mediaType"], "application/x-ndjson");
+    drop(streamed);
     worker.close().await.expect("clean close");
 }
 
