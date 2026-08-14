@@ -383,7 +383,7 @@ fn context_close() -> Tool {
 fn run() -> Tool {
     tool(
         RUN_TOOL,
-        "Execute JavaScript in a retained inspect-only context. Use az.graph for fleet inventory and az.request only for reviewed ARM routes.",
+        "Execute JavaScript in a retained inspect-only context. Use az.graph for fleet inventory, az.request for reviewed ARM routes, az.metrics.single({cloud, resourceId, metricNames, timespan?, interval?, aggregation?, top?, orderBy?, filter?, resultType?, metricNamespace?, autoAdjustTimegrain?, validateDimensions?, rollupBy?}) for one resource, and az.metrics.batch({cloud, region, resourceIds, metricNamespace, metricNames, startTime?, endTime?, interval?, aggregation?, top?, orderBy?, filter?, rollupBy?}) for up to 50 same-type resources. Both metrics helpers require an explicit cloud; batch also requires an explicit regional endpoint.",
         json!({
             "type": "object",
             "properties": {

@@ -14,6 +14,41 @@ pub const PROVIDERS_API_VERSION: &str = "2021-04-01";
 pub const RESOURCE_GRAPH_API_VERSION: &str = "2022-10-01";
 /// Stable identity of the checked-in bootstrap policy contents.
 pub const V0_POLICY_HASH: &str = "v0-bootstrap-1";
+/// Pinned ARM metrics API version from azure-rest-api-specs commit
+/// f05d9ee6113a6536cc39c374608c8daf007b1d38.
+pub const METRICS_API_VERSION: &str = "2023-10-01";
+
+/// Query controls reviewed from the 2023-10-01 ARM metrics operation.
+const METRICS_SINGLE_QUERY_PARAMETERS: &[&str] = &[
+    "timespan",
+    "interval",
+    "metricnames",
+    "aggregation",
+    "top",
+    "orderby",
+    "$filter",
+    "resultType",
+    "metricnamespace",
+    "AutoAdjustTimegrain",
+    "ValidateDimensions",
+    "rollupby",
+];
+
+/// Query controls reviewed from the 2023-10-01 metrics:getBatch operation in
+/// azure-rest-api-specs commit
+/// 3c0811c51be6cb34f4e151ee333439bfbfac354e.
+const METRICS_BATCH_QUERY_PARAMETERS: &[&str] = &[
+    "starttime",
+    "endtime",
+    "interval",
+    "metricnamespace",
+    "metricnames",
+    "aggregation",
+    "top",
+    "orderby",
+    "filter",
+    "rollupby",
+];
 
 /// Construct the deliberately small route bundle used by the first v0 scenarios.
 ///
@@ -51,6 +86,30 @@ pub fn v0_policy() -> Result<PolicyBundle, V0PolicyError> {
             "Microsoft.ResourceGraph/resources/read",
             ArmTier::Inspect,
         )?);
+        routes.push(
+            ReviewedRoute::new(
+                cloud,
+                RoutePurpose::MetricsSingle,
+                HttpMethod::Get,
+                "/{resourceUri}/providers/Microsoft.Insights/metrics",
+                [METRICS_API_VERSION],
+                "Microsoft.Insights/Metrics/Read",
+                ArmTier::Inspect,
+            )?
+            .with_query_parameters(METRICS_SINGLE_QUERY_PARAMETERS.iter().copied())?,
+        );
+        routes.push(
+            ReviewedRoute::new(
+                cloud,
+                RoutePurpose::MetricsBatch,
+                HttpMethod::Post,
+                "/subscriptions/{subscription}/metrics:getBatch",
+                [METRICS_API_VERSION],
+                "Microsoft.Insights/Metrics/Read",
+                ArmTier::Inspect,
+            )?
+            .with_query_parameters(METRICS_BATCH_QUERY_PARAMETERS.iter().copied())?,
+        );
     }
     Ok(PolicyBundle::new(V0_POLICY_VERSION, routes)?)
 }
@@ -140,6 +199,70 @@ mod tests {
                     method,
                     &target,
                     version,
+                ),
+                Err(PolicyDenial::UnknownRoute)
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_routes_cover_single_resource_and_subscription_batch_shapes() {
+        let policy = v0_policy().expect("checked-in policy is valid");
+        for cloud in [AzureCloud::AzureCloud, AzureCloud::AzureUSGovernment] {
+            let single = RelativeRequestTarget::parse(
+                "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm/providers/Microsoft.Insights/metrics?metricnames=Percentage%20CPU&$filter=Location%20eq%20%27west%27",
+            )
+            .expect("single metrics target");
+            assert_eq!(
+                policy
+                    .classify(
+                        cloud,
+                        RoutePurpose::MetricsSingle,
+                        HttpMethod::Get,
+                        &single,
+                        METRICS_API_VERSION,
+                    )
+                    .expect("single metrics route")
+                    .rbac_action(),
+                "Microsoft.Insights/Metrics/Read"
+            );
+
+            let batch = RelativeRequestTarget::parse(
+                "/subscriptions/11111111-1111-1111-1111-111111111111/metrics:getBatch?metricnamespace=Microsoft.Compute&metricnames=Percentage%20CPU&filter=Location%20eq%20%27west%27",
+            )
+            .expect("batch metrics target");
+            assert!(
+                policy
+                    .classify(
+                        cloud,
+                        RoutePurpose::MetricsBatch,
+                        HttpMethod::Post,
+                        &batch,
+                        METRICS_API_VERSION,
+                    )
+                    .is_ok()
+            );
+            assert_eq!(
+                policy.classify(
+                    cloud,
+                    RoutePurpose::MetricsBatch,
+                    HttpMethod::Get,
+                    &batch,
+                    METRICS_API_VERSION,
+                ),
+                Err(PolicyDenial::UnknownRoute)
+            );
+            let unknown_query = RelativeRequestTarget::parse(
+                "/subscriptions/11111111-1111-1111-1111-111111111111/metrics:getBatch?resourceids=x",
+            )
+            .expect("target");
+            assert_eq!(
+                policy.classify(
+                    cloud,
+                    RoutePurpose::MetricsBatch,
+                    HttpMethod::Post,
+                    &unknown_query,
+                    METRICS_API_VERSION,
                 ),
                 Err(PolicyDenial::UnknownRoute)
             );

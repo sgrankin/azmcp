@@ -300,6 +300,183 @@ impl fmt::Debug for ArmOrigin {
     }
 }
 
+/// An exact regional Azure Monitor Metrics origin.
+#[derive(Clone, Eq, PartialEq)]
+pub struct MetricsOrigin {
+    cloud: AzureCloud,
+    region: String,
+    url: Url,
+    loopback_override: bool,
+}
+
+impl MetricsOrigin {
+    /// Construct the exact regional data-plane origin from the reviewed cloud
+    /// manifest.
+    pub fn for_cloud(cloud: AzureCloud, region: &str) -> Result<Self, HttpError> {
+        let region = normalize_metrics_region(region)?;
+        let manifest = cloud.manifest();
+        let suffix = manifest.data_plane().metrics();
+        let url = Url::parse(&format!("https://{region}.{suffix}/"))
+            .map_err(|_| HttpError::InvalidManifestOrigin)?;
+        if url.scheme() != "https"
+            || url.path() != "/"
+            || url.username() != ""
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.port().is_some()
+        {
+            return Err(HttpError::InvalidManifestOrigin);
+        }
+        Ok(Self {
+            cloud,
+            region,
+            url,
+            loopback_override: false,
+        })
+    }
+
+    /// Construct a loopback-only origin for a synthetic metrics server.
+    pub fn loopback(cloud: AzureCloud, region: &str, url: Url) -> Result<Self, HttpError> {
+        let region = normalize_metrics_region(region)?;
+        let host = url.host_str().unwrap_or_default();
+        let is_loopback = host.eq_ignore_ascii_case("localhost")
+            || host == "127.0.0.1"
+            || host == "[::1]"
+            || host == "::1";
+        if !is_loopback
+            || !matches!(url.scheme(), "http" | "https")
+            || url.path() != "/"
+            || url.username() != ""
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(HttpError::InvalidLoopbackOrigin);
+        }
+        Ok(Self {
+            cloud,
+            region,
+            url,
+            loopback_override: true,
+        })
+    }
+
+    /// Parse and construct a loopback-only metrics origin.
+    pub fn loopback_from_str(
+        cloud: AzureCloud,
+        region: &str,
+        value: &str,
+    ) -> Result<Self, HttpError> {
+        let url = Url::parse(value).map_err(|_| HttpError::InvalidLoopbackOrigin)?;
+        Self::loopback(cloud, region, url)
+    }
+
+    /// The selected cloud.
+    pub const fn cloud(&self) -> AzureCloud {
+        self.cloud
+    }
+
+    /// The normalized region encoded in this origin.
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    /// The exact URL used as the request origin.
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// The origin string, including its required trailing slash.
+    pub fn as_str(&self) -> &str {
+        self.url.as_str()
+    }
+
+    fn is_loopback_override(&self) -> bool {
+        self.loopback_override
+    }
+}
+
+impl fmt::Debug for MetricsOrigin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetricsOrigin")
+            .field("cloud", &self.cloud)
+            .field("region", &self.region)
+            .field("url", &self.url.as_str())
+            .field("loopback_override", &self.loopback_override)
+            .finish()
+    }
+}
+
+/// A request origin selected from one of the reviewed Azure service families.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestOrigin {
+    /// Azure Resource Manager.
+    Arm(ArmOrigin),
+    /// Azure Monitor Metrics data plane.
+    Metrics(MetricsOrigin),
+}
+
+impl RequestOrigin {
+    /// The selected cloud.
+    pub const fn cloud(&self) -> AzureCloud {
+        match self {
+            Self::Arm(origin) => origin.cloud(),
+            Self::Metrics(origin) => origin.cloud(),
+        }
+    }
+
+    /// The exact URL used as the request origin.
+    pub fn url(&self) -> &Url {
+        match self {
+            Self::Arm(origin) => origin.url(),
+            Self::Metrics(origin) => origin.url(),
+        }
+    }
+
+    /// The origin string, including its required trailing slash.
+    pub fn as_str(&self) -> &str {
+        self.url().as_str()
+    }
+
+    fn is_loopback_override(&self) -> bool {
+        match self {
+            Self::Arm(origin) => origin.is_loopback_override(),
+            Self::Metrics(origin) => origin.is_loopback_override(),
+        }
+    }
+}
+
+fn normalize_metrics_region(value: &str) -> Result<String, HttpError> {
+    if value.is_empty()
+        || value.len() > 63
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+    {
+        return Err(HttpError::InvalidMetricsRegion);
+    }
+    let value = value.to_ascii_lowercase();
+    if value == "global"
+        || (value.len() >= 2
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && value
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric))
+    {
+        Ok(value)
+    } else {
+        Err(HttpError::InvalidMetricsRegion)
+    }
+}
+
 /// Return the exact reviewed ARM origin URL for a cloud without making a
 /// network request.
 pub fn manifest_origin(cloud: AzureCloud) -> Result<Url, HttpError> {
@@ -478,7 +655,7 @@ pub struct HttpClientConfig {
     subscription: SubscriptionId,
     tenant: TenantId,
     audience: TokenAudience,
-    origin: ArmOrigin,
+    origin: RequestOrigin,
     policy: PolicyBundle,
     limits: HttpLimits,
 }
@@ -506,11 +683,58 @@ impl HttpClientConfig {
         origin: ArmOrigin,
         policy: PolicyBundle,
     ) -> Result<Self, HttpError> {
+        if audience != TokenAudience::Arm {
+            return Err(HttpError::InvalidAudience);
+        }
+        Self::with_request_origin(
+            cloud,
+            subscription,
+            tenant,
+            audience,
+            RequestOrigin::Arm(origin),
+            policy,
+        )
+    }
+
+    /// Build a metrics configuration with an exact regional origin.
+    pub fn with_metrics_origin(
+        cloud: AzureCloud,
+        subscription: SubscriptionId,
+        tenant: TenantId,
+        origin: MetricsOrigin,
+        policy: PolicyBundle,
+    ) -> Result<Self, HttpError> {
+        Self::with_request_origin(
+            cloud,
+            subscription,
+            tenant,
+            TokenAudience::Metrics,
+            RequestOrigin::Metrics(origin),
+            policy,
+        )
+    }
+
+    fn with_request_origin(
+        cloud: AzureCloud,
+        subscription: SubscriptionId,
+        tenant: TenantId,
+        audience: TokenAudience,
+        origin: RequestOrigin,
+        policy: PolicyBundle,
+    ) -> Result<Self, HttpError> {
         if origin.cloud() != cloud {
             return Err(HttpError::OriginCloudMismatch);
         }
         if !origin.is_loopback_override() {
-            let expected = ArmOrigin::for_cloud(cloud)?;
+            let expected = match audience {
+                TokenAudience::Arm => RequestOrigin::Arm(ArmOrigin::for_cloud(cloud)?),
+                TokenAudience::Metrics => match &origin {
+                    RequestOrigin::Metrics(metrics) => {
+                        RequestOrigin::Metrics(MetricsOrigin::for_cloud(cloud, metrics.region())?)
+                    }
+                    RequestOrigin::Arm(_) => return Err(HttpError::InvalidAudience),
+                },
+            };
             if origin != expected {
                 return Err(HttpError::InvalidManifestOrigin);
             }
@@ -574,7 +798,7 @@ impl HttpClientConfig {
     }
 
     /// Selected exact origin.
-    pub fn origin(&self) -> &ArmOrigin {
+    pub fn origin(&self) -> &RequestOrigin {
         &self.origin
     }
 
@@ -644,6 +868,32 @@ impl HttpClient {
         let config =
             HttpClientConfig::with_origin(cloud, subscription, tenant, audience, origin, policy)?;
         Self::from_config(credential_provider, config)
+    }
+
+    /// Construct a metrics client for an explicit region while retaining the
+    /// immutable subscription, tenant, policy, credential provider, and test
+    /// origin selected for this client.
+    pub fn metrics_for_region(&self, region: &str) -> Result<Self, HttpError> {
+        let origin = match &self.config.origin {
+            RequestOrigin::Arm(origin) if origin.is_loopback_override() => {
+                MetricsOrigin::loopback_from_str(self.config.cloud, region, origin.as_str())?
+            }
+            RequestOrigin::Metrics(origin) if origin.is_loopback_override() => {
+                MetricsOrigin::loopback_from_str(self.config.cloud, region, origin.as_str())?
+            }
+            RequestOrigin::Arm(_) | RequestOrigin::Metrics(_) => {
+                MetricsOrigin::for_cloud(self.config.cloud, region)?
+            }
+        };
+        let config = HttpClientConfig::with_metrics_origin(
+            self.config.cloud,
+            self.config.subscription.clone(),
+            self.config.tenant.clone(),
+            origin,
+            self.config.policy.clone(),
+        )?
+        .with_limits(self.config.limits)?;
+        Self::from_config(Arc::clone(&self.credential_provider), config)
     }
 
     /// The immutable execution configuration.
@@ -793,7 +1043,7 @@ fn verify_subscription_scope(
 }
 
 fn build_request_url(
-    origin: &ArmOrigin,
+    origin: &RequestOrigin,
     target: &RelativeRequestTarget,
     api_version: &str,
 ) -> Result<Url, HttpError> {
@@ -936,8 +1186,11 @@ pub enum HttpError {
     #[error("invalid api-version")]
     InvalidApiVersion,
     /// The selected audience is not the reviewed ARM audience for the cloud.
-    #[error("invalid ARM token audience")]
+    #[error("invalid token audience for the selected Azure service")]
     InvalidAudience,
+    /// A metrics region is not a valid reviewed regional host label.
+    #[error("invalid metrics region")]
+    InvalidMetricsRegion,
     /// The built-in cloud manifest contained an unusable origin.
     #[error("invalid reviewed cloud origin")]
     InvalidManifestOrigin,
@@ -1131,6 +1384,80 @@ mod tests {
                 .as_str(),
             "https://management.usgovcloudapi.net/"
         );
+    }
+
+    #[test]
+    fn metrics_origins_are_exact_per_cloud_and_region() {
+        let commercial = MetricsOrigin::for_cloud(AzureCloud::AzureCloud, "EastUS")
+            .expect("commercial metrics origin");
+        let government = MetricsOrigin::for_cloud(AzureCloud::AzureUSGovernment, "usgov-virginia")
+            .expect("government metrics origin");
+        assert_eq!(
+            commercial.as_str(),
+            "https://eastus.metrics.monitor.azure.com/"
+        );
+        assert_eq!(
+            government.as_str(),
+            "https://usgov-virginia.metrics.monitor.azure.us/"
+        );
+        assert!(matches!(
+            MetricsOrigin::for_cloud(AzureCloud::AzureCloud, "east_us"),
+            Err(HttpError::InvalidMetricsRegion)
+        ));
+        assert!(matches!(
+            MetricsOrigin::for_cloud(AzureCloud::AzureCloud, "https://evil.example"),
+            Err(HttpError::InvalidMetricsRegion)
+        ));
+    }
+
+    #[tokio::test]
+    async fn metrics_loopback_uses_data_plane_audience_and_batch_route() {
+        let (base, server) = loopback_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        let provider = Arc::new(FakeCredentials::default());
+        let (subscription, tenant) = ids();
+        let origin = MetricsOrigin::loopback_from_str(
+            AzureCloud::AzureUSGovernment,
+            "usgov-virginia",
+            &base,
+        )
+        .expect("metrics loopback origin");
+        let client = HttpClient::from_config(
+            provider.clone(),
+            HttpClientConfig::with_metrics_origin(
+                AzureCloud::AzureUSGovernment,
+                subscription,
+                tenant,
+                origin,
+                crate::routes::v0_policy().expect("policy"),
+            )
+            .expect("metrics config"),
+        )
+        .expect("metrics client");
+        let target = RelativeRequestTarget::parse(
+            "/subscriptions/11111111-1111-1111-1111-111111111111/metrics:getBatch?metricnamespace=Microsoft.Compute&metricnames=Percentage%20CPU",
+        )
+        .expect("batch target");
+        let request = HttpRequest::for_purpose(
+            RoutePurpose::MetricsBatch,
+            HttpMethod::Post,
+            target,
+            crate::routes::METRICS_API_VERSION,
+        )
+        .expect("request")
+        .with_header("Content-Type", "application/json")
+        .with_body(br#"{"resourceids":["/subscriptions/11111111-1111-1111-1111-111111111111/providers/Microsoft.Compute/virtualMachines/vm"]}"#.to_vec());
+        client.execute(request).await.expect("metrics response");
+        let raw_request_bytes = server.await.expect("server task");
+        let raw_request = String::from_utf8_lossy(&raw_request_bytes);
+        assert!(raw_request.contains("POST /subscriptions/11111111-1111-1111-1111-111111111111/metrics%3AgetBatch?metricnamespace=Microsoft.Compute&metricnames=Percentage+CPU&api-version=2023-10-01 HTTP/1.1"));
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].cloud, AzureCloud::AzureUSGovernment);
+        assert_eq!(requests[0].audience, TokenAudience::Metrics);
+        assert_eq!(requests[0].resource(), "https://metrics.monitor.azure.us/");
     }
 
     #[tokio::test]

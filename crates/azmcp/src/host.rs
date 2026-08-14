@@ -1,7 +1,7 @@
 //! The semantic host-call boundary for the isolated JavaScript worker.
 //!
-//! The worker knows only two names: `az.request` and `az.graph`.  This module
-//! gives those names meaning without giving JavaScript a URL client, token, or
+//! The worker knows only reviewed host helpers.  This module gives those names
+//! meaning without giving JavaScript a URL client, token, or
 //! mutable Azure selection state.  Every call carries a cloud, resolves an
 //! immutable context binding, and then crosses the reviewed core HTTP policy.
 
@@ -17,7 +17,10 @@ use azmcp_core::{
     config::{CloudBinding, ResolvedCloudBinding, SubscriptionId},
     context::{ArmTier, BindingSource, Context, GraphScope, Identity},
     credential::{CredentialError, CredentialIdentityPin, TokenAudience},
-    http::{CredentialProvider, HttpClient, HttpError, HttpRequest, HttpResponse},
+    http::{
+        CredentialProvider, HttpClient, HttpError, HttpRequest, HttpResponse, MetricsOrigin,
+        RequestOrigin,
+    },
     policy::{HttpMethod, PolicyBundle, PolicyDenial, RoutePurpose},
     routes::RESOURCE_GRAPH_API_VERSION,
     target::RelativeRequestTarget,
@@ -27,8 +30,15 @@ use serde_json::{Value, json};
 
 use crate::{
     audit::AuditSink,
-    worker::{HOST_METHOD_GRAPH, HOST_METHOD_REQUEST, HostCallRequest, HostCallResult},
+    worker::{
+        HOST_METHOD_GRAPH, HOST_METHOD_METRICS_BATCH, HOST_METHOD_METRICS_SINGLE,
+        HOST_METHOD_REQUEST, HostCallRequest, HostCallResult,
+    },
 };
+
+const MAX_METRICS: usize = 20;
+const MAX_BATCH_RESOURCES: usize = 50;
+const METRICS_API_VERSION: &str = azmcp_core::routes::METRICS_API_VERSION;
 
 /// Maximum JSON response body that this v0 adapter will decode into a value.
 /// The transport has a larger byte cap so it can reject oversized responses
@@ -174,7 +184,7 @@ pub struct CallRecords {
     pub calls_omitted: usize,
 }
 
-/// Stable semantic failures returned by `az.request` and `az.graph`.
+/// Stable semantic failures returned by the JavaScript host helpers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostErrorCode {
@@ -336,6 +346,66 @@ pub struct GraphArgs {
     pub subscriptions: Option<Vec<String>>,
     #[serde(default)]
     pub scope: Option<GraphScopeArg>,
+}
+
+/// Closed arguments for a single-resource Azure Monitor Metrics call.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MetricsSingleArgs {
+    #[serde(default)]
+    pub cloud: Option<AzureCloud>,
+    pub resource_id: String,
+    pub metric_names: Vec<String>,
+    #[serde(default)]
+    pub timespan: Option<String>,
+    #[serde(default)]
+    pub interval: Option<String>,
+    #[serde(default)]
+    pub aggregation: Option<String>,
+    #[serde(default)]
+    pub top: Option<u32>,
+    #[serde(default)]
+    pub order_by: Option<String>,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub result_type: Option<String>,
+    #[serde(default)]
+    pub metric_namespace: Option<String>,
+    #[serde(default)]
+    pub auto_adjust_timegrain: Option<bool>,
+    #[serde(default)]
+    pub validate_dimensions: Option<bool>,
+    #[serde(default)]
+    pub rollup_by: Option<String>,
+}
+
+/// Closed arguments for the subscription-level Metrics batch call.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MetricsBatchArgs {
+    #[serde(default)]
+    pub cloud: Option<AzureCloud>,
+    pub region: String,
+    pub resource_ids: Vec<String>,
+    pub metric_namespace: String,
+    pub metric_names: Vec<String>,
+    #[serde(default)]
+    pub start_time: Option<String>,
+    #[serde(default)]
+    pub end_time: Option<String>,
+    #[serde(default)]
+    pub interval: Option<String>,
+    #[serde(default)]
+    pub aggregation: Option<String>,
+    #[serde(default)]
+    pub top: Option<u32>,
+    #[serde(default)]
+    pub order_by: Option<String>,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub rollup_by: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -535,6 +605,8 @@ impl HostAdapter {
         match method {
             HOST_METHOD_REQUEST => self.dispatch_request(arguments).await,
             HOST_METHOD_GRAPH => self.dispatch_graph(arguments).await,
+            HOST_METHOD_METRICS_SINGLE => self.dispatch_metrics_single(arguments).await,
+            HOST_METHOD_METRICS_BATCH => self.dispatch_metrics_batch(arguments).await,
             _ => Err(HostError::new(
                 HostErrorCode::ProtocolError,
                 "unknown host operation",
@@ -749,6 +821,167 @@ impl HostAdapter {
         decode_http_response(response)
     }
 
+    async fn dispatch_metrics_single(&self, arguments: Value) -> Result<Value, HostError> {
+        let args: MetricsSingleArgs = decode_arguments(arguments)?;
+        let cloud = args.cloud.ok_or_else(|| {
+            HostError::new(HostErrorCode::CloudRequired, "cloud is required", false)
+        })?;
+        let mut record = RecordBuilder::new(
+            HOST_METHOD_METRICS_SINGLE,
+            cloud,
+            &self.context,
+            &self.correlation_id,
+        );
+        record.method = "GET".to_owned();
+        record.api_version = METRICS_API_VERSION.to_owned();
+        record.api_version_source = "reviewedRoute".to_owned();
+
+        let result = match self.prepare_audit() {
+            Ok(()) => self.execute_metrics_single(args, &mut record).await,
+            Err(error) => Err(error),
+        };
+        let audit = self.push_record(record.finish(&result));
+        if audit.is_err() {
+            return Err(HostError::audit_unavailable());
+        }
+        result
+    }
+
+    async fn execute_metrics_single(
+        &self,
+        args: MetricsSingleArgs,
+        record: &mut RecordBuilder,
+    ) -> Result<Value, HostError> {
+        let resource = validate_metric_resource_id(&args.resource_id)?;
+        let (binding, source) = self.resolve_binding(
+            args.cloud_required(),
+            Some(resource.subscription.as_str().to_owned()),
+        )?;
+        record.subscription = Some(binding.subscription_id().to_owned());
+        record.subscription_source = Some(source);
+        record.tenant = Some(binding.tenant_id().to_owned());
+        let query = build_single_metrics_query(&args)?;
+        let target_text = format!(
+            "{}/providers/Microsoft.Insights/metrics{}",
+            resource.path, query
+        );
+        let target =
+            RelativeRequestTarget::parse(&target_text).map_err(|_| HostError::invalid())?;
+        let client = self.client_for(&binding)?;
+        let route = client
+            .config()
+            .policy()
+            .classify(
+                binding.cloud(),
+                RoutePurpose::MetricsSingle,
+                HttpMethod::Get,
+                &target,
+                METRICS_API_VERSION,
+            )
+            .map_err(|_| HostError::route_denied())?;
+        record.path_template = route.path_template().to_owned();
+        record.rbac_action = Some(route.rbac_action().to_owned());
+        record.decision = CallDecision::Allowed;
+        let request = HttpRequest::for_purpose(
+            RoutePurpose::MetricsSingle,
+            HttpMethod::Get,
+            target,
+            METRICS_API_VERSION,
+        )
+        .map_err(|_| HostError::invalid())?;
+        let response = client
+            .execute_with_identity_pin(request, Some(&self.identity_pin))
+            .await
+            .map_err(|error| map_http_error(error, &binding))?;
+        record.status = Some(response.status());
+        record.remaining_subscription_reads = remaining_subscription_reads(&response);
+        decode_http_response(response)
+    }
+
+    async fn dispatch_metrics_batch(&self, arguments: Value) -> Result<Value, HostError> {
+        let args: MetricsBatchArgs = decode_arguments(arguments)?;
+        let cloud = args.cloud.ok_or_else(|| {
+            HostError::new(HostErrorCode::CloudRequired, "cloud is required", false)
+        })?;
+        let mut record = RecordBuilder::new(
+            HOST_METHOD_METRICS_BATCH,
+            cloud,
+            &self.context,
+            &self.correlation_id,
+        );
+        record.method = "POST".to_owned();
+        record.api_version = METRICS_API_VERSION.to_owned();
+        record.api_version_source = "reviewedRoute".to_owned();
+
+        let result = match self.prepare_audit() {
+            Ok(()) => self.execute_metrics_batch(args, &mut record).await,
+            Err(error) => Err(error),
+        };
+        let audit = self.push_record(record.finish(&result));
+        if audit.is_err() {
+            return Err(HostError::audit_unavailable());
+        }
+        result
+    }
+
+    async fn execute_metrics_batch(
+        &self,
+        args: MetricsBatchArgs,
+        record: &mut RecordBuilder,
+    ) -> Result<Value, HostError> {
+        let resources = validate_batch_resource_ids(&args.resource_ids)?;
+        let (binding, source) = self.resolve_binding(
+            args.cloud_required(),
+            Some(resources[0].subscription.as_str().to_owned()),
+        )?;
+        record.subscription = Some(binding.subscription_id().to_owned());
+        record.subscription_source = Some(source);
+        record.tenant = Some(binding.tenant_id().to_owned());
+        let query = build_batch_metrics_query(&args)?;
+        let target_text = format!(
+            "/subscriptions/{}/metrics:getBatch{}",
+            binding.subscription_id(),
+            query
+        );
+        let target =
+            RelativeRequestTarget::parse(&target_text).map_err(|_| HostError::invalid())?;
+        let client = self.metrics_client_for(&binding, &args.region)?;
+        let route = client
+            .config()
+            .policy()
+            .classify(
+                binding.cloud(),
+                RoutePurpose::MetricsBatch,
+                HttpMethod::Post,
+                &target,
+                METRICS_API_VERSION,
+            )
+            .map_err(|_| HostError::route_denied())?;
+        record.path_template = route.path_template().to_owned();
+        record.rbac_action = Some(route.rbac_action().to_owned());
+        record.decision = CallDecision::Allowed;
+        let body = serde_json::to_vec(&json!({
+            "resourceids": resources.iter().map(|resource| resource.path.as_str()).collect::<Vec<_>>(),
+        }))
+        .map_err(|_| HostError::invalid())?;
+        let request = HttpRequest::for_purpose(
+            RoutePurpose::MetricsBatch,
+            HttpMethod::Post,
+            target,
+            METRICS_API_VERSION,
+        )
+        .map_err(|_| HostError::invalid())?
+        .with_header("Content-Type", "application/json")
+        .with_body(body);
+        let response = client
+            .execute_with_identity_pin(request, Some(&self.identity_pin))
+            .await
+            .map_err(|error| map_http_error(error, &binding))?;
+        record.status = Some(response.status());
+        record.remaining_subscription_reads = remaining_subscription_reads(&response);
+        decode_http_response(response)
+    }
+
     fn resolve_binding(
         &self,
         cloud: AzureCloud,
@@ -886,6 +1119,38 @@ impl HostAdapter {
         Ok(client)
     }
 
+    fn metrics_client_for(
+        &self,
+        binding: &ResolvedCloudBinding,
+        region: &str,
+    ) -> Result<Arc<HttpClient>, HostError> {
+        // Validate the region against the reviewed cloud suffix before the
+        // client is constructed. This remains inert and cannot contact Azure.
+        MetricsOrigin::for_cloud(binding.cloud(), region).map_err(|_| HostError::invalid())?;
+        let arm_client = self.client_for(binding)?;
+        let client = arm_client.metrics_for_region(region).map_err(|_| {
+            HostError::new(
+                HostErrorCode::ClientUnavailable,
+                "HTTP client unavailable",
+                true,
+            )
+        })?;
+        let config = client.config();
+        if config.origin().cloud() != binding.cloud()
+            || config.subscription() != binding.subscription()
+            || config.tenant() != binding.tenant()
+            || config.audience() != TokenAudience::Metrics
+            || !matches!(config.origin(), RequestOrigin::Metrics(_))
+        {
+            return Err(HostError::new(
+                HostErrorCode::ClientUnavailable,
+                "HTTP client binding mismatch",
+                false,
+            ));
+        }
+        Ok(Arc::new(client))
+    }
+
     fn prepare_audit(&self) -> Result<(), HostError> {
         match &self.audit_sink {
             Some(sink) => sink.prepare().map_err(|_| HostError::audit_unavailable()),
@@ -927,6 +1192,20 @@ impl GraphArgs {
     }
 }
 
+impl MetricsSingleArgs {
+    fn cloud_required(&self) -> AzureCloud {
+        self.cloud
+            .expect("cloud checked before metrics single execution")
+    }
+}
+
+impl MetricsBatchArgs {
+    fn cloud_required(&self) -> AzureCloud {
+        self.cloud
+            .expect("cloud checked before metrics batch execution")
+    }
+}
+
 #[derive(Clone, Debug)]
 enum GraphSelection {
     Subscriptions(Vec<SubscriptionId>),
@@ -947,6 +1226,159 @@ fn parse_subscription_list(values: &[String]) -> Result<Vec<SubscriptionId>, Hos
         subscriptions.push(subscription);
     }
     Ok(subscriptions)
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedMetricResource {
+    subscription: SubscriptionId,
+    path: String,
+    resource_type: String,
+}
+
+fn validate_metric_resource_id(value: &str) -> Result<ValidatedMetricResource, HostError> {
+    let target = RelativeRequestTarget::parse(value).map_err(|_| HostError::invalid())?;
+    if !target.query().is_empty() {
+        return Err(HostError::invalid());
+    }
+    let segments = target.segments();
+    if segments.len() < 6 || !segments[0].eq_ignore_ascii_case("subscriptions") {
+        return Err(HostError::invalid());
+    }
+    let subscription =
+        SubscriptionId::new(segments[1].clone()).map_err(|_| HostError::invalid())?;
+    let provider_index = segments
+        .iter()
+        .position(|segment| segment.eq_ignore_ascii_case("providers"))
+        .ok_or_else(HostError::invalid)?;
+    let provider_namespace = segments
+        .get(provider_index + 1)
+        .filter(|segment| !segment.is_empty())
+        .ok_or_else(HostError::invalid)?;
+    let resource_segments = segments
+        .get(provider_index + 2..)
+        .filter(|segments| !segments.is_empty() && segments.len() % 2 == 0)
+        .ok_or_else(HostError::invalid)?;
+    if resource_segments.iter().any(|segment| segment.is_empty()) {
+        return Err(HostError::invalid());
+    }
+    let mut resource_type = provider_namespace.to_ascii_lowercase();
+    for type_name in resource_segments.iter().step_by(2) {
+        resource_type.push('/');
+        resource_type.push_str(&type_name.to_ascii_lowercase());
+    }
+    Ok(ValidatedMetricResource {
+        subscription,
+        path: target.path().to_owned(),
+        resource_type,
+    })
+}
+
+fn validate_batch_resource_ids(
+    values: &[String],
+) -> Result<Vec<ValidatedMetricResource>, HostError> {
+    if values.is_empty() || values.len() > MAX_BATCH_RESOURCES {
+        return Err(HostError::invalid());
+    }
+    let mut resources = Vec::with_capacity(values.len());
+    for value in values {
+        let resource = validate_metric_resource_id(value)?;
+        if resources.iter().any(|known: &ValidatedMetricResource| {
+            known.path.eq_ignore_ascii_case(&resource.path)
+                || known.subscription != resource.subscription
+                || known.resource_type != resource.resource_type
+        }) {
+            return Err(HostError::invalid());
+        }
+        resources.push(resource);
+    }
+    Ok(resources)
+}
+
+fn validate_metric_names(names: &[String]) -> Result<(), HostError> {
+    if names.is_empty() || names.len() > MAX_METRICS {
+        return Err(HostError::invalid());
+    }
+    if names.iter().any(|name| {
+        name.is_empty()
+            || name.len() > 256
+            || name.chars().any(char::is_control)
+            || name.contains(',')
+    }) {
+        return Err(HostError::invalid());
+    }
+    Ok(())
+}
+
+fn validate_metric_value(value: &str) -> Result<(), HostError> {
+    if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
+        return Err(HostError::invalid());
+    }
+    Ok(())
+}
+
+fn push_metric_query(
+    serializer: &mut url::form_urlencoded::Serializer<'_, String>,
+    name: &str,
+    value: Option<&str>,
+) -> Result<(), HostError> {
+    if let Some(value) = value {
+        validate_metric_value(value)?;
+        serializer.append_pair(name, value);
+    }
+    Ok(())
+}
+
+fn build_single_metrics_query(args: &MetricsSingleArgs) -> Result<String, HostError> {
+    validate_metric_names(&args.metric_names)?;
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    push_metric_query(&mut serializer, "timespan", args.timespan.as_deref())?;
+    push_metric_query(&mut serializer, "interval", args.interval.as_deref())?;
+    let metric_names = args.metric_names.join(",");
+    push_metric_query(&mut serializer, "metricnames", Some(&metric_names))?;
+    push_metric_query(&mut serializer, "aggregation", args.aggregation.as_deref())?;
+    if let Some(top) = args.top {
+        serializer.append_pair("top", &top.to_string());
+    }
+    push_metric_query(&mut serializer, "orderby", args.order_by.as_deref())?;
+    push_metric_query(&mut serializer, "$filter", args.filter.as_deref())?;
+    push_metric_query(&mut serializer, "resultType", args.result_type.as_deref())?;
+    push_metric_query(
+        &mut serializer,
+        "metricnamespace",
+        args.metric_namespace.as_deref(),
+    )?;
+    if let Some(value) = args.auto_adjust_timegrain {
+        serializer.append_pair("AutoAdjustTimegrain", if value { "true" } else { "false" });
+    }
+    if let Some(value) = args.validate_dimensions {
+        serializer.append_pair("ValidateDimensions", if value { "true" } else { "false" });
+    }
+    push_metric_query(&mut serializer, "rollupby", args.rollup_by.as_deref())?;
+    Ok(format!("?{}", serializer.finish()))
+}
+
+fn build_batch_metrics_query(args: &MetricsBatchArgs) -> Result<String, HostError> {
+    validate_metric_names(&args.metric_names)?;
+    validate_metric_value(&args.metric_namespace)?;
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    push_metric_query(&mut serializer, "starttime", args.start_time.as_deref())?;
+    push_metric_query(&mut serializer, "endtime", args.end_time.as_deref())?;
+    push_metric_query(&mut serializer, "interval", args.interval.as_deref())?;
+    push_metric_query(
+        &mut serializer,
+        "metricnamespace",
+        Some(&args.metric_namespace),
+    )?;
+    let metric_names = args.metric_names.join(",");
+    push_metric_query(&mut serializer, "metricnames", Some(&metric_names))?;
+    push_metric_query(&mut serializer, "aggregation", args.aggregation.as_deref())?;
+    if let Some(top) = args.top {
+        serializer.append_pair("top", &top.to_string());
+    }
+    push_metric_query(&mut serializer, "orderby", args.order_by.as_deref())?;
+    push_metric_query(&mut serializer, "filter", args.filter.as_deref())?;
+    push_metric_query(&mut serializer, "rollupby", args.rollup_by.as_deref())?;
+    Ok(format!("?{}", serializer.finish()))
 }
 
 fn method_name(method: HttpMethod) -> &'static str {
@@ -1054,7 +1486,8 @@ fn map_http_error(error: HttpError, binding: &ResolvedCloudBinding) -> HostError
         | HttpError::InvalidHeader { .. }
         | HttpError::InvalidHeaderValue { .. }
         | HttpError::DuplicateHeader { .. }
-        | HttpError::InvalidLimits { .. } => HostError::invalid(),
+        | HttpError::InvalidLimits { .. }
+        | HttpError::InvalidMetricsRegion => HostError::invalid(),
         HttpError::Timeout => HostError::new(
             HostErrorCode::UpstreamError,
             "upstream request timed out",
@@ -1226,21 +1659,21 @@ mod tests {
             .expect("resolved binding")
     }
 
-    fn context(graph_scope: GraphScope, extra: bool) -> Context {
+    fn context_for_cloud(cloud: AzureCloud, graph_scope: GraphScope, extra: bool) -> Context {
         let registry = ContextRegistry::new(RegistryConfig::new(
             2,
             std::time::Duration::from_secs(60),
             std::time::Duration::from_secs(600),
         ))
         .expect("registry");
-        let commercial = binding(AzureCloud::AzureCloud, extra);
+        let binding = binding(cloud, extra);
         let mut scopes = BTreeMap::new();
-        scopes.insert(AzureCloud::AzureCloud, graph_scope);
+        scopes.insert(cloud, graph_scope);
         let options = ContextOptions::new(
             Identity::User,
             ArmTier::Inspect,
             Vec::new(),
-            vec![commercial],
+            vec![binding],
             "test-policy-hash",
             "test-policy-v1",
         )
@@ -1250,6 +1683,10 @@ mod tests {
         registry
             .open(options, std::time::Instant::now())
             .expect("context")
+    }
+
+    fn context(graph_scope: GraphScope, extra: bool) -> Context {
+        context_for_cloud(AzureCloud::AzureCloud, graph_scope, extra)
     }
 
     fn policy() -> PolicyBundle {
@@ -1499,7 +1936,8 @@ mod tests {
             GraphScope::Subscriptions(vec![SubscriptionId::new(SUBSCRIPTION).unwrap()]),
             false,
         );
-        let adapter = HostAdapter::new(&context, factory);
+        let audit = Arc::new(RecordingAudit::default());
+        let adapter = HostAdapter::new(&context, factory).with_audit_sink(audit.clone());
         let result = adapter
             .handle(HostCallRequest {
                 id: 1,
@@ -1575,5 +2013,211 @@ mod tests {
         commercial_server.await.expect("commercial server");
         government_server.await.expect("government server");
         assert_eq!(adapter.records().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn metrics_single_uses_arm_origin_and_keeps_resource_in_binding() {
+        let (origin, server_task) = server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+        )
+        .await;
+        let credentials = Arc::new(FakeCredentials::default());
+        let factory = Arc::new(TestFactory {
+            credentials: credentials.clone(),
+            origins: [(AzureCloud::AzureCloud, origin)].into_iter().collect(),
+            policy: policy(),
+        });
+        let context = context(
+            GraphScope::Subscriptions(vec![SubscriptionId::new(SUBSCRIPTION).unwrap()]),
+            true,
+        );
+        let audit = Arc::new(RecordingAudit::default());
+        let adapter = HostAdapter::new(&context, factory).with_audit_sink(audit.clone());
+        let result = adapter
+            .dispatch(
+                HOST_METHOD_METRICS_SINGLE,
+                json!({
+                    "cloud": "AzureCloud",
+                    "resourceId": format!("/subscriptions/{EXTRA_SUBSCRIPTION}/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm"),
+                    "metricNames": ["Percentage CPU"],
+                    "timespan": "PT1H",
+                    "filter": "Location eq 'eastus'"
+                }),
+            )
+            .await
+            .expect("metrics response");
+        assert_eq!(result["status"], 200);
+        let raw_request_bytes = server_task.await.expect("server");
+        let raw_request = String::from_utf8_lossy(&raw_request_bytes);
+        assert!(raw_request.contains("GET /subscriptions/22222222-2222-2222-2222-222222222222/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm/providers/Microsoft.Insights/metrics"));
+        assert!(raw_request.contains("metricnames=Percentage+CPU"));
+        let requests = credentials.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].cloud, AzureCloud::AzureCloud);
+        assert_eq!(requests[0].audience, TokenAudience::Arm);
+        assert_eq!(requests[0].subscription_id.as_str(), EXTRA_SUBSCRIPTION);
+        assert_eq!(requests[0].tenant_id.as_str(), EXTRA_TENANT);
+        let records = adapter.records();
+        let record = records.last().expect("audit record");
+        assert_eq!(record.operation, HOST_METHOD_METRICS_SINGLE);
+        assert_eq!(
+            record.rbac_action.as_deref(),
+            Some("Microsoft.Insights/Metrics/Read")
+        );
+        let durable = audit
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let encoded = serde_json::to_string(durable.last().expect("durable record")).expect("JSON");
+        assert!(!encoded.contains("Percentage CPU"));
+        assert!(!encoded.contains("eastus"));
+        assert!(!encoded.contains("resourceGroups"));
+    }
+
+    #[tokio::test]
+    async fn metrics_batch_uses_government_data_plane_and_lowercase_body() {
+        let (origin, server_task) = server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+        )
+        .await;
+        let credentials = Arc::new(FakeCredentials::default());
+        let factory = Arc::new(TestFactory {
+            credentials: credentials.clone(),
+            origins: [(AzureCloud::AzureUSGovernment, origin)]
+                .into_iter()
+                .collect(),
+            policy: policy(),
+        });
+        let context = context_for_cloud(
+            AzureCloud::AzureUSGovernment,
+            GraphScope::Subscriptions(vec![SubscriptionId::new(SUBSCRIPTION).unwrap()]),
+            false,
+        );
+        let adapter = HostAdapter::new(&context, factory);
+        let result = adapter
+            .dispatch(
+                HOST_METHOD_METRICS_BATCH,
+                json!({
+                    "cloud": "AzureUSGovernment",
+                    "region": "usgov-virginia",
+                    "resourceIds": [
+                        format!("/subscriptions/{SUBSCRIPTION}/resourceGroups/rg1/providers/Microsoft.Compute/virtualMachines/vm1"),
+                        format!("/subscriptions/{SUBSCRIPTION}/resourceGroups/rg2/providers/Microsoft.Compute/virtualMachines/vm2")
+                    ],
+                    "metricNamespace": "Microsoft.Compute",
+                    "metricNames": ["Percentage CPU"],
+                    "startTime": "2024-01-01T00:00:00Z",
+                    "endTime": "2024-01-01T01:00:00Z"
+                }),
+            )
+            .await
+            .expect("batch response");
+        assert_eq!(result["status"], 200);
+        let raw_request_bytes = server_task.await.expect("server");
+        let raw_request = String::from_utf8_lossy(&raw_request_bytes);
+        assert!(raw_request.contains(
+            "POST /subscriptions/11111111-1111-1111-1111-111111111111/metrics%3AgetBatch"
+        ));
+        assert!(raw_request.contains("metricnamespace=Microsoft.Compute"));
+        assert!(raw_request.contains("\"resourceids\":[\"/subscriptions/"));
+        assert!(!raw_request.contains("resourceIds"));
+        let requests = credentials.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].cloud, AzureCloud::AzureUSGovernment);
+        assert_eq!(requests[0].audience, TokenAudience::Metrics);
+        let records = adapter.records();
+        let record = records.last().expect("audit record");
+        assert_eq!(record.operation, HOST_METHOD_METRICS_BATCH);
+        assert_eq!(
+            record.rbac_action.as_deref(),
+            Some("Microsoft.Insights/Metrics/Read")
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_reject_cross_subscription_and_mixed_resource_types_before_credentials() {
+        let credentials = Arc::new(FakeCredentials::default());
+        let factory = Arc::new(TestFactory {
+            credentials: credentials.clone(),
+            origins: BTreeMap::new(),
+            policy: policy(),
+        });
+        let context = context(
+            GraphScope::Subscriptions(vec![SubscriptionId::new(SUBSCRIPTION).unwrap()]),
+            false,
+        );
+        let adapter = HostAdapter::new(&context, factory);
+        let wrong_subscription = adapter
+            .dispatch(
+                HOST_METHOD_METRICS_SINGLE,
+                json!({
+                    "cloud": "AzureCloud",
+                    "resourceId": format!("/subscriptions/{EXTRA_SUBSCRIPTION}/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm"),
+                    "metricNames": ["Percentage CPU"]
+                }),
+            )
+            .await
+            .expect_err("subscription is immutable");
+        assert_eq!(wrong_subscription.code, HostErrorCode::SubscriptionMismatch);
+        let mixed_types = adapter
+            .dispatch(
+                HOST_METHOD_METRICS_BATCH,
+                json!({
+                    "cloud": "AzureCloud",
+                    "region": "eastus",
+                    "resourceIds": [
+                        format!("/subscriptions/{SUBSCRIPTION}/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm"),
+                        format!("/subscriptions/{SUBSCRIPTION}/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/vnet")
+                    ],
+                    "metricNamespace": "Microsoft.Compute",
+                    "metricNames": ["Percentage CPU"]
+                }),
+            )
+            .await
+            .expect_err("batch resource type is fixed");
+        assert_eq!(mixed_types.code, HostErrorCode::InvalidRequest);
+
+        let invalid_region = adapter
+            .dispatch(
+                HOST_METHOD_METRICS_BATCH,
+                json!({
+                    "cloud": "AzureCloud",
+                    "region": "east_us",
+                    "resourceIds": [format!("/subscriptions/{SUBSCRIPTION}/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm")],
+                    "metricNamespace": "Microsoft.Compute",
+                    "metricNames": ["Percentage CPU"]
+                }),
+            )
+            .await
+            .expect_err("region host label is closed");
+        assert_eq!(invalid_region.code, HostErrorCode::InvalidRequest);
+
+        let oversized = adapter
+            .dispatch(
+                HOST_METHOD_METRICS_SINGLE,
+                json!({
+                    "cloud": "AzureCloud",
+                    "resourceId": format!("/subscriptions/{SUBSCRIPTION}/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm"),
+                    "metricNames": vec!["metric"; MAX_METRICS + 1]
+                }),
+            )
+            .await
+            .expect_err("metric name cap");
+        assert_eq!(oversized.code, HostErrorCode::InvalidRequest);
+
+        let unknown = adapter
+            .dispatch(
+                HOST_METHOD_METRICS_SINGLE,
+                json!({
+                    "cloud": "AzureCloud",
+                    "resourceId": format!("/subscriptions/{SUBSCRIPTION}/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm"),
+                    "metricNames": ["Percentage CPU"],
+                    "headers": {}
+                }),
+            )
+            .await
+            .expect_err("unknown metrics field");
+        assert_eq!(unknown.code, HostErrorCode::InvalidRequest);
+        assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
     }
 }

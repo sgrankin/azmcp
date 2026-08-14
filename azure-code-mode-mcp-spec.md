@@ -1171,18 +1171,38 @@ be treated as a separate endpoint if any remain.
 
 ### 9.2 Azure Monitor metrics
 
-Already control plane, already covered by Reader — this is the `az rest` usage that
-disappears first.
+The single-resource operation is an ARM control-plane GET. The multi-resource operation is
+a separate regional Metrics data-plane POST; its HTTP method does not imply a write, and the
+reviewed metadata row uses the canonical `Microsoft.Insights/Metrics/Read` action for both.
 
-- Single resource: `GET …/providers/Microsoft.Insights/metrics` (`Microsoft.Insights/metrics/read`)
-- **Multi-resource batch**: `POST …/Microsoft.Insights/metrics:getBatch` — one call across
-  many resource IDs in a subscription+region. For pulling App Service platform metrics
-  across a fleet this is dramatically better than N single-resource calls, and it is a POST
-  that maps to a `/read` action, so it lands in `inspect` correctly via the metadata table
-  rather than via a method heuristic.
+```js
+az.metrics.single({
+  cloud, resourceId, metricNames, timespan?, interval?, aggregation?, top?,
+  orderBy?, filter?, resultType?, metricNamespace?, autoAdjustTimegrain?,
+  validateDimensions?, rollupBy?
+})
+az.metrics.batch({
+  cloud, region, resourceIds, metricNamespace, metricNames, startTime?, endTime?,
+  interval?, aggregation?, top?, orderBy?, filter?, rollupBy?
+})
+```
 
-Sugar: `az.gov.metrics(resourceIds, ['CpuTime','Http5xx'], { interval: 'PT5M' })`, batching
-transparently.
+Both calls require an explicit cloud. Batch requires an explicit validated region, keeps all
+resource IDs within the selected immutable subscription and resource type, limits requests to
+50 resources and 20 metric names, and sends the exact lower-case `resourceids` JSON member.
+Single uses `GET /{resourceUri}/providers/Microsoft.Insights/metrics?api-version=2023-10-01`
+against the selected ARM origin. Batch uses
+`POST /subscriptions/{subscriptionId}/metrics:getBatch?api-version=2023-10-01` against
+`https://{region}.metrics.monitor.azure.com/` in commercial Azure or
+`https://{region}.metrics.monitor.azure.us/` in Azure Government. The batch query uses
+`metricnamespace`, `metricnames`, and the reviewed lower-case controls; the single query uses
+the ARM operation's `$filter` spelling.
+
+Source pins: ARM route `azure-rest-api-specs`
+`f05d9ee6113a6536cc39c374608c8daf007b1d38`;
+batch route `3c0811c51be6cb34f4e151ee333439bfbfac354e`;
+2023-10 SDK client `6a3df963b195b8e14bb2eaf5a1167dfbc1dee450` and sovereign endpoint support
+`6b4267a13a5d20364cfc0ae6526a9e5a3fda73d8`.
 
 ### 9.3 Key Vault
 
@@ -1283,7 +1303,8 @@ unrecognized method/path/version is denied — the same fail-closed rule as §5.
 - Per-cloud subscription binding from config plus unambiguous single-subscription
   auto-binding and live validation.
 - `identity: 'user'` through the explicit Azure CLI credential broker (§4.7).
-- `az.request` and `az.graph` only, `inspect` only, no data-plane grants.
+- `az.request`, `az.graph`, and the inspect-only `az.metrics` helpers, with no write or
+  caller-selectable data-plane grants.
 - A deliberately small reviewed route bundle: subscription validation, Resource Graph,
   provider metadata, and an enumerated set of ARM GET path templates selected by the first
   real scenarios. “Needed by the first scenarios” is resolved into checked-in route rows

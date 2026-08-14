@@ -54,6 +54,8 @@ pub const WORKER_RSS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub const HOST_METHOD_REQUEST: &str = "az.request";
 pub const HOST_METHOD_GRAPH: &str = "az.graph";
+pub const HOST_METHOD_METRICS_SINGLE: &str = "az.metrics.single";
+pub const HOST_METHOD_METRICS_BATCH: &str = "az.metrics.batch";
 
 /// Keep shape diagnostics useful without allowing a pathological object key
 /// set to become a second oversized result.
@@ -1569,6 +1571,10 @@ const WORKER_BOOTSTRAP: &str = r#"
     value: Object.freeze(Object.assign(Object.create(null), {
       request: (arguments) => hostCall("az.request", arguments),
       graph: (arguments) => hostCall("az.graph", arguments),
+      metrics: Object.freeze(Object.assign(Object.create(null), {
+        single: (arguments) => hostCall("az.metrics.single", arguments),
+        batch: (arguments) => hostCall("az.metrics.batch", arguments),
+      })),
     })),
     writable: false,
     configurable: false,
@@ -1720,7 +1726,11 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
 }
 
 fn validate_host_call_request(request: &HostCallRequest) -> Result<(), String> {
-    if request.method != HOST_METHOD_REQUEST && request.method != HOST_METHOD_GRAPH {
+    if request.method != HOST_METHOD_REQUEST
+        && request.method != HOST_METHOD_GRAPH
+        && request.method != HOST_METHOD_METRICS_SINGLE
+        && request.method != HOST_METHOD_METRICS_BATCH
+    {
         return Err("unknown host-call method".to_owned());
     }
     if request.method.len() > MAX_HOST_METHOD_BYTES
@@ -2078,6 +2088,48 @@ mod tests {
                 {"method": HOST_METHOD_REQUEST, "n": 1},
                 {"method": HOST_METHOD_GRAPH, "n": 2}
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_exposes_explicit_metrics_helpers() {
+        let (response_tx, mut response_rx) = mpsc::channel(8);
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let bridge = HostBridge::new(response_tx, request_rx);
+        bridge.begin_execution(12);
+        let mut runtime = WorkerRuntime::new_with_host_bridge(bridge.clone()).unwrap();
+        let mut execution = Box::pin(runtime.execute(
+            "Promise.all([az.metrics.single({cloud: 'AzureCloud', metricNames: ['m']}), az.metrics.batch({cloud: 'AzureUSGovernment', region: 'usgov-virginia', resourceIds: [], metricNamespace: 'n', metricNames: ['m']})])",
+            Duration::from_secs(1),
+        ));
+        let mut methods = Vec::new();
+        let result = loop {
+            tokio::select! {
+                result = &mut execution => break result,
+                response = response_rx.recv() => {
+                    let Some(WorkerResponse::HostCall { id, call_id, method, arguments }) = response else {
+                        panic!("metrics host call channel closed before execution completed");
+                    };
+                    methods.push(method.clone());
+                    request_tx.send(WorkerRequest::HostCallResult {
+                        id,
+                        call_id,
+                        ok: true,
+                        value: Some(json!({"method": method, "arguments": arguments})),
+                        error: None,
+                    }).await.unwrap();
+                }
+            }
+        };
+        bridge.end_execution();
+        result.expect("metrics execution");
+        methods.sort_unstable();
+        assert_eq!(
+            methods,
+            vec![
+                HOST_METHOD_METRICS_BATCH.to_owned(),
+                HOST_METHOD_METRICS_SINGLE.to_owned()
+            ]
         );
     }
 

@@ -22,11 +22,29 @@ Schema discovery is offline and tied to the reviewed `az.request` policy. The
 bootstrap catalog currently returns route metadata with `metadataOnly` body
 schemas because no response fixtures are checked in.
 
-Inside `azure_run`, JavaScript has only `console`, `az.request`, and `az.graph`.
-There is no `fetch`, `Deno`, token access, ambient cloud, or ambient
-subscription. The v0 `az.request` surface accepts no caller headers or body;
-the reviewed route bundle currently contains subscription
-validation, provider metadata, and Resource Graph for Azure commercial and US
+Inside `azure_run`, JavaScript has only `console`, `az.request`, `az.graph`, and
+the reviewed `az.metrics` helpers. There is no `fetch`, `Deno`, token access,
+ambient cloud, or ambient subscription.
+
+The metrics signatures are explicit and closed:
+
+```js
+az.metrics.single({
+  cloud, resourceId, metricNames, timespan?, interval?, aggregation?, top?,
+  orderBy?, filter?, resultType?, metricNamespace?, autoAdjustTimegrain?,
+  validateDimensions?, rollupBy?
+})
+az.metrics.batch({
+  cloud, region, resourceIds, metricNamespace, metricNames, startTime?, endTime?,
+  interval?, aggregation?, top?, orderBy?, filter?, rollupBy?
+})
+```
+
+Both helpers require an explicit `cloud`. Batch requires an explicit validated
+regional endpoint, accepts at most 50 same-type resource IDs, and accepts at
+most 20 metric names. The v0 `az.request` surface accepts no caller headers or
+body. The reviewed route bundle contains subscription validation, provider
+metadata, Resource Graph, and metrics operations for Azure commercial and US
 Government clouds.
 
 ## Build and test

@@ -976,7 +976,7 @@ impl Application {
         self.inner.registry.clone()
     }
 
-    /// Whether `az.request` and `az.graph` have a real semantic host boundary.
+    /// Whether the reviewed JavaScript host helpers have a real semantic boundary.
     pub fn host_calls_ready(&self) -> bool {
         self.inner.host_client_factory.is_some()
     }

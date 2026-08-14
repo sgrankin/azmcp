@@ -88,6 +88,8 @@ impl TokenRequest {
 pub enum TokenAudience {
     /// The selected cloud's Azure Resource Manager audience.
     Arm,
+    /// The selected cloud's Azure Monitor Metrics data-plane audience.
+    Metrics,
 }
 
 impl TokenAudience {
@@ -96,6 +98,10 @@ impl TokenAudience {
             (Self::Arm, AzureCloud::AzureCloud) => crate::cloud::AZURE_CLOUD_ARM_AUDIENCE,
             (Self::Arm, AzureCloud::AzureUSGovernment) => {
                 crate::cloud::AZURE_US_GOVERNMENT_ARM_AUDIENCE
+            }
+            (Self::Metrics, AzureCloud::AzureCloud) => crate::cloud::AZURE_CLOUD_METRICS_AUDIENCE,
+            (Self::Metrics, AzureCloud::AzureUSGovernment) => {
+                crate::cloud::AZURE_US_GOVERNMENT_METRICS_AUDIENCE
             }
         }
     }

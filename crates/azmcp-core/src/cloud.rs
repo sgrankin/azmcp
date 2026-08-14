@@ -103,7 +103,10 @@ impl CloudManifest {
             active_directory: AZURE_CLOUD_ACTIVE_DIRECTORY.to_owned(),
             authentication: AuthenticationManifest {
                 authority: AZURE_CLOUD_ACTIVE_DIRECTORY.to_owned(),
-                audiences: vec![AZURE_CLOUD_ARM_AUDIENCE.to_owned()],
+                audiences: vec![
+                    AZURE_CLOUD_ARM_AUDIENCE.to_owned(),
+                    AZURE_CLOUD_METRICS_AUDIENCE.to_owned(),
+                ],
             },
             suffixes: EndpointSuffixes {
                 management: "management.azure.com".to_owned(),
@@ -113,6 +116,7 @@ impl CloudManifest {
             },
             data_plane: DataPlaneEndpoints {
                 resource_graph: AZURE_CLOUD_RESOURCE_GRAPH.to_owned(),
+                metrics: "metrics.monitor.azure.com".to_owned(),
             },
         }
     }
@@ -125,7 +129,10 @@ impl CloudManifest {
             active_directory: AZURE_US_GOVERNMENT_ACTIVE_DIRECTORY.to_owned(),
             authentication: AuthenticationManifest {
                 authority: AZURE_US_GOVERNMENT_ACTIVE_DIRECTORY.to_owned(),
-                audiences: vec![AZURE_US_GOVERNMENT_ARM_AUDIENCE.to_owned()],
+                audiences: vec![
+                    AZURE_US_GOVERNMENT_ARM_AUDIENCE.to_owned(),
+                    AZURE_US_GOVERNMENT_METRICS_AUDIENCE.to_owned(),
+                ],
             },
             suffixes: EndpointSuffixes {
                 management: "management.usgovcloudapi.net".to_owned(),
@@ -135,6 +142,7 @@ impl CloudManifest {
             },
             data_plane: DataPlaneEndpoints {
                 resource_graph: AZURE_US_GOVERNMENT_RESOURCE_GRAPH.to_owned(),
+                metrics: "metrics.monitor.azure.us".to_owned(),
             },
         }
     }
@@ -226,11 +234,17 @@ impl EndpointSuffixes {
 #[serde(rename_all = "camelCase")]
 pub struct DataPlaneEndpoints {
     resource_graph: String,
+    metrics: String,
 }
 
 impl DataPlaneEndpoints {
     pub fn resource_graph(&self) -> &str {
         &self.resource_graph
+    }
+
+    /// The exact regional metrics host suffix for this cloud.
+    pub fn metrics(&self) -> &str {
+        &self.metrics
     }
 }
 
@@ -239,6 +253,7 @@ pub const AZURE_CLOUD_METADATA_URL: &str =
 pub const AZURE_CLOUD_RESOURCE_MANAGER: &str = "https://management.azure.com/";
 pub const AZURE_CLOUD_ACTIVE_DIRECTORY: &str = "https://login.microsoftonline.com/";
 pub const AZURE_CLOUD_ARM_AUDIENCE: &str = "https://management.azure.com/";
+pub const AZURE_CLOUD_METRICS_AUDIENCE: &str = "https://metrics.monitor.azure.com/";
 pub const AZURE_CLOUD_RESOURCE_GRAPH: &str =
     "https://management.azure.com/providers/Microsoft.ResourceGraph/resources";
 
@@ -247,6 +262,7 @@ pub const AZURE_US_GOVERNMENT_METADATA_URL: &str =
 pub const AZURE_US_GOVERNMENT_RESOURCE_MANAGER: &str = "https://management.usgovcloudapi.net/";
 pub const AZURE_US_GOVERNMENT_ACTIVE_DIRECTORY: &str = "https://login.microsoftonline.us/";
 pub const AZURE_US_GOVERNMENT_ARM_AUDIENCE: &str = "https://management.usgovcloudapi.net/";
+pub const AZURE_US_GOVERNMENT_METRICS_AUDIENCE: &str = "https://metrics.monitor.azure.us/";
 pub const AZURE_US_GOVERNMENT_RESOURCE_GRAPH: &str =
     "https://management.usgovcloudapi.net/providers/Microsoft.ResourceGraph/resources";
 

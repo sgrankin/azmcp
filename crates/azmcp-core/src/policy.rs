@@ -43,6 +43,10 @@ pub enum RoutePurpose {
     ResourceGraph,
     /// Server-owned validation and metadata calls.
     Internal,
+    /// Server-owned single-resource Azure Monitor Metrics calls.
+    MetricsSingle,
+    /// Server-owned multi-resource Azure Monitor Metrics calls.
+    MetricsBatch,
 }
 
 /// One reviewed and executable route-policy row.
@@ -281,7 +285,11 @@ impl RouteTemplate {
                     {
                         return Err(InvalidRoute::PathTemplate);
                     }
-                    Ok(TemplateSegment::Parameter(parameter.to_owned()))
+                    if parameter == "resourceUri" {
+                        Ok(TemplateSegment::TailParameter(parameter.to_owned()))
+                    } else {
+                        Ok(TemplateSegment::Parameter(parameter.to_owned()))
+                    }
                 } else if segment.contains(['{', '}']) || segment.chars().any(char::is_control) {
                     Err(InvalidRoute::PathTemplate)
                 } else {
@@ -299,26 +307,90 @@ impl RouteTemplate {
     }
 
     fn matches(&self, request_segments: &[String]) -> bool {
-        if self.segments.len() != request_segments.len() {
+        if self.segments.len() > request_segments.len() {
             return false;
         }
-        let mut parameters = std::collections::BTreeMap::<&str, &str>::new();
-        self.segments
-            .iter()
-            .zip(request_segments)
-            .all(|(expected, actual)| match expected {
-                TemplateSegment::Literal(literal) => literal.eq_ignore_ascii_case(actual),
-                TemplateSegment::Parameter(name) => {
-                    !actual.is_empty()
-                        && parameters
-                            .get(name.as_str())
-                            .is_none_or(|previous| previous.eq_ignore_ascii_case(actual))
-                        && {
-                            parameters.insert(name, actual);
-                            true
-                        }
+        Self::matches_segments(
+            &self.segments,
+            request_segments,
+            0,
+            0,
+            &std::collections::BTreeMap::new(),
+        )
+    }
+
+    fn matches_segments(
+        expected: &[TemplateSegment],
+        actual: &[String],
+        expected_index: usize,
+        actual_index: usize,
+        parameters: &std::collections::BTreeMap<String, String>,
+    ) -> bool {
+        if expected_index == expected.len() {
+            return actual_index == actual.len();
+        }
+        match &expected[expected_index] {
+            TemplateSegment::TailParameter(_) => {
+                // A resource URI is the only reviewed multi-segment route
+                // parameter. It must leave the provider-extension suffix
+                // available for exact matching and must contain at least one
+                // segment so the route cannot match an empty resource.
+                let remaining = expected.len().saturating_sub(expected_index + 1);
+                if actual.len() < actual_index + remaining + 1 {
+                    return false;
                 }
-            })
+                let max_consumed = actual.len() - actual_index - remaining;
+                (1..=max_consumed).any(|consumed| {
+                    let mut parameters = parameters.clone();
+                    parameters.insert(
+                        "resourceUri".to_owned(),
+                        actual[actual_index..actual_index + consumed].join("/"),
+                    );
+                    Self::matches_segments(
+                        expected,
+                        actual,
+                        expected_index + 1,
+                        actual_index + consumed,
+                        &parameters,
+                    )
+                })
+            }
+            TemplateSegment::Literal(literal) => {
+                actual
+                    .get(actual_index)
+                    .is_some_and(|value| literal.eq_ignore_ascii_case(value))
+                    && Self::matches_segments(
+                        expected,
+                        actual,
+                        expected_index + 1,
+                        actual_index + 1,
+                        parameters,
+                    )
+            }
+            TemplateSegment::Parameter(name) => {
+                let Some(value) = actual.get(actual_index) else {
+                    return false;
+                };
+                if value.is_empty() {
+                    return false;
+                }
+                if parameters
+                    .get(name)
+                    .is_some_and(|previous| !previous.eq_ignore_ascii_case(value))
+                {
+                    return false;
+                }
+                let mut parameters = parameters.clone();
+                parameters.insert(name.clone(), value.clone());
+                Self::matches_segments(
+                    expected,
+                    actual,
+                    expected_index + 1,
+                    actual_index + 1,
+                    &parameters,
+                )
+            }
+        }
     }
 }
 
@@ -326,6 +398,7 @@ impl RouteTemplate {
 enum TemplateSegment {
     Literal(String),
     Parameter(String),
+    TailParameter(String),
 }
 
 /// A checked-in route row was malformed and cannot be loaded.
