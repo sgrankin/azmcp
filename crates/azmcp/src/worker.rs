@@ -1848,6 +1848,7 @@ const WORKER_BOOTSTRAP: &str = r#"
   }).join(" ");
   const write = (...args) => op(text(args));
   const PEEK_LIMIT = 32;
+  const PEEK_VISIT_LIMIT = PEEK_LIMIT * 2;
   const shapeType = (value) => {
     if (value === null) return "null";
     if (Array.isArray(value)) return "array";
@@ -1873,11 +1874,18 @@ const WORKER_BOOTSTRAP: &str = r#"
       }
       if (type === "object") {
         const sampledKeys = [];
-        let hasMore = false;
+        let ownKeyBeyondSample = false;
+        let visitLimitReached = false;
+        let visits = 0;
         for (const key in value) {
+          if (visits >= PEEK_VISIT_LIMIT) {
+            visitLimitReached = true;
+            break;
+          }
+          visits += 1;
           if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
           if (sampledKeys.length >= PEEK_LIMIT) {
-            hasMore = true;
+            ownKeyBeyondSample = true;
             break;
           }
           sampledKeys.push(key);
@@ -1892,8 +1900,8 @@ const WORKER_BOOTSTRAP: &str = r#"
           counts[childType] = (counts[childType] || 0) + 1;
         }
         const result = { type, keys, counts };
-        if (hasMore) {
-          result.keyCountAtLeast = PEEK_LIMIT + 1;
+        if (ownKeyBeyondSample || visitLimitReached) {
+          result.keyCountAtLeast = sampledKeys.length + (ownKeyBeyondSample ? 1 : 0);
           result.keysSampled = true;
           result.hasMore = true;
           result.countsSampled = true;
@@ -2488,7 +2496,7 @@ mod tests {
         let mut runtime = WorkerRuntime::new().unwrap();
         let result = runtime
             .execute(
-                "({peek: az.peek({secret: 'do-not-return', count: 2}), manyPeek: az.peek(Object.fromEntries(Array.from({length: 64}, (_, index) => [`key${index}`, index]))), refType: typeof az.ref})",
+                "({peek: az.peek({secret: 'do-not-return', count: 2}), manyPeek: az.peek(Object.fromEntries(Array.from({length: 64}, (_, index) => [`key${index}`, index]))), inheritedPeek: az.peek(Object.create(Object.fromEntries(Array.from({length: 128}, (_, index) => [`inherited${index}`, index])))), refType: typeof az.ref})",
                 Duration::from_secs(1),
             )
             .await
@@ -2506,6 +2514,17 @@ mod tests {
         assert_eq!(result.value["manyPeek"]["countsSampled"], true);
         assert!(result.value["manyPeek"].get("keyCount").is_none());
         assert!(result.value["manyPeek"].get("keysOmitted").is_none());
+        assert_eq!(result.value["inheritedPeek"]["keyCountAtLeast"], 0);
+        assert_eq!(
+            result.value["inheritedPeek"]["keys"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(result.value["inheritedPeek"]["keysSampled"], true);
+        assert_eq!(result.value["inheritedPeek"]["hasMore"], true);
+        assert!(result.value["inheritedPeek"].get("keyCount").is_none());
         let encoded = serde_json::to_string(&result.value).expect("peek JSON");
         assert!(!encoded.contains("do-not-return"));
     }

@@ -338,11 +338,11 @@ fn domain_error_result(
 }
 
 fn bounded_call_tool_result(value: Value, is_error: bool) -> Result<CallToolResponse, ErrorData> {
-    let encoded_bytes = serde_json::to_vec(&value)
+    let value_bytes = serde_json::to_vec(&value)
         .map_err(|_| ErrorData::internal_error("tool result sizing failed", None))?
         .len();
-    if encoded_bytes > MAX_TOOL_RESULT_BYTES {
-        return oversized_call_tool_result(&value, encoded_bytes);
+    if value_bytes > MAX_TOOL_RESULT_BYTES {
+        return oversized_call_tool_result(&value, value_bytes);
     }
 
     let result = if is_error {
@@ -350,7 +350,17 @@ fn bounded_call_tool_result(value: Value, is_error: bool) -> Result<CallToolResp
     } else {
         CallToolResult::structured(value)
     };
-    Ok(result.with_meta(Some(server_info_meta())).into())
+    let result = result.with_meta(Some(server_info_meta()));
+    let wire_bytes = serde_json::to_vec(&result)
+        .map_err(|_| ErrorData::internal_error("tool result sizing failed", None))?
+        .len();
+    if wire_bytes > MAX_TOOL_RESULT_BYTES {
+        let value = result.structured_content.as_ref().ok_or_else(|| {
+            ErrorData::internal_error("tool result structured content missing", None)
+        })?;
+        return oversized_call_tool_result(value, wire_bytes);
+    }
+    Ok(result.into())
 }
 
 fn oversized_call_tool_result(
@@ -367,18 +377,27 @@ fn oversized_call_tool_result(
         "correlationId": correlation_id.clone(),
         "details": result_too_large_details(&summary),
     });
+    let fallback = CallToolResult::structured_error(fallback).with_meta(Some(server_info_meta()));
     let fallback = match serde_json::to_vec(&fallback) {
         Ok(encoded) if encoded.len() <= MAX_TOOL_RESULT_BYTES => fallback,
-        _ => json!({
+        _ => CallToolResult::structured_error(json!({
             "code": "result_too_large",
             "message": "structured tool result exceeded the 1 MiB transport limit",
             "retryable": false,
             "correlationId": correlation_id,
-        }),
+        }))
+        .with_meta(Some(server_info_meta())),
     };
-    Ok(CallToolResult::structured_error(fallback)
-        .with_meta(Some(server_info_meta()))
-        .into())
+    let fallback_bytes = serde_json::to_vec(&fallback)
+        .map_err(|_| ErrorData::internal_error("bounded fallback sizing failed", None))?
+        .len();
+    if fallback_bytes > MAX_TOOL_RESULT_BYTES {
+        return Err(ErrorData::internal_error(
+            "bounded fallback exceeds the transport limit",
+            None,
+        ));
+    }
+    Ok(fallback.into())
 }
 
 fn result_too_large_details(summary: &ResultTooLargeSummary) -> Value {
@@ -1252,8 +1271,8 @@ mod tests {
         let rmcp::model::CallToolResponse::Complete(response) = response else {
             panic!("expected complete tool response");
         };
+        let encoded = serde_json::to_vec(&response).expect("complete MCP result JSON");
         let structured = response.structured_content.expect("structured content");
-        let encoded = serde_json::to_vec(&structured).expect("structured JSON");
         assert!(encoded.len() <= MAX_TOOL_RESULT_BYTES);
         assert_eq!(structured["code"], "result_too_large");
         assert!(
@@ -1261,6 +1280,20 @@ mod tests {
                 .unwrap()
                 .contains("DO-NOT-RETURN")
         );
+    }
+
+    #[test]
+    fn near_limit_success_is_bounded_as_a_complete_mcp_result() {
+        let value = json!({
+            "value": "x".repeat(MAX_TOOL_RESULT_BYTES / 2 - 2_048),
+        });
+        let response = bounded_call_tool_result(value, false).expect("bounded success");
+        let rmcp::model::CallToolResponse::Complete(response) = response else {
+            panic!("expected complete tool response");
+        };
+        let encoded = serde_json::to_vec(&response).expect("complete MCP result JSON");
+        assert!(encoded.len() <= MAX_TOOL_RESULT_BYTES);
+        assert_eq!(response.is_error, Some(false));
     }
 
     #[test]
