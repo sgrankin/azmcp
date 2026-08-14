@@ -1,11 +1,29 @@
 {
   "formatVersion": 1,
   "manifestId": "v1-observability-1",
-  "policyVersion": "v1-observability-1",
-  "policyHash": "sha256:d3655b57f92a18efdfc375446425e9e8d6ade644c2036c333e2f276cbd45c8bf",
+  "policyVersion": "v1-observability-2",
+  "policyHash": "sha256:120f3e489269e7dd720808354fdb8ccf8862e7d3f726e3d7179e1b452a20a0ed",
   "source": {
     "kind": "checked-in-reviewed-fixture",
-    "revision": "d13b7291813c0a17ebcfa0a0eca5f3dcaf71eb48"
+    "revision": "reviewed-manifest-v2",
+    "upstream": {
+      "kind": "azure-rest-openapi",
+      "repository": "https://github.com/Azure/azure-rest-api-specs",
+      "revision": "bd92126f09e7e3caa74f10fa1c944d1e451813ac",
+      "path": "specification/storage/resource-manager/Microsoft.Storage/stable/2023-05-01/storage.json",
+      "sourceSha256": "sha256:ed82ebe858480524bb4c974c86d705bc84a900f414328f91ec742f8ac6c7a132",
+      "catalogSha256": "sha256:a96d16decc6cbff908689f86cbfa0dd69ca03be788fee3ca261dc798beff9335",
+      "reviewId": "azure-rest-storage-review-v1",
+      "reviewRevision": "reviewed-storage-accounts-get-properties-v1",
+      "reviewSha256": "sha256:c122d731e730c5e86597d8dc773693f1935cbe10f1a7be2023ebd919ef8d1e13",
+      "rbacEvidence": {
+        "kind": "azure-rest-operations-example",
+        "repository": "https://github.com/Azure/azure-rest-api-specs",
+        "revision": "bd92126f09e7e3caa74f10fa1c944d1e451813ac",
+        "path": "specification/storage/resource-manager/Microsoft.Storage/stable/2023-05-01/examples/OperationsList.json",
+        "sourceSha256": "sha256:8984b143508e4782cfc0f3fbb7a23151e8c0d0c132d1e78a61c916f317cc6b6e"
+      }
+    }
   },
   "routes": [
     {
@@ -19,6 +37,20 @@
       "rbacAction": "Microsoft.Resources/subscriptions/providers/read",
       "armTier": "inspect",
       "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureCloud",
+      "purpose": "request",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}",
+      "apiVersions": [
+        "2023-05-01"
+      ],
+      "rbacAction": "Microsoft.Storage/storageAccounts/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": [
+        "$expand"
+      ]
     },
     {
       "cloud": "AzureCloud",
@@ -43,6 +75,20 @@
       "rbacAction": "Microsoft.Resources/subscriptions/providers/read",
       "armTier": "inspect",
       "allowedQueryParameters": []
+    },
+    {
+      "cloud": "AzureUSGovernment",
+      "purpose": "request",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}",
+      "apiVersions": [
+        "2023-05-01"
+      ],
+      "rbacAction": "Microsoft.Storage/storageAccounts/read",
+      "armTier": "inspect",
+      "allowedQueryParameters": [
+        "$expand"
+      ]
     },
     {
       "cloud": "AzureUSGovernment",
@@ -629,6 +675,62 @@
       "responseBodySchema": null
     },
     {
+      "entryId": "AzureCloud.storageAccounts.get",
+      "resourceType": "Microsoft.Storage/storageAccounts",
+      "operation": "get",
+      "purpose": "request",
+      "displayName": "Get storage account",
+      "description": "Read metadata for one reviewed Azure Storage account.",
+      "cliEquivalent": null,
+      "cloud": "AzureCloud",
+      "method": "GET",
+      "canonicalPathTemplate": "/subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}",
+      "requestPathTemplate": "/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}",
+      "apiVersions": [
+        "2023-05-01"
+      ],
+      "rbacAction": "Microsoft.Storage/storageAccounts/read",
+      "armTier": "inspect",
+      "dataPlaneGrant": null,
+      "argumentSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "apiVersion": {
+            "const": "2023-05-01"
+          },
+          "cloud": {
+            "enum": [
+              "AzureCloud"
+            ]
+          },
+          "method": {
+            "const": "GET"
+          },
+          "path": {
+            "description": "Relative az.request path matching /resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}; the host prepends the selected subscription for /subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          },
+          "subscription": {
+            "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cloud",
+          "method",
+          "path",
+          "apiVersion"
+        ],
+        "title": "az.request arguments for /subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}",
+        "type": "object"
+      },
+      "requestBodySchema": null,
+      "responseBodySchema": null
+    },
+    {
       "entryId": "AzureCloud.subscriptions.get",
       "resourceType": "Microsoft.Resources/subscriptions",
       "operation": "get",
@@ -1054,6 +1156,62 @@
           "apiVersion"
         ],
         "title": "az.request arguments for provider metadata",
+        "type": "object"
+      },
+      "requestBodySchema": null,
+      "responseBodySchema": null
+    },
+    {
+      "entryId": "AzureUSGovernment.storageAccounts.get",
+      "resourceType": "Microsoft.Storage/storageAccounts",
+      "operation": "get",
+      "purpose": "request",
+      "displayName": "Get storage account",
+      "description": "Read metadata for one reviewed Azure Storage account.",
+      "cliEquivalent": null,
+      "cloud": "AzureUSGovernment",
+      "method": "GET",
+      "canonicalPathTemplate": "/subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}",
+      "requestPathTemplate": "/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}",
+      "apiVersions": [
+        "2023-05-01"
+      ],
+      "rbacAction": "Microsoft.Storage/storageAccounts/read",
+      "armTier": "inspect",
+      "dataPlaneGrant": null,
+      "argumentSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "apiVersion": {
+            "const": "2023-05-01"
+          },
+          "cloud": {
+            "enum": [
+              "AzureUSGovernment"
+            ]
+          },
+          "method": {
+            "const": "GET"
+          },
+          "path": {
+            "description": "Relative az.request path matching /resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}; the host prepends the selected subscription for /subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          },
+          "subscription": {
+            "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cloud",
+          "method",
+          "path",
+          "apiVersion"
+        ],
+        "title": "az.request arguments for /subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}",
         "type": "object"
       },
       "requestBodySchema": null,

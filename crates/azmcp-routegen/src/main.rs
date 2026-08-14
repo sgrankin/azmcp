@@ -25,8 +25,8 @@ fn main() -> Result<(), String> {
         }
         let seed_bytes = fs::read(seed_path)
             .map_err(|error| format!("read {}: {error}", seed_path.display()))?;
-        let seed =
-            route_manifest::parse_manifest(&seed_bytes).map_err(|error| error.to_string())?;
+        let seed = route_manifest::parse_manifest_for_generation(&seed_bytes)
+            .map_err(|error| error.to_string())?;
         let upstream_path = args
             .upstream_path
             .as_ref()

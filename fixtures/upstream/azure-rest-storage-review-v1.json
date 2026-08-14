@@ -1,0 +1,47 @@
+{
+  "formatVersion": 1,
+  "reviewId": "azure-rest-storage-review-v1",
+  "source": {
+    "kind": "manual-route-review",
+    "revision": "reviewed-storage-accounts-get-properties-v1"
+  },
+  "upstream": {
+    "repository": "https://github.com/Azure/azure-rest-api-specs",
+    "revision": "bd92126f09e7e3caa74f10fa1c944d1e451813ac",
+    "path": "specification/storage/resource-manager/Microsoft.Storage/stable/2023-05-01/storage.json",
+    "sourceSha256": "sha256:ed82ebe858480524bb4c974c86d705bc84a900f414328f91ec742f8ac6c7a132",
+    "catalogSha256": "sha256:a96d16decc6cbff908689f86cbfa0dd69ca03be788fee3ca261dc798beff9335"
+  },
+  "rbacEvidence": {
+    "kind": "azure-rest-operations-example",
+    "repository": "https://github.com/Azure/azure-rest-api-specs",
+    "revision": "bd92126f09e7e3caa74f10fa1c944d1e451813ac",
+    "path": "specification/storage/resource-manager/Microsoft.Storage/stable/2023-05-01/examples/OperationsList.json",
+    "sourceSha256": "sha256:8984b143508e4782cfc0f3fbb7a23151e8c0d0c132d1e78a61c916f317cc6b6e"
+  },
+  "reviewSha256": "sha256:c122d731e730c5e86597d8dc773693f1935cbe10f1a7be2023ebd919ef8d1e13",
+  "operations": [
+    {
+      "operationId": "StorageAccounts_GetProperties",
+      "entryId": "AzureCloud.storageAccounts.get",
+      "displayName": "Get storage account",
+      "description": "Read metadata for one reviewed Azure Storage account.",
+      "cliEquivalent": null,
+      "cloud": "AzureCloud",
+      "armTier": "inspect",
+      "rbacAction": "Microsoft.Storage/storageAccounts/read",
+      "allowedQueryParameters": ["$expand"]
+    },
+    {
+      "operationId": "StorageAccounts_GetProperties",
+      "entryId": "AzureUSGovernment.storageAccounts.get",
+      "displayName": "Get storage account",
+      "description": "Read metadata for one reviewed Azure Storage account.",
+      "cliEquivalent": null,
+      "cloud": "AzureUSGovernment",
+      "armTier": "inspect",
+      "rbacAction": "Microsoft.Storage/storageAccounts/read",
+      "allowedQueryParameters": ["$expand"]
+    }
+  ]
+}

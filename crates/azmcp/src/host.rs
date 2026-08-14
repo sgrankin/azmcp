@@ -2239,6 +2239,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn storage_account_properties_route_is_pinned_per_cloud_and_query() {
+        let (commercial_origin, commercial_server) = server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+        )
+        .await;
+        let (government_origin, government_server) = server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+        )
+        .await;
+        let credentials = Arc::new(FakeCredentials::default());
+        let factory = Arc::new(TestFactory {
+            credentials: credentials.clone(),
+            origins: [
+                (AzureCloud::AzureCloud, commercial_origin),
+                (AzureCloud::AzureUSGovernment, government_origin),
+            ]
+            .into_iter()
+            .collect(),
+            policy: policy(),
+        });
+        let path = "/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/account?$expand=geoReplicationStats";
+
+        for cloud in [AzureCloud::AzureCloud, AzureCloud::AzureUSGovernment] {
+            let context = context_for_cloud(
+                cloud,
+                GraphScope::Subscriptions(vec![SubscriptionId::new(SUBSCRIPTION).unwrap()]),
+                false,
+            );
+            let adapter = HostAdapter::new(&context, factory.clone());
+            let value = adapter
+                .dispatch(
+                    HOST_METHOD_REQUEST,
+                    json!({
+                        "cloud": cloud,
+                        "method": "GET",
+                        "path": path,
+                        "apiVersion": "2023-05-01"
+                    }),
+                )
+                .await
+                .expect("storage account properties");
+            assert_eq!(value["body"], json!({"ok": true}));
+        }
+
+        assert_eq!(credentials.calls.load(Ordering::SeqCst), 2);
+        let commercial_request = String::from_utf8(commercial_server.await.expect("commercial"))
+            .expect("commercial request");
+        let government_request = String::from_utf8(government_server.await.expect("government"))
+            .expect("government request");
+        for request in [commercial_request, government_request] {
+            assert!(
+                request.starts_with(&format!(
+                    "GET /subscriptions/{SUBSCRIPTION}/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/account"
+                )),
+                "{request}"
+            );
+            assert!(
+                request.contains("%24expand=geoReplicationStats"),
+                "{request}"
+            );
+            assert!(request.contains("api-version=2023-05-01"), "{request}");
+        }
+
+        let denied = [
+            json!({
+                "cloud": "AzureCloud",
+                "method": "GET",
+                "path": "/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/account?$filter=bad",
+                "apiVersion": "2023-05-01"
+            }),
+            json!({
+                "cloud": "AzureCloud",
+                "method": "GET",
+                "path": path,
+                "apiVersion": "2024-01-01"
+            }),
+            json!({
+                "cloud": "AzureUSGovernment",
+                "method": "GET",
+                "path": path,
+                "apiVersion": "2023-05-01"
+            }),
+            json!({
+                "cloud": "AzureCloud",
+                "method": "GET",
+                "path": "/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts",
+                "apiVersion": "2023-05-01"
+            }),
+        ];
+        let context = context(
+            GraphScope::Subscriptions(vec![SubscriptionId::new(SUBSCRIPTION).unwrap()]),
+            false,
+        );
+        let adapter = HostAdapter::new(&context, factory);
+        for (arguments, expected) in denied.into_iter().zip([
+            HostErrorCode::RouteDenied,
+            HostErrorCode::RouteDenied,
+            HostErrorCode::BindingUnavailable,
+            HostErrorCode::RouteDenied,
+        ]) {
+            assert_eq!(
+                adapter
+                    .dispatch(HOST_METHOD_REQUEST, arguments)
+                    .await
+                    .expect_err("unreviewed storage request")
+                    .code,
+                expected
+            );
+        }
+        assert_eq!(credentials.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn subscription_root_request_does_not_add_a_trailing_slash() {
         let (origin, server_task) = server(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",

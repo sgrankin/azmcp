@@ -36,6 +36,8 @@ pub const REVIEW_FORMAT_VERSION: u32 = 1;
 pub const UPSTREAM_SOURCE_KIND: &str = "synthetic-upstream-contract";
 /// The pinned revision label for the checked-in contract fixture.
 pub const UPSTREAM_SOURCE_REVISION: &str = "synthetic-azure-rest-api-specs-v1";
+/// The source label for a normalized export from the official REST OpenAPI.
+pub const REAL_UPSTREAM_SOURCE_KIND: &str = "azure-rest-openapi";
 /// The pinned review identifier for the checked-in join.
 pub const UPSTREAM_REVIEW_ID: &str = "azure-rest-review-v1";
 /// The pinned revision label for the checked-in review join.
@@ -100,6 +102,10 @@ pub struct ReviewBundle {
     review_id: String,
     source: ReviewSource,
     upstream: UpstreamPin,
+    /// Independent provider-operation evidence for the manually reviewed
+    /// RBAC action.  This is deliberately not part of the OpenAPI operation
+    /// export and is never used to derive the action name.
+    rbac_evidence: RbacEvidencePin,
     /// SHA-256 of this canonical review with `reviewSha256` cleared.
     review_sha256: String,
     operations: Vec<ReviewOperation>,
@@ -120,6 +126,18 @@ struct UpstreamPin {
     path: String,
     source_sha256: String,
     catalog_sha256: String,
+}
+
+/// A separately pinned provider-operation artifact used as evidence for a
+/// manually reviewed RBAC action.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RbacEvidencePin {
+    kind: String,
+    repository: String,
+    revision: String,
+    path: String,
+    source_sha256: String,
 }
 
 /// One human-reviewed source operation and its exact v0 execution metadata.
@@ -154,6 +172,8 @@ pub enum UpstreamError {
     UnsupportedReviewFormat,
     #[error("upstream provenance is not pinned")]
     UnpinnedSource,
+    #[error("RBAC evidence provenance is not pinned")]
+    UnpinnedRbacEvidence,
     #[error("upstream catalog hash does not match its canonical content")]
     CatalogHashMismatch,
     #[error("upstream review does not pin the imported catalog")]
@@ -251,6 +271,9 @@ pub fn validate_review(review: &ReviewBundle) -> Result<(), UpstreamError> {
         || !valid_sha256(&review.upstream.catalog_sha256)
     {
         return Err(UpstreamError::UnpinnedSource);
+    }
+    if !valid_rbac_evidence(&review.rbac_evidence) {
+        return Err(UpstreamError::UnpinnedRbacEvidence);
     }
     if review.operations.len() > MAX_REVIEWS {
         return Err(UpstreamError::InvalidReviewCount);
@@ -470,8 +493,16 @@ pub fn merge_into_manifest(
             review_id: review.review_id.clone(),
             review_revision: review.source.revision.clone(),
             review_sha256: review.review_sha256.clone(),
+            rbac_evidence: crate::route_manifest::ManifestRbacEvidence {
+                kind: review.rbac_evidence.kind.clone(),
+                repository: review.rbac_evidence.repository.clone(),
+                revision: review.rbac_evidence.revision.clone(),
+                path: review.rbac_evidence.path.clone(),
+                source_sha256: review.rbac_evidence.source_sha256.clone(),
+            },
         },
     );
+    manifest.set_source_revision(crate::route_manifest::V1_SOURCE_REVISION);
     let policy_hash = crate::route_manifest::computed_policy_hash(manifest)
         .map_err(|error| UpstreamError::Manifest(error.to_string()))?;
     manifest.set_policy_hash(policy_hash);
@@ -511,8 +542,10 @@ pub fn operations(catalog: &UpstreamCatalog) -> &[UpstreamOperation] {
 }
 
 fn validate_source(source: &UpstreamSource) -> Result<(), UpstreamError> {
-    if source.kind != UPSTREAM_SOURCE_KIND
-        || !bounded(&source.repository, 512)
+    if !matches!(
+        source.kind.as_str(),
+        UPSTREAM_SOURCE_KIND | REAL_UPSTREAM_SOURCE_KIND
+    ) || !bounded(&source.repository, 512)
         || !bounded(&source.revision, 256)
         || !bounded(&source.path, 1_024)
         || !valid_sha256(&source.source_sha256)
@@ -630,6 +663,14 @@ fn valid_sha256(value: &str) -> bool {
             .all(|character| character.is_ascii_hexdigit())
 }
 
+fn valid_rbac_evidence(evidence: &RbacEvidencePin) -> bool {
+    bounded(&evidence.kind, 128)
+        && bounded(&evidence.repository, 512)
+        && bounded(&evidence.revision, 256)
+        && bounded(&evidence.path, 1_024)
+        && valid_sha256(&evidence.source_sha256)
+}
+
 fn review_operation_key(operation: &ReviewOperation) -> (String, String, AzureCloud) {
     (
         operation.entry_id.clone(),
@@ -741,7 +782,7 @@ mod tests {
         assert_eq!(review.review_id, UPSTREAM_REVIEW_ID);
         assert_eq!(review.source.revision, UPSTREAM_REVIEW_REVISION);
 
-        let base = route_manifest::checked_in_manifest().expect("base manifest");
+        let base = route_manifest::checked_in_seed_manifest().expect("base manifest");
         let expanded = generate_manifest(&base, &catalog, &review).expect("expanded manifest");
         assert_eq!(route_manifest::route_count(&expanded), 18);
         assert_eq!(route_manifest::schema_count(&expanded), 12);
@@ -772,7 +813,7 @@ mod tests {
     #[test]
     fn unreviewed_candidate_never_enters_discovery() {
         let (catalog, review) = fixtures();
-        let base = route_manifest::checked_in_manifest().expect("base manifest");
+        let base = route_manifest::checked_in_seed_manifest().expect("base manifest");
         let expanded = generate_manifest(&base, &catalog, &review).expect("expanded manifest");
         assert!(
             route_manifest::schemas(&expanded)
@@ -802,7 +843,7 @@ mod tests {
                 allowed_query_parameters: Vec::new(),
             });
             selected.review_sha256 = computed_review_hash(&selected).expect("review hash");
-            let base = route_manifest::checked_in_manifest().expect("base manifest");
+            let base = route_manifest::checked_in_seed_manifest().expect("base manifest");
             assert!(matches!(
                 generate_manifest(&base, &catalog, &selected),
                 Err(UpstreamError::UnsupportedOperation { .. })
@@ -815,7 +856,7 @@ mod tests {
         let (catalog, mut review) = fixtures();
         review.operations[0].arm_tier = ArmTier::Write;
         review.review_sha256 = computed_review_hash(&review).expect("review hash");
-        let base = route_manifest::checked_in_manifest().expect("base manifest");
+        let base = route_manifest::checked_in_seed_manifest().expect("base manifest");
         assert!(matches!(
             generate_manifest(&base, &catalog, &review),
             Err(UpstreamError::UnsupportedTier { .. })
@@ -853,11 +894,18 @@ mod tests {
         review.upstream.source_sha256 =
             "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_owned();
         review.review_sha256 = computed_review_hash(&review).expect("review hash");
-        let base = route_manifest::checked_in_manifest().expect("base manifest");
+        let base = route_manifest::checked_in_seed_manifest().expect("base manifest");
         assert!(matches!(
             generate_manifest(&base, &catalog, &review),
             Err(UpstreamError::ReviewSourceMismatch)
         ));
+
+        let (_, mut review) = fixtures();
+        review.rbac_evidence.source_sha256 = "not-a-sha256-pin".to_owned();
+        assert_eq!(
+            validate_review(&review),
+            Err(UpstreamError::UnpinnedRbacEvidence)
+        );
     }
 
     #[test]
@@ -865,7 +913,7 @@ mod tests {
         let (catalog, mut review) = fixtures();
         review.operations.pop();
         review.review_sha256 = computed_review_hash(&review).expect("review hash");
-        let base = route_manifest::checked_in_manifest().expect("base manifest");
+        let base = route_manifest::checked_in_seed_manifest().expect("base manifest");
         let generated = generate_manifest(&base, &catalog, &review).expect("generated manifest");
         assert_eq!(route_manifest::route_count(&generated), 17);
         assert_eq!(route_manifest::schema_count(&generated), 11);
@@ -882,7 +930,7 @@ mod tests {
         review.source.revision = "synthetic-route-review-v2".to_owned();
         review.review_sha256 = computed_review_hash(&review).expect("review hash");
         let expected_hash = review.review_sha256.clone();
-        let base = route_manifest::checked_in_manifest().expect("base manifest");
+        let base = route_manifest::checked_in_seed_manifest().expect("base manifest");
         let generated = generate_manifest(&base, &catalog, &review).expect("generated manifest");
         let source = generated
             .source
@@ -938,7 +986,7 @@ mod tests {
             catalog.source.catalog_sha256 = computed_catalog_hash(&catalog).expect("catalog hash");
             review.upstream.catalog_sha256 = catalog.source.catalog_sha256.clone();
             review.review_sha256 = computed_review_hash(&review).expect("review hash");
-            let base = route_manifest::checked_in_manifest().expect("base manifest");
+            let base = route_manifest::checked_in_seed_manifest().expect("base manifest");
             let result = generate_manifest(&base, &catalog, &review);
             assert!(
                 matches!(result, Err(UpstreamError::Collision)),

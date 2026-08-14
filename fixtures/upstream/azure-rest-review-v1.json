@@ -12,7 +12,14 @@
     "sourceSha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
     "catalogSha256": "sha256:6818f591fd2c21a4424c008a9147c0a3a90335aeb401348b36f748efa924e152"
   },
-  "reviewSha256": "sha256:399c2da593625e69d0327d91fe88686bd316f4a3d6dc5f1ea627e5e55d8019d3",
+  "rbacEvidence": {
+    "kind": "synthetic-rbac-evidence",
+    "repository": "https://github.com/Azure/azure-rest-api-specs",
+    "revision": "synthetic-azure-rest-api-specs-v1",
+    "path": "specification/storage/resource-manager/Microsoft.Storage/stable/2023-05-01/examples/OperationsList.json",
+    "sourceSha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "reviewSha256": "sha256:af6d10172e1981de3eb3434bea299b218c5c98c8ad3bb8d62e6025a0c82a49b4",
   "operations": [
     {
       "operationId": "Storage_StorageAccounts_Get",

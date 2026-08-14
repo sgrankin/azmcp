@@ -1,0 +1,24 @@
+{
+  "formatVersion": 1,
+  "source": {
+    "kind": "azure-rest-openapi",
+    "repository": "https://github.com/Azure/azure-rest-api-specs",
+    "revision": "bd92126f09e7e3caa74f10fa1c944d1e451813ac",
+    "path": "specification/storage/resource-manager/Microsoft.Storage/stable/2023-05-01/storage.json",
+    "sourceSha256": "sha256:ed82ebe858480524bb4c974c86d705bc84a900f414328f91ec742f8ac6c7a132",
+    "catalogSha256": "sha256:a96d16decc6cbff908689f86cbfa0dd69ca03be788fee3ca261dc798beff9335"
+  },
+  "operations": [
+    {
+      "operationId": "StorageAccounts_GetProperties",
+      "providerNamespace": "Microsoft.Storage",
+      "resourceType": "Microsoft.Storage/storageAccounts",
+      "operation": "get",
+      "method": "GET",
+      "pathTemplate": "/subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}",
+      "apiVersions": ["2023-05-01"],
+      "requestBodySchema": null,
+      "responseBodySchema": null
+    }
+  ]
+}

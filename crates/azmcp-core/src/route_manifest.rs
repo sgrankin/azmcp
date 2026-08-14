@@ -21,10 +21,17 @@ use crate::{
 
 /// Repository-relative path of the checked-in reviewed source fixture.
 pub const V1_MANIFEST_PATH: &str = "fixtures/reviewed-routes/v1-observability-1.json";
+/// Repository-relative path of the immutable pre-import route seed.
+pub const V1_SEED_MANIFEST_PATH: &str = "fixtures/reviewed-routes/v1-observability-seed-v2.json";
 const V1_MANIFEST_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../",
     "fixtures/reviewed-routes/v1-observability-1.json"
+));
+const V1_SEED_MANIFEST_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../",
+    "fixtures/reviewed-routes/v1-observability-seed-v2.json"
 ));
 
 /// The only manifest format understood by this binary.
@@ -32,14 +39,15 @@ pub const V1_MANIFEST_FORMAT: u32 = 1;
 /// Stable identity of the checked-in route review.
 pub const V1_MANIFEST_ID: &str = "v1-observability-1";
 /// The policy version emitted by this manifest.
-pub const V1_POLICY_VERSION: &str = "v1-observability-1";
+pub const V1_POLICY_VERSION: &str = "v1-observability-2";
 /// The policy hash recorded with the checked-in review.
 pub const V1_POLICY_HASH: &str =
-    "sha256:d3655b57f92a18efdfc375446425e9e8d6ade644c2036c333e2f276cbd45c8bf";
-/// The source fixture is pinned to the review's parent revision.
+    "sha256:120f3e489269e7dd720808354fdb8ccf8862e7d3f726e3d7179e1b452a20a0ed";
+/// Stable source identity for the checked-in review; upstream content pins are
+/// carried separately by the joined catalog and RBAC evidence metadata.
 pub const V1_SOURCE_KIND: &str = "checked-in-reviewed-fixture";
-/// Revision from which this initial v1 route fixture was reviewed.
-pub const V1_SOURCE_REVISION: &str = "d13b7291813c0a17ebcfa0a0eca5f3dcaf71eb48";
+/// Stable review identity for the canonical runtime manifest.
+pub const V1_SOURCE_REVISION: &str = "reviewed-manifest-v2";
 
 const MAX_MANIFEST_BYTES: usize = 512 * 1024;
 const MAX_ROUTES: usize = 256;
@@ -78,6 +86,21 @@ pub struct ManifestUpstreamSource {
     pub(crate) review_revision: String,
     /// SHA-256 of the canonical review join with its own hash cleared.
     pub(crate) review_sha256: String,
+    /// Independent provider-operation evidence for the manually reviewed RBAC
+    /// action.  This is never treated as an OpenAPI-derived field.
+    pub(crate) rbac_evidence: ManifestRbacEvidence,
+}
+
+/// Provenance for the separate provider-operation artifact used to review an
+/// RBAC action.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ManifestRbacEvidence {
+    pub(crate) kind: String,
+    pub(crate) repository: String,
+    pub(crate) revision: String,
+    pub(crate) path: String,
+    pub(crate) source_sha256: String,
 }
 
 /// The pinned provenance of a checked-in route fixture.
@@ -378,9 +401,23 @@ pub fn checked_in_manifest() -> Result<RouteManifest, ManifestError> {
     Ok(manifest)
 }
 
+/// Return the immutable pre-import route seed used by offline imports.
+pub fn checked_in_seed_manifest() -> Result<RouteManifest, ManifestError> {
+    let manifest = parse_manifest_for_generation(V1_SEED_MANIFEST_BYTES)?;
+    if canonical_manifest_bytes(&manifest)? != V1_SEED_MANIFEST_BYTES {
+        return Err(ManifestError::NonCanonical);
+    }
+    Ok(manifest)
+}
+
 /// Return the exact source bytes embedded in the core library.
 pub const fn checked_in_manifest_bytes() -> &'static [u8] {
     V1_MANIFEST_BYTES
+}
+
+/// Return the exact source bytes embedded in the core library for the seed.
+pub const fn checked_in_seed_manifest_bytes() -> &'static [u8] {
+    V1_SEED_MANIFEST_BYTES
 }
 
 /// Serialize a manifest using stable field and collection ordering.
@@ -463,6 +500,10 @@ impl RouteManifest {
         self.schemas.extend(schemas);
         self.source.upstream = Some(source);
         self.policy_hash.clear();
+    }
+
+    pub(crate) fn set_source_revision(&mut self, revision: impl Into<String>) {
+        self.source.revision = revision.into();
     }
 
     pub(crate) fn clear_policy_hash(&mut self) {
@@ -639,6 +680,19 @@ fn valid_upstream_source(source: &ManifestUpstreamSource) -> bool {
         && valid_sha256(&source.source_sha256)
         && valid_sha256(&source.catalog_sha256)
         && valid_sha256(&source.review_sha256)
+        && valid_bounded_rbac_evidence(&source.rbac_evidence)
+}
+
+fn valid_bounded_rbac_evidence(evidence: &ManifestRbacEvidence) -> bool {
+    [
+        (&evidence.kind, 128),
+        (&evidence.repository, 512),
+        (&evidence.revision, 256),
+        (&evidence.path, 1_024),
+    ]
+    .into_iter()
+    .all(|(value, maximum)| bounded(value, maximum))
+        && valid_sha256(&evidence.source_sha256)
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -708,9 +762,54 @@ mod tests {
     #[test]
     fn checked_in_manifest_is_canonical_and_joins_both_sources() {
         let manifest = checked_in_manifest().expect("checked-in route fixture");
-        assert_eq!(route_count(&manifest), 16);
-        assert_eq!(schema_count(&manifest), 10);
+        assert_eq!(route_count(&manifest), 18);
+        assert_eq!(schema_count(&manifest), 12);
         assert_eq!(policy_version(&manifest), V1_POLICY_VERSION);
+        assert_eq!(manifest.source.revision, V1_SOURCE_REVISION);
+        let upstream = manifest
+            .source
+            .upstream
+            .as_ref()
+            .expect("pinned real upstream source");
+        assert_eq!(upstream.kind, "azure-rest-openapi");
+        assert_eq!(
+            upstream.path,
+            "specification/storage/resource-manager/Microsoft.Storage/stable/2023-05-01/storage.json"
+        );
+        assert_eq!(
+            upstream.rbac_evidence.path,
+            "specification/storage/resource-manager/Microsoft.Storage/stable/2023-05-01/examples/OperationsList.json"
+        );
+        assert_eq!(
+            upstream.rbac_evidence.source_sha256,
+            "sha256:8984b143508e4782cfc0f3fbb7a23151e8c0d0c132d1e78a61c916f317cc6b6e"
+        );
+        let storage_routes = manifest
+            .routes
+            .iter()
+            .filter(|route| route.path_template.contains("Microsoft.Storage"))
+            .collect::<Vec<_>>();
+        assert_eq!(storage_routes.len(), 2);
+        assert_eq!(
+            storage_routes
+                .iter()
+                .filter(|route| route.cloud == AzureCloud::AzureCloud)
+                .count(),
+            1
+        );
+        assert_eq!(
+            storage_routes
+                .iter()
+                .filter(|route| route.cloud == AzureCloud::AzureUSGovernment)
+                .count(),
+            1
+        );
+        assert!(storage_routes.iter().all(|route| {
+            route.method == HttpMethod::Get
+                && route.api_versions == vec!["2023-05-01".to_owned()]
+                && route.rbac_action == "Microsoft.Storage/storageAccounts/read"
+                && route.allowed_query_parameters == vec!["$expand".to_owned()]
+        }));
         assert_eq!(
             canonical_manifest_bytes(&manifest).unwrap(),
             V1_MANIFEST_BYTES
@@ -725,12 +824,25 @@ mod tests {
                     *counts.entry(route.purpose()).or_insert(0usize) += 1;
                     counts
                 });
-        assert_eq!(purposes.get(&RoutePurpose::Request), Some(&4));
+        assert_eq!(purposes.get(&RoutePurpose::Request), Some(&6));
         assert_eq!(purposes.get(&RoutePurpose::ResourceGraph), Some(&2));
         assert_eq!(purposes.get(&RoutePurpose::LogsQuery), Some(&2));
         assert_eq!(purposes.get(&RoutePurpose::Internal), Some(&4));
         assert_eq!(purposes.get(&RoutePurpose::MetricsSingle), Some(&2));
         assert_eq!(purposes.get(&RoutePurpose::MetricsBatch), Some(&2));
+    }
+
+    #[test]
+    fn pre_import_seed_is_independent_and_canonical() {
+        let seed = checked_in_seed_manifest().expect("checked-in route seed");
+        assert_eq!(route_count(&seed), 16);
+        assert_eq!(schema_count(&seed), 10);
+        assert!(seed.source.upstream.is_none());
+        assert_eq!(seed.source.revision, V1_SOURCE_REVISION);
+        assert_eq!(
+            canonical_manifest_bytes(&seed).unwrap(),
+            V1_SEED_MANIFEST_BYTES
+        );
     }
 
     #[test]

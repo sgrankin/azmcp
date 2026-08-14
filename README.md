@@ -88,15 +88,18 @@ cargo build --release
 cargo run -p azmcp-routegen -- --check
 ```
 
-The manually reviewed seed routes and offline schema rows share the pinned
-source fixture at `fixtures/reviewed-routes/v1-observability-1.json`.
-`azmcp-routegen --check`
-rejects malformed, unpinned, non-canonical, or incomplete route/schema data;
+The reviewed runtime manifest at
+`fixtures/reviewed-routes/v1-observability-1.json` is regenerated from the
+immutable 16-route seed at
+`fixtures/reviewed-routes/v1-observability-seed-v2.json` plus the pinned,
+normalized Storage OpenAPI catalog and separate RBAC evidence in
+`fixtures/upstream/`. The explicit routegen import check compares those inputs
+to the checked-in 18-route/12-schema output. `azmcp-routegen --check` rejects
+malformed, unpinned, non-canonical, or incomplete route/schema data;
 `--write` canonicalizes the reviewed fixture deterministically. Request,
 metrics, and Logs Query rows feed schema discovery under their exact execution
 surfaces. Resource Graph and internal rows remain undiscoverable, and helper
 routes are never advertised as generic `az.request` capabilities.
-The checker does not yet ingest the upstream Azure REST specification corpus.
 
 Tests use synthetic Azure profiles, fake `az` executables, and loopback HTTP
 servers. They must not use an ambient Azure login.

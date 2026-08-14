@@ -734,6 +734,22 @@ mod tests {
         logs_grant: bool,
         logs_scope: bool,
     ) -> Context {
+        context_with_grants_for_cloud(
+            AzureCloud::AzureCloud,
+            policy_hash,
+            policy_version,
+            logs_grant,
+            logs_scope,
+        )
+    }
+
+    fn context_with_grants_for_cloud(
+        cloud: AzureCloud,
+        policy_hash: &str,
+        policy_version: &str,
+        logs_grant: bool,
+        logs_scope: bool,
+    ) -> Context {
         let registry = ContextRegistry::new(RegistryConfig::new(
             2,
             Duration::from_secs(60),
@@ -744,7 +760,7 @@ mod tests {
             SubscriptionId::new(SUBSCRIPTION).expect("subscription"),
             Some(TenantId::new(TENANT).expect("tenant")),
         )
-        .resolve(AzureCloud::AzureCloud, &[])
+        .resolve(cloud, &[])
         .expect("binding");
         let options = ContextOptions::new(
             Identity::User,
@@ -760,7 +776,7 @@ mod tests {
         )
         .expect("options")
         .with_graph_scopes(BTreeMap::from([(
-            AzureCloud::AzureCloud,
+            cloud,
             GraphScope::Subscriptions(vec![
                 SubscriptionId::new(SUBSCRIPTION).expect("subscription"),
             ]),
@@ -768,10 +784,7 @@ mod tests {
         .expect("scopes");
         let options = if logs_scope {
             options
-                .with_logs_scopes(BTreeMap::from([(
-                    AzureCloud::AzureCloud,
-                    LogsScope::AllAccessible,
-                )]))
+                .with_logs_scopes(BTreeMap::from([(cloud, LogsScope::AllAccessible)]))
                 .expect("logs scope")
         } else {
             options
@@ -943,6 +956,47 @@ mod tests {
             .expect("granted logs details");
         assert!(allowed_logs.access.executable);
         assert_eq!(allowed_logs.access.denial_reason, None);
+    }
+
+    #[test]
+    fn storage_entries_expose_both_clouds_and_the_reviewed_query_allowlist() {
+        let index = SchemaIndex::v0(&policy()).expect("index");
+        for cloud in [AzureCloud::AzureCloud, AzureCloud::AzureUSGovernment] {
+            let context = context_with_grants_for_cloud(
+                cloud,
+                V0_POLICY_HASH,
+                crate::routes::V0_POLICY_VERSION,
+                false,
+                false,
+            );
+            let entry_id = format!("{cloud}.storageAccounts.get");
+            let search = index
+                .search(&context, "storageAccounts", Some(cloud), 50)
+                .expect("storage search");
+            assert_eq!(search.results.len(), 1);
+            let hit = &search.results[0];
+            assert_eq!(hit.entry_id, entry_id);
+            assert_eq!(hit.execution_surface, "az.request");
+            assert_eq!(hit.audience, TokenAudience::Arm.resource(cloud));
+            assert_eq!(hit.allowed_query_parameters, vec!["$expand"]);
+            assert!(hit.access.executable);
+
+            let details = index
+                .get(&context, &entry_id, "2023-05-01")
+                .expect("storage details");
+            assert_eq!(details.execution_surface, "az.request");
+            assert_eq!(details.method, HttpMethod::Get);
+            assert_eq!(details.allowed_query_parameters, vec!["$expand"]);
+            assert_eq!(
+                details.canonical_path_template,
+                "/subscriptions/{subscription}/resourceGroups/{resourceGroupName}/providers/Microsoft.Storage/storageAccounts/{accountName}"
+            );
+            assert_eq!(
+                details.argument_schema.expect("request arguments")["additionalProperties"],
+                json!(false)
+            );
+            assert!(details.request_body_schema.is_none());
+        }
     }
 
     #[test]

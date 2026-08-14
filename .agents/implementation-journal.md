@@ -39,11 +39,14 @@
   HTTP 429 and 5xx responses, with hard attempt, elapsed-time, and backoff ceilings.
   Retry counts are preserved in both helper and context-validation audit records.
 - The reviewed-manifest checkpoint is change `wxtpqzxx`. The checked-in canonical
-  fixture is now the runtime source for all 16 executable routes and all 10 discoverable
-  Commercial/Government request, metrics, and Logs Query entries. The checker rejects
-  malformed, stale, unjoined, purpose-confused, referenced, or non-canonical schemas.
-  Its policy hash is a verified SHA-256 digest of canonical content, and every entry exposes
-  a closed, cloud-specific argument schema under its actual execution surface.
+  fixture is now the runtime source for 18 executable routes and 12 discoverable
+  Commercial/Government request, metrics, and Logs Query entries. The 16-route seed is
+  checked in independently, and the routegen real-input gate regenerates the runtime
+  fixture from that seed plus the pinned Storage OpenAPI catalog and separate RBAC
+  evidence. The checker rejects malformed, stale, unjoined, purpose-confused,
+  referenced, or non-canonical schemas. Its policy hash is a verified SHA-256 digest of
+  canonical content, and every entry exposes a closed, cloud-specific argument schema
+  under its actual execution surface.
 - The bounded-paging checkpoint is change `qzvlxprn`. It follows only upstream-provided
   `nextLink` values from a reviewed initial GET, revalidates exact origin, API version,
   route identity, subscription policy, signing, and retries on every page, and enforces
@@ -131,18 +134,17 @@
 
 ## Open risks
 
-- The reviewed route bundle intentionally exposes only subscription validation, provider
-  metadata, and Resource Graph until real ARM scenario rows have golden tests.
+- The reviewed route bundle currently has one real generic ARM scenario:
+  `StorageAccounts_GetProperties` for both supported clouds. Broader ARM coverage still
+  needs independently pinned source and golden review rows.
 - Portable process-tree termination for timed-out credential subprocess descendants remains
   unresolved; the direct child is killed and pipe readers are bounded/aborted.
 - Bounded exact-origin continuation handling exists in the core HTTP layer, but no current
-  advertised helper consumes a reviewed `nextLink` route. Large-result references and the
-  offline upstream importer are implemented in isolated workspaces and remain unintegrated
-  until their adversarial lifecycle and provenance regressions pass.
+  advertised helper consumes a reviewed `nextLink` route. Large-result references are
+  implemented for bounded context-owned retrieval, but there is no public reference MCP tool.
 - Helper argument and request-body schemas are checked in and closed, while response bodies
-  remain `metadataOnly`. Generic `az.request` still exposes only the Commercial/Government
-  subscription and provider metadata routes; the current `azmcp-routegen` canonicalizes and
-  validates the reviewed fixture but does not yet ingest the Azure REST specification corpus.
+  remain `metadataOnly`. The real Storage route is an inspect-only GET with the reviewed
+  `$expand` query allowlist; its independent OpenAPI and RBAC evidence pins remain distinct.
 - The RSS implementation currently targets macOS and Linux through `sysinfo`; other targets
   must add an equivalent OS process sampler before relying on the documented ceiling.
 - The local Codex repository contains a pinned official MCP client-conformance driver, not an
