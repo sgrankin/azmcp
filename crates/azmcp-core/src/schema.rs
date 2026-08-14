@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn bootstrap_index_is_request_only_and_metadata_only() {
         let index = SchemaIndex::v0(&policy()).expect("index");
-        let context = context("v0-bootstrap-1");
+        let context = context(crate::routes::V0_POLICY_VERSION);
         let result = index
             .search(&context, "get", Some(AzureCloud::AzureCloud), 50)
             .expect("search");
@@ -638,7 +638,7 @@ mod tests {
     #[test]
     fn search_is_deterministic_and_context_filtered() {
         let index = SchemaIndex::v0(&policy()).expect("index");
-        let context = context("v0-bootstrap-1");
+        let context = context(crate::routes::V0_POLICY_VERSION);
         let first = index
             .search(&context, "provider", None, DEFAULT_SEARCH_LIMIT)
             .expect("search");
@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn get_requires_an_exact_reviewed_version() {
         let index = SchemaIndex::v0(&policy()).expect("index");
-        let context = context("v0-bootstrap-1");
+        let context = context(crate::routes::V0_POLICY_VERSION);
         assert_eq!(
             index.get(&context, "AzureCloud.providers.get", "2025-01-01"),
             Err(SchemaError::ApiVersionNotFound)
@@ -697,7 +697,10 @@ mod tests {
         );
         assert_eq!(
             SchemaIndex::v0(&policy()).expect("index").search(
-                &context_with_policy("different-policy-contents", "v0-bootstrap-1"),
+                &context_with_policy(
+                    "different-policy-contents",
+                    crate::routes::V0_POLICY_VERSION,
+                ),
                 "provider",
                 None,
                 1

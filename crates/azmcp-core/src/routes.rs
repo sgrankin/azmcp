@@ -1,4 +1,4 @@
-//! Small, reviewed v0 ARM route bundle.
+//! Small, reviewed Azure route bundle.
 
 use crate::cloud::AzureCloud;
 use crate::policy::{
@@ -6,14 +6,14 @@ use crate::policy::{
     RoutePurpose,
 };
 
-/// Version of the checked-in bootstrap route review.
-pub const V0_POLICY_VERSION: &str = "v0-bootstrap-1";
+/// Version of the checked-in observability route review.
+pub const V0_POLICY_VERSION: &str = "v1-observability-1";
 
 pub const SUBSCRIPTIONS_API_VERSION: &str = "2020-01-01";
 pub const PROVIDERS_API_VERSION: &str = "2021-04-01";
 pub const RESOURCE_GRAPH_API_VERSION: &str = "2022-10-01";
-/// Stable identity of the checked-in bootstrap policy contents.
-pub const V0_POLICY_HASH: &str = "v0-bootstrap-1";
+/// Stable identity of the checked-in observability policy contents.
+pub const V0_POLICY_HASH: &str = "v1-observability-1";
 /// Pinned ARM metrics API version from azure-rest-api-specs commit
 /// f05d9ee6113a6536cc39c374608c8daf007b1d38.
 pub const METRICS_API_VERSION: &str = "2023-10-01";

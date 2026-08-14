@@ -2,13 +2,10 @@
 
 ## Current plan
 
-1. Build the v1 reviewed-route generator and compact offline schema index.
-2. Add cross-cloud Azure Monitor metrics, including regional multi-resource batch.
-3. Add direct cross-cloud Log Analytics Query for workspace-backed logs and
-   Application Insights.
-4. Add bounded paging, retries, result caps, and large-result references.
-5. Preserve the synthetic-only local test boundary and run the complete modern MCP gate.
-6. Run authenticated Commercial/Government acceptance only in a separately authorized
+1. Build the v1 reviewed-route generator and broaden the compact offline schema index.
+2. Add bounded paging, retries, result caps, and large-result references.
+3. Preserve the synthetic-only local test boundary and run the complete modern MCP gate.
+4. Run authenticated Commercial/Government acceptance only in a separately authorized
    non-production environment.
 
 ## Verified facts
@@ -22,14 +19,21 @@
   `azure_accounts` requests over real stdio using a synthetic temporary home, the standard
   config/profile/state paths, and an explicitly injected fake Azure executable.
 - The core test suite uses only synthetic profiles, fake executables, and loopback HTTP.
-  The current workspace gate is 112 tests plus warning-free clippy.
-- The four v0 tools are now the exact advertised catalog. A modern-protocol lifecycle test
+  The current workspace gate is 133 tests plus formatting and warning-free clippy.
+- The six modern tools are now the exact advertised catalog. A modern-protocol lifecycle test
   covers accounts, context open, persistent run, close, and structured domain failure.
 - `azure_schema_search` and `azure_schema_get` are implemented as context-scoped,
   offline tools tied to the executable reviewed route policy. The bootstrap catalog
   exposes exact route metadata only; it does not invent request or response schemas.
 - The schema checkpoint is change `vxkvytws`. Its isolated and integrated test gate is
   118 tests plus formatting and warning-free clippy.
+- The metrics checkpoint is change `uvwwumps`. It exposes explicit single-resource and
+  same-type regional batch helpers for Commercial and Government clouds, resolves every
+  resource subscription through the immutable context allowlist, and is loopback-tested.
+- The Logs Query checkpoint is change `wqrmmlyt`. It exposes direct Commercial and
+  Government workspace queries with exact data-plane audiences, explicit context grants,
+  bounded table responses, and redacted audit records. The integrated observability gate is
+  133 tests plus formatting and warning-free clippy.
 - One current-thread V8 worker process is retained per context. Subprocess tests cover
   persistence, hard close and MCP cancellation, abort poisoning, timeout poisoning, heap/RSS
   pressure, TTL disposal, and an eight-call concurrency bound under `Promise.all`.

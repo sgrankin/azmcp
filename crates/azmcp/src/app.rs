@@ -644,10 +644,10 @@ impl WorkerHandle for ProcessWorkerHandle {
     }
 }
 
-/// Defaults for the v0 policy metadata.  The policy implementation remains an
+/// Defaults for the reviewed policy metadata.  The policy implementation remains an
 /// application concern; these non-empty values satisfy the immutable core record.
 pub const DEFAULT_POLICY_HASH: &str = azmcp_core::routes::V0_POLICY_HASH;
-pub const DEFAULT_POLICY_VERSION: &str = "v0-bootstrap-1";
+pub const DEFAULT_POLICY_VERSION: &str = azmcp_core::routes::V0_POLICY_VERSION;
 
 struct ApplicationInner {
     config: Config,

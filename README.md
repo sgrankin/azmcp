@@ -23,8 +23,8 @@ bootstrap catalog currently returns route metadata with `metadataOnly` body
 schemas because no response fixtures are checked in.
 
 Inside `azure_run`, JavaScript has only `console`, `az.request`, `az.graph`, and
-the reviewed `az.metrics` helpers. There is no `fetch`, `Deno`, token access,
-ambient cloud, or ambient subscription.
+the reviewed `az.metrics` and `az.logs` helpers. There is no `fetch`, `Deno`,
+token access, ambient cloud, or ambient subscription.
 
 The metrics signatures are explicit and closed:
 
@@ -42,10 +42,37 @@ az.metrics.batch({
 
 Both helpers require an explicit `cloud`. Batch requires an explicit validated
 regional endpoint, accepts at most 50 same-type resource IDs, and accepts at
-most 20 metric names. The v0 `az.request` surface accepts no caller headers or
-body. The reviewed route bundle contains subscription validation, provider
-metadata, Resource Graph, and metrics operations for Azure commercial and US
-Government clouds.
+most 20 metric names.
+
+Direct Log Analytics and workspace-backed Application Insights queries use:
+
+```js
+await az.logs.query({
+  cloud,
+  subscription?,
+  workspaceId,
+  query,
+  timespan
+})
+```
+
+The context must explicitly grant `logs.query` and opt each cloud into the
+initial non-porous Logs scope:
+
+```json
+{
+  "dataPlanes": ["logs.query"],
+  "logsScopes": {
+    "AzureCloud": {"scope": "allAccessible"}
+  }
+}
+```
+
+`allAccessible` is deliberate: a workspace allowlist would not bound KQL that
+uses cross-workspace references or stored functions. The v0 `az.request`
+surface accepts no caller headers or body. The reviewed route bundle contains
+subscription validation, provider metadata, Resource Graph, metrics, and Logs
+Query operations for Azure commercial and US Government clouds.
 
 ## Build and test
 
