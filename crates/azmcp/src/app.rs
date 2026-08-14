@@ -642,7 +642,7 @@ impl WorkerHandle for ProcessWorkerHandle {
 
 /// Defaults for the v0 policy metadata.  The policy implementation remains an
 /// application concern; these non-empty values satisfy the immutable core record.
-pub const DEFAULT_POLICY_HASH: &str = "v0-bootstrap-1";
+pub const DEFAULT_POLICY_HASH: &str = azmcp_core::routes::V0_POLICY_HASH;
 pub const DEFAULT_POLICY_VERSION: &str = "v0-bootstrap-1";
 
 struct ApplicationInner {
@@ -941,6 +941,11 @@ impl Application {
             .validate()
             .map_err(|_| AppError::new(AppErrorCode::InvalidConfiguration))?;
         if policy_hash.is_empty() || policy_version.is_empty() {
+            return Err(AppError::new(AppErrorCode::InvalidConfiguration));
+        }
+        if schema_index.policy_hash() != policy_hash
+            || schema_index.policy_version() != policy_version
+        {
             return Err(AppError::new(AppErrorCode::InvalidConfiguration));
         }
         Ok(Self {
@@ -2148,8 +2153,8 @@ mod tests {
             Arc::new(MemoryProfileSource::new(bytes)),
             validator,
             factory,
-            "hash",
-            "version",
+            DEFAULT_POLICY_HASH,
+            DEFAULT_POLICY_VERSION,
         )
         .unwrap()
     }
@@ -2445,8 +2450,8 @@ mod tests {
             Arc::new(MemoryProfileSource::new(Vec::new())),
             validator,
             factory(Arc::clone(&state)),
-            "hash",
-            "version",
+            DEFAULT_POLICY_HASH,
+            DEFAULT_POLICY_VERSION,
         )
         .expect("application");
         let mut args = ContextOpenArgs::default();
@@ -2500,8 +2505,8 @@ mod tests {
             )))),
             Arc::new(Validator::default()),
             factory,
-            "hash",
-            "version",
+            DEFAULT_POLICY_HASH,
+            DEFAULT_POLICY_VERSION,
         )
         .expect("application");
         let cancelled = application.clone();

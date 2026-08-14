@@ -563,7 +563,7 @@ mod tests {
             Arc::new(AllowValidator),
             worker_factory,
             Arc::new(NoClientFactory),
-            "test-policy-hash",
+            crate::app::DEFAULT_POLICY_HASH,
             azmcp_core::routes::V0_POLICY_VERSION,
         )
         .unwrap()
@@ -876,6 +876,102 @@ mod tests {
             evicted.structured_content.unwrap()["code"],
             "context_evicted"
         );
+
+        drop(client);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn schema_tools_return_modern_structured_results_and_domain_errors() {
+        let (mut client, server_task) = modern_client().await;
+        client
+            .send(call_tool_request(1, CONTEXT_OPEN_TOOL, json!({})))
+            .await
+            .unwrap();
+        let opened = receive_tool_result(&mut client).await;
+        let context_id = opened.structured_content.unwrap()["contextId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        client
+            .send(call_tool_request(
+                2,
+                SCHEMA_SEARCH_TOOL,
+                json!({"contextId": context_id, "query": "provider"}),
+            ))
+            .await
+            .unwrap();
+        let searched =
+            tokio::time::timeout(Duration::from_secs(1), receive_tool_result(&mut client))
+                .await
+                .expect("schema search response");
+        assert_eq!(searched.is_error, Some(false));
+        let searched = searched.structured_content.unwrap();
+        assert_eq!(
+            searched["results"][0]["entryId"],
+            "AzureCloud.providers.get"
+        );
+        assert_eq!(
+            searched["results"][0]["pathTemplate"],
+            "/providers/{namespace}"
+        );
+
+        client
+            .send(call_tool_request(
+                3,
+                SCHEMA_GET_TOOL,
+                json!({
+                    "contextId": context_id,
+                    "entryId": "AzureCloud.providers.get",
+                    "apiVersion": azmcp_core::routes::PROVIDERS_API_VERSION
+                }),
+            ))
+            .await
+            .unwrap();
+        let found = tokio::time::timeout(Duration::from_secs(1), receive_tool_result(&mut client))
+            .await
+            .expect("schema get response");
+        assert_eq!(found.is_error, Some(false));
+        assert_eq!(
+            found.structured_content.unwrap()["schema"]["schemaAvailability"],
+            "metadataOnly"
+        );
+
+        client
+            .send(call_tool_request(
+                4,
+                SCHEMA_GET_TOOL,
+                json!({
+                    "contextId": context_id,
+                    "entryId": "AzureCloud.not-reviewed.get",
+                    "apiVersion": azmcp_core::routes::PROVIDERS_API_VERSION
+                }),
+            ))
+            .await
+            .unwrap();
+        let missing =
+            tokio::time::timeout(Duration::from_secs(1), receive_tool_result(&mut client))
+                .await
+                .expect("schema missing response");
+        assert_eq!(missing.is_error, Some(true));
+        assert_eq!(
+            missing.structured_content.unwrap()["code"],
+            "schema_not_found"
+        );
+
+        client
+            .send(call_tool_request(
+                5,
+                CONTEXT_CLOSE_TOOL,
+                json!({"contextId": context_id}),
+            ))
+            .await
+            .unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(1), receive_tool_result(&mut client))
+            .await
+            .expect("context close response");
+        assert_eq!(closed.is_error, Some(false));
 
         drop(client);
         server_task.await.unwrap().unwrap();

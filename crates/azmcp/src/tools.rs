@@ -8,7 +8,13 @@ use serde_json::{Value, json};
 
 use azmcp_core::{
     cloud::AzureCloud,
-    schema::{DEFAULT_SEARCH_LIMIT, MAX_QUERY_BYTES, MAX_SEARCH_LIMIT},
+    schema::{
+        DEFAULT_SEARCH_LIMIT, MAX_API_VERSION_BYTES, MAX_API_VERSIONS, MAX_CLI_EQUIVALENT_BYTES,
+        MAX_DATA_PLANE_GRANT_BYTES, MAX_DESCRIPTION_BYTES, MAX_DISPLAY_NAME_BYTES,
+        MAX_ENTRY_ID_BYTES, MAX_OPERATION_BYTES, MAX_PATH_TEMPLATE_BYTES, MAX_QUERY_BYTES,
+        MAX_QUERY_PARAMETER_BYTES, MAX_QUERY_PARAMETERS, MAX_RBAC_ACTION_BYTES,
+        MAX_RESOURCE_TYPE_BYTES, MAX_SEARCH_LIMIT,
+    },
 };
 
 pub const ACCOUNTS_TOOL: &str = "azure_accounts";
@@ -242,9 +248,9 @@ impl SchemaSearchArgs {
 impl SchemaGetArgs {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.entry_id.is_empty()
-            || self.entry_id.len() > 256
+            || self.entry_id.len() > MAX_ENTRY_ID_BYTES
             || self.api_version.is_empty()
-            || self.api_version.len() > 64
+            || self.api_version.len() > MAX_API_VERSION_BYTES
         {
             return Err("schema get arguments are outside the supported range");
         }
@@ -446,8 +452,8 @@ fn schema_get() -> Tool {
             "type": "object",
             "properties": {
                 "contextId": context_id_schema(),
-                "entryId": {"type": "string", "minLength": 1, "maxLength": 256},
-                "apiVersion": {"type": "string", "minLength": 1, "maxLength": 64}
+                "entryId": {"type": "string", "minLength": 1, "maxLength": MAX_ENTRY_ID_BYTES},
+                "apiVersion": {"type": "string", "minLength": 1, "maxLength": MAX_API_VERSION_BYTES}
             },
             "required": ["contextId", "entryId", "apiVersion"],
             "additionalProperties": false
@@ -640,21 +646,21 @@ fn schema_hit_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "entryId": {"type": "string", "minLength": 1, "maxLength": 256},
-            "resourceType": {"type": "string", "minLength": 1, "maxLength": 256},
-            "operation": {"type": "string", "minLength": 1, "maxLength": 128},
-            "displayName": {"type": "string", "minLength": 1, "maxLength": 256},
-            "description": {"type": "string", "minLength": 1, "maxLength": 2048},
-            "cliEquivalent": optional_string_schema(512),
+            "entryId": {"type": "string", "minLength": 1, "maxLength": MAX_ENTRY_ID_BYTES},
+            "resourceType": {"type": "string", "minLength": 1, "maxLength": MAX_RESOURCE_TYPE_BYTES},
+            "operation": {"type": "string", "minLength": 1, "maxLength": MAX_OPERATION_BYTES},
+            "displayName": {"type": "string", "minLength": 1, "maxLength": MAX_DISPLAY_NAME_BYTES},
+            "description": {"type": "string", "minLength": 1, "maxLength": MAX_DESCRIPTION_BYTES},
+            "cliEquivalent": optional_string_schema(MAX_CLI_EQUIVALENT_BYTES),
             "cloud": cloud_schema(),
             "method": method_schema(),
-            "pathTemplate": {"type": "string", "minLength": 1, "maxLength": 1024},
-            "canonicalPathTemplate": {"type": "string", "minLength": 1, "maxLength": 1024},
-            "apiVersions": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 64}},
-            "rbacAction": {"type": "string", "minLength": 1, "maxLength": 512},
+            "pathTemplate": {"type": "string", "minLength": 1, "maxLength": MAX_PATH_TEMPLATE_BYTES},
+            "canonicalPathTemplate": {"type": "string", "minLength": 1, "maxLength": MAX_PATH_TEMPLATE_BYTES},
+            "apiVersions": {"type": "array", "minItems": 1, "maxItems": MAX_API_VERSIONS, "items": {"type": "string", "minLength": 1, "maxLength": MAX_API_VERSION_BYTES}},
+            "rbacAction": {"type": "string", "minLength": 1, "maxLength": MAX_RBAC_ACTION_BYTES},
             "armTier": arm_tier_schema(),
-            "dataPlaneGrant": optional_string_schema(128),
-            "allowedQueryParameters": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+            "dataPlaneGrant": optional_string_schema(MAX_DATA_PLANE_GRANT_BYTES),
+            "allowedQueryParameters": {"type": "array", "maxItems": MAX_QUERY_PARAMETERS, "items": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_PARAMETER_BYTES}},
             "access": access_schema()
         },
         "required": ["entryId", "resourceType", "operation", "displayName", "description", "cliEquivalent", "cloud", "method", "pathTemplate", "canonicalPathTemplate", "apiVersions", "rbacAction", "armTier", "dataPlaneGrant", "allowedQueryParameters", "access"],
@@ -666,22 +672,22 @@ fn schema_detail_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "entryId": {"type": "string", "minLength": 1, "maxLength": 256},
-            "resourceType": {"type": "string", "minLength": 1, "maxLength": 256},
-            "operation": {"type": "string", "minLength": 1, "maxLength": 128},
-            "displayName": {"type": "string", "minLength": 1, "maxLength": 256},
-            "description": {"type": "string", "minLength": 1, "maxLength": 2048},
-            "cliEquivalent": optional_string_schema(512),
+            "entryId": {"type": "string", "minLength": 1, "maxLength": MAX_ENTRY_ID_BYTES},
+            "resourceType": {"type": "string", "minLength": 1, "maxLength": MAX_RESOURCE_TYPE_BYTES},
+            "operation": {"type": "string", "minLength": 1, "maxLength": MAX_OPERATION_BYTES},
+            "displayName": {"type": "string", "minLength": 1, "maxLength": MAX_DISPLAY_NAME_BYTES},
+            "description": {"type": "string", "minLength": 1, "maxLength": MAX_DESCRIPTION_BYTES},
+            "cliEquivalent": optional_string_schema(MAX_CLI_EQUIVALENT_BYTES),
             "cloud": cloud_schema(),
             "method": method_schema(),
-            "pathTemplate": {"type": "string", "minLength": 1, "maxLength": 1024},
-            "canonicalPathTemplate": {"type": "string", "minLength": 1, "maxLength": 1024},
-            "apiVersion": {"type": "string", "minLength": 1, "maxLength": 64},
-            "apiVersions": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 64}},
-            "rbacAction": {"type": "string", "minLength": 1, "maxLength": 512},
+            "pathTemplate": {"type": "string", "minLength": 1, "maxLength": MAX_PATH_TEMPLATE_BYTES},
+            "canonicalPathTemplate": {"type": "string", "minLength": 1, "maxLength": MAX_PATH_TEMPLATE_BYTES},
+            "apiVersion": {"type": "string", "minLength": 1, "maxLength": MAX_API_VERSION_BYTES},
+            "apiVersions": {"type": "array", "minItems": 1, "maxItems": MAX_API_VERSIONS, "items": {"type": "string", "minLength": 1, "maxLength": MAX_API_VERSION_BYTES}},
+            "rbacAction": {"type": "string", "minLength": 1, "maxLength": MAX_RBAC_ACTION_BYTES},
             "armTier": arm_tier_schema(),
-            "dataPlaneGrant": optional_string_schema(128),
-            "allowedQueryParameters": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+            "dataPlaneGrant": optional_string_schema(MAX_DATA_PLANE_GRANT_BYTES),
+            "allowedQueryParameters": {"type": "array", "maxItems": MAX_QUERY_PARAMETERS, "items": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_PARAMETER_BYTES}},
             "requestBodySchema": {"oneOf": [schema_document_schema(), {"type": "null"}]},
             "responseBodySchema": {"oneOf": [schema_document_schema(), {"type": "null"}]},
             "schemaAvailability": {"enum": ["metadataOnly", "full"]},

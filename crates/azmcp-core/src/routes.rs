@@ -12,6 +12,8 @@ pub const V0_POLICY_VERSION: &str = "v0-bootstrap-1";
 pub const SUBSCRIPTIONS_API_VERSION: &str = "2020-01-01";
 pub const PROVIDERS_API_VERSION: &str = "2021-04-01";
 pub const RESOURCE_GRAPH_API_VERSION: &str = "2022-10-01";
+/// Stable identity of the checked-in bootstrap policy contents.
+pub const V0_POLICY_HASH: &str = "v0-bootstrap-1";
 
 /// Construct the deliberately small route bundle used by the first v0 scenarios.
 ///

@@ -13,12 +13,25 @@ use crate::{
     cloud::AzureCloud,
     context::Context,
     policy::{ArmTier, HttpMethod, PolicyBundle, RoutePurpose},
-    routes::{PROVIDERS_API_VERSION, SUBSCRIPTIONS_API_VERSION},
+    routes::{PROVIDERS_API_VERSION, SUBSCRIPTIONS_API_VERSION, V0_POLICY_HASH},
 };
 
 pub const MAX_QUERY_BYTES: usize = 256;
 pub const DEFAULT_SEARCH_LIMIT: usize = 20;
 pub const MAX_SEARCH_LIMIT: usize = 50;
+pub const MAX_ENTRY_ID_BYTES: usize = 256;
+pub const MAX_RESOURCE_TYPE_BYTES: usize = 256;
+pub const MAX_OPERATION_BYTES: usize = 128;
+pub const MAX_DISPLAY_NAME_BYTES: usize = 256;
+pub const MAX_DESCRIPTION_BYTES: usize = 2_048;
+pub const MAX_CLI_EQUIVALENT_BYTES: usize = 512;
+pub const MAX_PATH_TEMPLATE_BYTES: usize = 1_024;
+pub const MAX_API_VERSIONS: usize = 32;
+pub const MAX_API_VERSION_BYTES: usize = 64;
+pub const MAX_RBAC_ACTION_BYTES: usize = 512;
+pub const MAX_DATA_PLANE_GRANT_BYTES: usize = 128;
+pub const MAX_QUERY_PARAMETERS: usize = 64;
+pub const MAX_QUERY_PARAMETER_BYTES: usize = 128;
 const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 const SUBSCRIPTION_ROUTE: &str = "/subscriptions/{subscription}";
 const PROVIDER_ROUTE: &str = "/subscriptions/{subscription}/providers/{namespace}";
@@ -143,6 +156,7 @@ pub enum SchemaError {
 /// Immutable, offline schema metadata tied to one policy bundle.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SchemaIndex {
+    policy_hash: String,
     policy_version: String,
     entries: Vec<Entry>,
 }
@@ -150,8 +164,13 @@ pub struct SchemaIndex {
 impl SchemaIndex {
     pub fn from_policy(
         policy: &PolicyBundle,
+        policy_hash: impl Into<String>,
         sources: impl IntoIterator<Item = SchemaSource>,
     ) -> Result<Self, SchemaError> {
+        let policy_hash = policy_hash.into();
+        if policy_hash.is_empty() {
+            return Err(SchemaError::UnreviewedSource);
+        }
         let request_routes = policy
             .routes()
             .iter()
@@ -183,6 +202,7 @@ impl SchemaIndex {
             if expected_request_path(route.path_template()) != source.request_path_template {
                 return Err(SchemaError::UnrepresentablePath);
             }
+            validate_query_parameters(route.allowed_query_parameters())?;
             entries.push(Entry {
                 source,
                 allowed_query_parameters: route.allowed_query_parameters().to_vec(),
@@ -194,13 +214,18 @@ impl SchemaIndex {
         }
         entries.sort_by(|left, right| left.source.entry_id.cmp(&right.source.entry_id));
         Ok(Self {
+            policy_hash,
             policy_version: policy.version().to_owned(),
             entries,
         })
     }
 
     pub fn v0(policy: &PolicyBundle) -> Result<Self, SchemaError> {
-        Self::from_policy(policy, v0_sources())
+        Self::from_policy(policy, V0_POLICY_HASH, v0_sources())
+    }
+
+    pub fn policy_hash(&self) -> &str {
+        &self.policy_hash
     }
 
     pub fn policy_version(&self) -> &str {
@@ -310,22 +335,36 @@ impl SchemaIndex {
     }
 
     fn ensure_policy(&self, context: &Context) -> Result<(), SchemaError> {
-        (context.policy_version() == self.policy_version)
+        (context.policy_hash() == self.policy_hash
+            && context.policy_version() == self.policy_version)
             .then_some(())
             .ok_or(SchemaError::PolicyMismatch)
     }
 }
 
 fn validate_source(source: &SchemaSource) -> Result<(), SchemaError> {
-    if source.resource_type.is_empty()
-        || source.operation.is_empty()
-        || source.display_name.is_empty()
-        || source.description.is_empty()
-        || source.canonical_path_template.is_empty()
-        || source.request_path_template.is_empty()
+    if !bounded(&source.entry_id, MAX_ENTRY_ID_BYTES)
+        || !bounded(&source.resource_type, MAX_RESOURCE_TYPE_BYTES)
+        || !bounded(&source.operation, MAX_OPERATION_BYTES)
+        || !bounded(&source.display_name, MAX_DISPLAY_NAME_BYTES)
+        || !bounded(&source.description, MAX_DESCRIPTION_BYTES)
+        || source
+            .cli_equivalent
+            .as_ref()
+            .is_some_and(|value| !bounded(value, MAX_CLI_EQUIVALENT_BYTES))
+        || !bounded(&source.canonical_path_template, MAX_PATH_TEMPLATE_BYTES)
+        || !bounded(&source.request_path_template, MAX_PATH_TEMPLATE_BYTES)
         || source.api_versions.is_empty()
-        || source.api_versions.iter().any(String::is_empty)
-        || source.rbac_action.is_empty()
+        || source.api_versions.len() > MAX_API_VERSIONS
+        || source
+            .api_versions
+            .iter()
+            .any(|value| !bounded(value, MAX_API_VERSION_BYTES))
+        || !bounded(&source.rbac_action, MAX_RBAC_ACTION_BYTES)
+        || source
+            .data_plane_grant
+            .as_ref()
+            .is_some_and(|value| !bounded(value, MAX_DATA_PLANE_GRANT_BYTES))
     {
         return Err(SchemaError::UnreviewedSource);
     }
@@ -341,6 +380,21 @@ fn validate_source(source: &SchemaSource) -> Result<(), SchemaError> {
         return Err(SchemaError::InvalidSchema);
     }
     Ok(())
+}
+
+fn validate_query_parameters(values: &[String]) -> Result<(), SchemaError> {
+    if values.len() > MAX_QUERY_PARAMETERS
+        || values
+            .iter()
+            .any(|value| !bounded(value, MAX_QUERY_PARAMETER_BYTES))
+    {
+        return Err(SchemaError::UnreviewedSource);
+    }
+    Ok(())
+}
+
+fn bounded(value: &str, maximum: usize) -> bool {
+    !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
 }
 
 fn valid_schema(schema: &Value) -> bool {
@@ -527,6 +581,10 @@ mod tests {
     }
 
     fn context(policy_version: &str) -> Context {
+        context_with_policy(V0_POLICY_HASH, policy_version)
+    }
+
+    fn context_with_policy(policy_hash: &str, policy_version: &str) -> Context {
         let registry = ContextRegistry::new(RegistryConfig::new(
             2,
             Duration::from_secs(60),
@@ -544,7 +602,7 @@ mod tests {
             ArmTier::Inspect,
             Vec::new(),
             vec![binding],
-            "hash",
+            policy_hash,
             policy_version,
         )
         .expect("options")
@@ -619,13 +677,13 @@ mod tests {
         let mut sources = v0_sources();
         sources.pop();
         assert_eq!(
-            SchemaIndex::from_policy(&policy(), sources),
+            SchemaIndex::from_policy(&policy(), V0_POLICY_HASH, sources),
             Err(SchemaError::MissingSource)
         );
         let mut sources = v0_sources();
         sources[0].canonical_path_template = "/subscriptions/{subscription}/unknown".to_owned();
         assert_eq!(
-            SchemaIndex::from_policy(&policy(), sources),
+            SchemaIndex::from_policy(&policy(), V0_POLICY_HASH, sources),
             Err(SchemaError::UnreviewedSource)
         );
         assert_eq!(
@@ -636,6 +694,22 @@ mod tests {
                 1
             ),
             Err(SchemaError::PolicyMismatch)
+        );
+        assert_eq!(
+            SchemaIndex::v0(&policy()).expect("index").search(
+                &context_with_policy("different-policy-contents", "v0-bootstrap-1"),
+                "provider",
+                None,
+                1
+            ),
+            Err(SchemaError::PolicyMismatch)
+        );
+
+        let mut sources = v0_sources();
+        sources[0].description = "x".repeat(MAX_DESCRIPTION_BYTES + 1);
+        assert_eq!(
+            SchemaIndex::from_policy(&policy(), V0_POLICY_HASH, sources),
+            Err(SchemaError::UnreviewedSource)
         );
     }
 }
