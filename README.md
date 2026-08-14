@@ -41,7 +41,8 @@ servers. They must not use an ambient Azure login.
 The default azmcp configuration path is
 `$XDG_CONFIG_HOME/azmcp/config.toml`, or
 `$HOME/.config/azmcp/config.toml` when `XDG_CONFIG_HOME` is unset.
-`AZMCP_CONFIG` selects an explicit file.
+No azmcp-specific environment variables are required for a normal installation.
+`AZMCP_CONFIG` is an optional override for tests and nonstandard layouts.
 
 ```toml
 [clouds.AzureCloud]
@@ -100,16 +101,22 @@ command = "/absolute/path/to/azmcp"
 
 [mcp_servers.azmcp.env]
 CODEX_MCP_PROTOCOL_VERSION = "2026-07-28"
-AZMCP_CONFIG = "/absolute/path/to/azmcp.toml"
-AZMCP_AZURE_PROFILE = "/absolute/path/to/azureProfile.json"
-AZMCP_AUDIT_LOG = "/absolute/path/to/azmcp-requests.jsonl"
 ```
 
 The feature can instead be enabled for one invocation with
 `codex --enable mcp_2026_07_28`. Codex consumes
 `CODEX_MCP_PROTOCOL_VERSION` before it launches the child; `azmcp` neither
-expects nor receives that variable. Legacy `initialize` is intentionally not
-implemented.
+expects nor receives that variable. The server finds its configuration, Azure
+CLI profile, `az` executable, and audit destination through the standard paths
+described above. Legacy `initialize` is intentionally not implemented.
+
+With the feature enabled, the equivalent CLI registration is:
+
+```sh
+codex mcp add azmcp \
+  --env CODEX_MCP_PROTOCOL_VERSION=2026-07-28 \
+  -- /absolute/path/to/azmcp
+```
 
 ## Safety model
 

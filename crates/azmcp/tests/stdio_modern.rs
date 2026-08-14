@@ -18,13 +18,15 @@ fn metadata() -> Value {
 }
 
 #[test]
-fn built_server_completes_modern_discovery_and_synthetic_accounts() {
+fn built_server_uses_standard_paths_for_modern_synthetic_accounts() {
     let directory = tempfile::tempdir().expect("tempdir");
-    let config = directory.path().join("azmcp.toml");
-    let profile = directory.path().join("azureProfile.json");
-    let audit = directory.path().join("audit/requests.jsonl");
+    let config = directory.path().join(".config/azmcp/config.toml");
+    let profile = directory.path().join(".azure/azureProfile.json");
+    let audit = directory.path().join(".local/state/azmcp/requests.jsonl");
     let az_marker = directory.path().join("fake-az-invoked");
     let fake_az = directory.path().join("fake-az");
+    fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
+    fs::create_dir_all(profile.parent().expect("profile parent")).expect("profile directory");
     fs::write(&config, "").expect("config");
     fs::write(
         &profile,
@@ -48,10 +50,7 @@ fn built_server_completes_modern_discovery_and_synthetic_accounts() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_azmcp"))
         .env_clear()
         .env("HOME", directory.path())
-        .env("AZMCP_CONFIG", &config)
-        .env("AZMCP_AZURE_PROFILE", &profile)
         .env("AZMCP_AZ_EXECUTABLE", &fake_az)
-        .env("AZMCP_AUDIT_LOG", &audit)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -16,7 +16,8 @@
   `CODEX_MCP_PROTOCOL_VERSION=2026-07-28` server configuration marker.
 - Local Rust is `1.97.1`; Azure CLI is `2.89.0`.
 - The built server completes interleaved `server/discover`, deterministic `tools/list`, and
-  `azure_accounts` requests over real stdio with synthetic paths and a fake Azure executable.
+  `azure_accounts` requests over real stdio using a synthetic temporary home, the standard
+  config/profile/state paths, and an explicitly injected fake Azure executable.
 - The core test suite uses only synthetic profiles, fake executables, and loopback HTTP.
   The current workspace gate is 112 tests plus warning-free clippy.
 - The four v0 tools are now the exact advertised catalog. A modern-protocol lifecycle test
@@ -60,6 +61,8 @@
 
 - v0 is modern-only. Legacy MCP is deferred until a concrete host requirement justifies a
   second lifecycle.
+- A normal installation needs no azmcp-specific environment variables. Codex's stdio protocol
+  marker remains in the client registration, but Codex consumes it before launching azmcp.
 - This machine's Azure CLI session targets real production. Development and validation
   must not inspect accounts, acquire tokens, or call Azure endpoints. Use only synthetic
   profile fixtures, fake `az` executables, and loopback Azure simulators.
