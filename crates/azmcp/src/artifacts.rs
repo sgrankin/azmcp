@@ -503,6 +503,7 @@ struct Reservation {
     stage_id: String,
     staging_path: PathBuf,
     identity: FileIdentity,
+    cleanup_pending: bool,
 }
 
 struct StreamState {
@@ -1037,6 +1038,7 @@ impl FileArtifactStore {
                 stage_id: stage_id.clone(),
                 staging_path: stream_state.staging_path.clone(),
                 identity: stream_state.identity,
+                cleanup_pending: false,
             },
         );
         Ok(ArtifactStage {
@@ -1149,6 +1151,7 @@ impl FileArtifactStore {
                     stage_id: stage_id.clone(),
                     staging_path: staging_path.clone(),
                     identity,
+                    cleanup_pending: false,
                 },
             );
             Ok(ArtifactStage {
@@ -1252,11 +1255,19 @@ impl FileArtifactStore {
         ensure_store_ready(&self.inner.root, &mut state)?;
         let mut first_error = None;
         for stage in stages {
+            let owns_reservation = self.validate_stage_shape(namespace, stage).is_ok()
+                && state
+                    .reservations
+                    .get(stage.receipt.path())
+                    .is_some_and(|reservation| validate_reservation(reservation, stage).is_ok());
             let result = self
                 .validate_stage_shape(namespace, stage)
                 .and_then(|_| {
-                    if let Some(reservation) = state.reservations.get(stage.receipt.path()) {
-                        validate_reservation(reservation, stage)?;
+                    match state.reservations.get(stage.receipt.path()) {
+                        Some(reservation) => validate_reservation(reservation, stage)?,
+                        None if file_identity_if_regular(stage.receipt.path())?.is_none()
+                            && file_identity_if_regular(&stage.staging_path)?.is_none() => {}
+                        None => return Err(ArtifactError::ReceiptMismatch),
                     }
                     Ok(())
                 })
@@ -1265,8 +1276,16 @@ impl FileArtifactStore {
                 Ok(()) => {
                     state.reservations.remove(stage.receipt.path());
                 }
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+                Err(error) => {
+                    if owns_reservation
+                        && let Some(reservation) = state.reservations.get_mut(stage.receipt.path())
+                    {
+                        reservation.cleanup_pending = true;
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
         let namespace_path = self.inner.root.join(namespace.as_str());
@@ -1735,7 +1754,13 @@ impl io::Write for BoundedBuffer {
 
 fn ensure_store_ready(root: &Path, state: &mut StoreState) -> Result<(), ArtifactError> {
     ensure_store_root_ready(root, state)?;
-    retry_pending_stream_cleanup(state)
+    let mut first_error = retry_pending_stage_cleanup(state).err();
+    if let Err(error) = retry_pending_stream_cleanup(state)
+        && first_error.is_none()
+    {
+        first_error = Some(error);
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn ensure_store_root_ready(root: &Path, state: &mut StoreState) -> Result<(), ArtifactError> {
@@ -1803,6 +1828,42 @@ fn retry_pending_stream_cleanup(state: &mut StoreState) -> Result<(), ArtifactEr
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn retry_pending_stage_cleanup(state: &mut StoreState) -> Result<(), ArtifactError> {
+    let destinations = state
+        .reservations
+        .iter()
+        .filter(|(_, reservation)| reservation.cleanup_pending)
+        .map(|(destination, _)| destination.clone())
+        .collect::<Vec<_>>();
+    let mut first_error = None;
+    for destination in destinations {
+        let Some(reservation) = state.reservations.remove(&destination) else {
+            continue;
+        };
+        let mut cleanup_error = None;
+        for path in [destination.as_path(), reservation.staging_path.as_path()] {
+            if let Err(error) = remove_exact_file(path, reservation.identity)
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(error);
+            }
+        }
+        if cleanup_error.is_none()
+            && let Some(namespace_path) = destination.parent()
+            && let Err(error) = remove_directory_if_empty(namespace_path)
+        {
+            cleanup_error = Some(error);
+        }
+        if let Some(error) = cleanup_error {
+            state.reservations.insert(destination, reservation);
+            if first_error.is_none() {
+                first_error = Some(error);
             }
         }
     }
@@ -2824,6 +2885,14 @@ mod tests {
             .expect("finalized stage releases root");
         assert!(stage.receipt().path().is_file());
         assert!(!stage.staging_path.exists());
+        assert_eq!(
+            store
+                .discard_staged(namespace, vec![stage.clone()])
+                .await
+                .expect_err("finalized ticket cannot delete a durable artifact"),
+            ArtifactError::ReceiptMismatch
+        );
+        assert!(stage.receipt().path().is_file());
     }
 
     #[tokio::test]
@@ -3184,7 +3253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_rejects_replaced_inode_and_other_namespaces() {
+    async fn pending_stage_cleanup_recovers_without_ticket_and_rejects_other_namespaces() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = FileArtifactStore::new(directory.path().join("artifacts")).unwrap();
         let first = store.allocate_namespace().unwrap();
@@ -3205,26 +3274,52 @@ mod tests {
         drop(replacement);
         assert_eq!(
             store
-                .discard_staged(first, vec![stage.clone()])
+                .discard_staged(first.clone(), vec![stage.clone()])
                 .await
                 .expect_err("changed inode"),
             ArtifactError::ReceiptMismatch
         );
         assert!(stage.staging_path.exists());
+        let replaced_path = stage.staging_path.clone();
+        drop(stage);
 
         let second = store.allocate_namespace().unwrap();
+        assert_eq!(
+            store
+                .write_json(second.clone(), "blocked.json".to_owned(), json!(null))
+                .await
+                .expect_err("pending cleanup blocks later writes"),
+            ArtifactError::ReceiptMismatch
+        );
+        assert!(replaced_path.exists());
+        fs::remove_file(&replaced_path).unwrap();
         let second_receipt = store
             .write_json(second.clone(), "result.json".to_owned(), json!(null))
             .await
             .unwrap();
+
+        let foreign_stage = store
+            .stage_prepared(
+                first.clone(),
+                store
+                    .prepare_json("foreign.json".to_owned(), json!(null))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(
             store
-                .discard_staged(second, vec![stage])
+                .discard_staged(second, vec![foreign_stage.clone()])
                 .await
                 .expect_err("other namespace"),
             ArtifactError::ReceiptMismatch
         );
         assert!(second_receipt.path().exists());
+        assert!(foreign_stage.staging_path.exists());
+        store
+            .discard_staged(first, vec![foreign_stage])
+            .await
+            .expect("wrong-namespace denial did not schedule cleanup");
     }
 
     #[tokio::test]
