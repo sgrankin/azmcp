@@ -1252,44 +1252,46 @@ impl FileArtifactStore {
             .gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ensure_store_ready(&self.inner.root, &mut state)?;
+        ensure_store_root_ready(&self.inner.root, &mut state)?;
         let mut first_error = None;
         for stage in stages {
-            let owns_reservation = self.validate_stage_shape(namespace, stage).is_ok()
-                && state
-                    .reservations
-                    .get(stage.receipt.path())
-                    .is_some_and(|reservation| validate_reservation(reservation, stage).is_ok());
-            let result = self
-                .validate_stage_shape(namespace, stage)
-                .and_then(|_| {
-                    match state.reservations.get(stage.receipt.path()) {
-                        Some(reservation) => validate_reservation(reservation, stage)?,
-                        None if file_identity_if_regular(stage.receipt.path())?.is_none()
-                            && file_identity_if_regular(&stage.staging_path)?.is_none() => {}
-                        None => return Err(ArtifactError::ReceiptMismatch),
+            let result = self.validate_stage_shape(namespace, stage).and_then(|_| {
+                match state.reservations.get(stage.receipt.path()) {
+                    Some(reservation) => validate_reservation(reservation, stage),
+                    None if file_identity_if_regular(stage.receipt.path())?.is_none()
+                        && file_identity_if_regular(&stage.staging_path)?.is_none() =>
+                    {
+                        Ok(())
                     }
-                    Ok(())
-                })
-                .and_then(|_| discard_exact_files(std::slice::from_ref(stage)));
+                    None => Err(ArtifactError::ReceiptMismatch),
+                }
+            });
             match result {
                 Ok(()) => {
-                    state.reservations.remove(stage.receipt.path());
-                }
-                Err(error) => {
-                    if owns_reservation
-                        && let Some(reservation) = state.reservations.get_mut(stage.receipt.path())
-                    {
+                    if let Some(reservation) = state.reservations.get_mut(stage.receipt.path()) {
                         reservation.cleanup_pending = true;
                     }
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
                 }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
             }
         }
+        if let Err(error) = retry_pending_stage_cleanup(&mut state)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Err(error) = retry_pending_stream_cleanup(&mut state)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
         let namespace_path = self.inner.root.join(namespace.as_str());
-        remove_directory_if_empty(&namespace_path)?;
+        if let Err(error) = remove_directory_if_empty(&namespace_path)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
         release_root_if_idle(&mut state);
         first_error.map_or(Ok(()), Err)
     }
@@ -3266,6 +3268,15 @@ mod tests {
             )
             .await
             .unwrap();
+        let sibling = store
+            .stage_prepared(
+                first.clone(),
+                store
+                    .prepare_json("sibling.json".to_owned(), json!({"b": 2}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         let original = fs::read(&stage.staging_path).unwrap();
         fs::remove_file(&stage.staging_path).unwrap();
         let mut replacement = open_private_new(&stage.staging_path).unwrap();
@@ -3280,8 +3291,26 @@ mod tests {
             ArtifactError::ReceiptMismatch
         );
         assert!(stage.staging_path.exists());
+        assert_eq!(
+            store
+                .discard_staged(first.clone(), vec![stage.clone(), sibling.clone()])
+                .await
+                .expect_err("one pending failure does not skip its sibling"),
+            ArtifactError::ReceiptMismatch
+        );
+        assert!(!sibling.staging_path.exists());
+        assert!(
+            !store
+                .inner
+                .gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reservations
+                .contains_key(sibling.receipt().path())
+        );
         let replaced_path = stage.staging_path.clone();
         drop(stage);
+        drop(sibling);
 
         let second = store.allocate_namespace().unwrap();
         assert_eq!(
