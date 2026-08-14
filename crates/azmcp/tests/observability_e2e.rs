@@ -1,4 +1,5 @@
 use std::{
+    io::Read as _,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -251,10 +252,16 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
       timespan: "PT1H"
     }})
   ]);
-  return await az.artifacts.writeJson({{
+  const array = await az.artifacts.writeJsonArray({{
     name: "observability.json",
-    value: {{metrics, logs}}
+    values: [metrics, logs]
   }});
+  const lines = await az.artifacts.writeJsonLines({{
+    name: "observability.jsonl.lz4",
+    compression: "lz4",
+    values: [metrics.body.value[0], ...logs.tables[0].rows]
+  }});
+  return {{array, lines}};
 }})()
 "#
     );
@@ -269,21 +276,38 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
     let ran = receive_tool_result(&mut client, 2).await;
     assert_eq!(ran.is_error, Some(false));
     let ran = ran.structured_content.expect("run result");
-    let artifact_path = std::path::PathBuf::from(
-        ran["value"]["path"]
+    let array_path = std::path::PathBuf::from(
+        ran["value"]["array"]["path"]
             .as_str()
-            .expect("artifact receipt path"),
+            .expect("array receipt path"),
     );
-    assert!(artifact_path.starts_with(&artifact_root));
-    assert_eq!(ran["value"]["mediaType"], "application/json");
-    assert_eq!(ran["value"]["sensitivity"], "customerData");
-    let artifact_bytes = std::fs::read(&artifact_path).expect("artifact bytes");
-    assert_eq!(artifact_bytes.last(), Some(&b'\n'));
-    assert_eq!(ran["value"]["bytes"], artifact_bytes.len());
-    let artifact: Value = serde_json::from_slice(&artifact_bytes).expect("artifact JSON");
-    assert_eq!(artifact["metrics"]["body"]["kind"], "synthetic-metrics");
-    assert_eq!(artifact["metrics"]["body"]["value"][0]["average"], 12.5);
-    assert_eq!(artifact["logs"]["tables"][0]["rows"][0], json!([17]));
+    let lines_path = std::path::PathBuf::from(
+        ran["value"]["lines"]["path"]
+            .as_str()
+            .expect("JSON Lines receipt path"),
+    );
+    assert!(array_path.starts_with(&artifact_root));
+    assert!(lines_path.starts_with(&artifact_root));
+    assert_eq!(ran["value"]["array"]["mediaType"], "application/json");
+    assert_eq!(ran["value"]["lines"]["mediaType"], "application/x-ndjson");
+    assert_eq!(ran["value"]["lines"]["contentEncoding"], "lz4");
+    assert_eq!(ran["value"]["array"]["sensitivity"], "customerData");
+    assert_eq!(ran["value"]["lines"]["sensitivity"], "customerData");
+    let array_bytes = std::fs::read(&array_path).expect("array artifact bytes");
+    assert_eq!(array_bytes.last(), Some(&b'\n'));
+    assert_eq!(ran["value"]["array"]["bytes"], array_bytes.len());
+    let artifact: Value = serde_json::from_slice(&array_bytes).expect("artifact JSON");
+    assert_eq!(artifact[0]["body"]["kind"], "synthetic-metrics");
+    assert_eq!(artifact[0]["body"]["value"][0]["average"], 12.5);
+    assert_eq!(artifact[1]["tables"][0]["rows"][0], json!([17]));
+    let compressed_lines = std::fs::read(&lines_path).expect("compressed JSON Lines");
+    let mut lines_bytes = Vec::new();
+    lz4_flex::frame::FrameDecoder::new(compressed_lines.as_slice())
+        .read_to_end(&mut lines_bytes)
+        .expect("decode JSON Lines LZ4 frame");
+    assert_eq!(lines_bytes, b"{\"average\":12.5}\n[17]\n");
+    assert_eq!(ran["value"]["lines"]["logicalBytes"], lines_bytes.len());
+    assert_eq!(ran["value"]["lines"]["bytes"], compressed_lines.len());
     assert_eq!(ran["callsOmitted"], 0);
     assert_eq!(ran["calls"].as_array().map(Vec::len), Some(2));
     let metrics_call = call(&ran, "az.metrics.single");
@@ -315,11 +339,51 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         .send(tool_request(
             3,
             RUN_TOOL,
+            json!({
+                "contextId": context_id,
+                "code": r#"az.artifacts.writeJsonArray({
+                    name: "large-series.json.lz4",
+                    compression: "lz4",
+                    values: (function* () {
+                        for (let index = 0; index < 16; index += 1) {
+                            yield {index, points: "x".repeat(64 * 1024)};
+                        }
+                    })(),
+                })"#,
+                "timeoutMs": 5_000,
+            }),
+        ))
+        .await
+        .expect("send large artifact run");
+    let large = receive_tool_result(&mut client, 3).await;
+    assert_eq!(large.is_error, Some(false));
+    let large = large.structured_content.expect("large artifact result");
+    assert!(large["value"]["logicalBytes"].as_u64().unwrap() > 480 * 1024);
+    assert_eq!(large["value"]["contentEncoding"], "lz4");
+    let large_path = std::path::PathBuf::from(
+        large["value"]["path"]
+            .as_str()
+            .expect("large artifact receipt path"),
+    );
+    let large_compressed = std::fs::read(&large_path).expect("large compressed artifact");
+    let mut large_decoded = Vec::new();
+    lz4_flex::frame::FrameDecoder::new(large_compressed.as_slice())
+        .read_to_end(&mut large_decoded)
+        .expect("decode large artifact");
+    assert_eq!(large_decoded.first(), Some(&b'['));
+    assert_eq!(large_decoded.last(), Some(&b'\n'));
+    let large_json: Value = serde_json::from_slice(&large_decoded).expect("large JSON array");
+    assert_eq!(large_json.as_array().map(Vec::len), Some(16));
+
+    client
+        .send(tool_request(
+            4,
+            RUN_TOOL,
             json!({"contextId": context_id, "code": "e2eCounter + 1"}),
         ))
         .await
         .expect("send persistence run");
-    let persisted = receive_tool_result(&mut client, 3).await;
+    let persisted = receive_tool_result(&mut client, 4).await;
     assert_eq!(persisted.is_error, Some(false));
     let persisted = persisted.structured_content.expect("persistence result");
     assert_eq!(persisted["value"], 42);
@@ -327,33 +391,41 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
 
     client
         .send(tool_request(
-            4,
+            5,
             CONTEXT_CLOSE_TOOL,
             json!({"contextId": context_id}),
         ))
         .await
         .expect("send close");
-    let closed = receive_tool_result(&mut client, 4).await;
+    let closed = receive_tool_result(&mut client, 5).await;
     assert_eq!(closed.is_error, Some(false));
     assert_eq!(closed.structured_content, Some(json!({"closed": true})));
 
     client
         .send(tool_request(
-            5,
+            6,
             RUN_TOOL,
             json!({"contextId": context_id, "code": "e2eCounter"}),
         ))
         .await
         .expect("send post-close run");
-    let evicted = receive_tool_result(&mut client, 5).await;
+    let evicted = receive_tool_result(&mut client, 6).await;
     assert_eq!(evicted.is_error, Some(true));
     assert_eq!(
         evicted.structured_content.expect("domain error")["code"],
         "context_evicted"
     );
     assert_eq!(
-        std::fs::read(&artifact_path).expect("artifact survives context close"),
-        artifact_bytes
+        std::fs::read(&array_path).expect("array artifact survives context close"),
+        array_bytes
+    );
+    assert_eq!(
+        std::fs::read(&lines_path).expect("JSON Lines artifact survives context close"),
+        compressed_lines
+    );
+    assert_eq!(
+        std::fs::read(&large_path).expect("large artifact survives context close"),
+        large_compressed
     );
 
     let token_requests = credentials
@@ -389,7 +461,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         request.audience == TokenAudience::LogAnalytics
             && request.resource() == "https://api.loganalytics.io"
     }));
-    assert_eq!(audit.prepares.load(Ordering::SeqCst), 4);
+    assert_eq!(audit.prepares.load(Ordering::SeqCst), 6);
     let records = audit
         .records
         .lock()
@@ -425,19 +497,42 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    assert_eq!(artifact_records.len(), 1);
-    assert_eq!(artifact_records[0].operation, "az.artifacts.writeJson");
-    assert_eq!(artifact_records[0].bytes, artifact_bytes.len());
-    assert_eq!(artifact_records[0].sensitivity, "customerData");
-    assert_eq!(artifact_records[0].correlation_id, ran["correlationId"]);
+    assert_eq!(artifact_records.len(), 3);
+    assert_eq!(artifact_records[0].operation, "az.artifacts.writeJsonArray");
+    assert_eq!(artifact_records[0].bytes, array_bytes.len());
+    assert_eq!(artifact_records[0].logical_bytes, array_bytes.len());
+    assert_eq!(artifact_records[0].content_encoding, None);
+    assert_eq!(artifact_records[1].operation, "az.artifacts.writeJsonLines");
+    assert_eq!(artifact_records[1].bytes, compressed_lines.len());
+    assert_eq!(artifact_records[1].logical_bytes, lines_bytes.len());
+    assert_eq!(artifact_records[1].content_encoding, Some("lz4"));
+    assert_eq!(artifact_records[2].operation, "az.artifacts.writeJsonArray");
+    assert_eq!(artifact_records[2].bytes, large_compressed.len());
+    assert_eq!(artifact_records[2].logical_bytes, large_decoded.len());
+    assert_eq!(artifact_records[2].content_encoding, Some("lz4"));
+    assert!(
+        artifact_records
+            .iter()
+            .all(|record| record.sensitivity == "customerData")
+    );
+    assert!(
+        artifact_records[..2]
+            .iter()
+            .all(|record| record.correlation_id == ran["correlationId"])
+    );
+    assert_eq!(artifact_records[2].correlation_id, large["correlationId"]);
     let encoded_artifact_audit =
         serde_json::to_string(&artifact_records).expect("artifact audit JSON");
     for secret in [
         "observability.json",
+        "observability.jsonl.lz4",
+        "large-series.json.lz4",
         METRIC,
         KQL,
         WORKSPACE,
-        artifact_path.to_string_lossy().as_ref(),
+        array_path.to_string_lossy().as_ref(),
+        lines_path.to_string_lossy().as_ref(),
+        large_path.to_string_lossy().as_ref(),
     ] {
         assert!(
             !encoded_artifact_audit.contains(secret),

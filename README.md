@@ -96,16 +96,45 @@ const receipt = await az.artifacts.writeJson({
   name: "metrics.json",
   value: result
 })
-// {path, bytes, sha256, mediaType: "application/json", sensitivity: "customerData"}
+// {path, bytes, sha256, logicalBytes, mediaType, sensitivity}
+
+const arrayReceipt = await az.artifacts.writeJsonArray({
+  name: "metrics.json.lz4",
+  compression: "lz4",
+  values: asyncMetricBatches
+})
+
+const linesReceipt = await az.artifacts.writeJsonLines({
+  name: "metrics.jsonl",
+  values: metricRows
+})
 ```
 
 `name` is one conservative ASCII filename ending in `.json`, never a path.
+The streamed helpers also accept `.jsonl`; compressed names add a `.lz4`
+suffix, producing `.json.lz4` or `.jsonl.lz4`.
+`values` may be an iterable or async iterable and is transferred in bounded,
+acknowledged chunks rather than one giant worker message.
+`writeJsonArray` produces one conventional top-level JSON array;
+`writeJsonLines` writes one compact JSON value per line.
+Compression is opt-in with `compression: "lz4"` and uses an LZ4 frame with a
+content checksum.
+
 Writes are create-only and confined to a fresh random directory owned by that
-context. Each compact JSON file is limited to 480 KiB; a context can create at
-most 32 files and 4 MiB, while one artifact root can hold at most 256 files and
-16 MiB. Directories are mode `0700` and files mode `0600` on Unix. Symlinks,
+context. A single-value `writeJson` file is limited to 480 KiB.
+A streamed artifact is limited to 64 MiB of logical JSON and 65 MiB of stored
+bytes, allowing bounded LZ4 framing overhead for incompressible input.
+A context can create at most 32 files and retain 128 MiB of stored bytes; one
+artifact root can hold at most 256 files and 512 MiB.
+Directories are mode `0700` and files mode `0600` on Unix. Symlinks,
 non-regular destinations, traversal, overwrite, and cross-context addressing
 fail closed.
+
+Receipt `bytes` and `sha256` describe the file actually stored at `path`.
+`logicalBytes` describes the decoded JSON size, and compressed receipts add
+`contentEncoding: "lz4"`.
+The media type is `application/json` for arrays and
+`application/x-ndjson` for JSON Lines.
 
 The managed artifact store currently requires Unix file identities and private
 mode semantics (macOS or Linux). Other platforms fail server startup until an
@@ -124,7 +153,7 @@ attempt; it does not claim that a later run commit succeeded.
 Abrupt process or host termination at the publication boundary is different
 from cancellation: the local file may have committed even if the MCP response
 was lost. azmcp removes stale unpublished temporary files on the next locked
-transaction, but cannot infer whether a durable create-only `.json` file was
+transaction, but cannot infer whether a durable create-only artifact was
 received by the client. Such an orphan remains subject to the normal root
 quota and ordinary local-shell cleanup.
 
@@ -132,8 +161,8 @@ Artifacts deliberately survive context close, expiry, and server restart so a
 local process can consume the returned path. azmcp exposes no artifact read,
 list, delete, or arbitrary filesystem API; cleanup is an ordinary local-shell
 operation. The durable audit log records only the correlation ID, operation,
-decision, encoded byte count, and sensitivity—not the path, filename, or JSON
-content.
+stored and logical byte counts, encoding, media type, and sensitivity—not the
+path, filename, or JSON content.
 
 ## Build and test
 

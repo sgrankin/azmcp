@@ -36,7 +36,10 @@ use serde_json::Value;
 use tokio::sync::{Mutex, watch};
 
 use crate::{
-    artifacts::{ArtifactError, ArtifactNamespace, ArtifactStage, ArtifactStore},
+    artifacts::{
+        ArtifactCompression, ArtifactError, ArtifactNamespace, ArtifactStage, ArtifactStore,
+        ArtifactStream, ArtifactStreamFormat,
+    },
     audit::{ArtifactWriteAuditRecord, AuditSink},
     host::{CallDecision, CallRecord, CallRecords, HostAdapter, HttpClientFactory},
     refs::{RefId, RefStore},
@@ -45,9 +48,12 @@ use crate::{
         LogsScopeOverrides, RunArgs, SchemaGetArgs, SchemaSearchArgs,
     },
     worker::{
-        ExecutionResult, HOST_METHOD_ARTIFACT_WRITE_JSON, HOST_METHOD_REF, HostCallHandler,
-        HostCallRequest, HostCallResult, MAX_INPUT_BYTES, RefCandidate, ResultTooLargeSummary,
-        WorkerProcess,
+        ArtifactWriteCompression, ArtifactWriteJsonStreamAbortResult,
+        ArtifactWriteJsonStreamAppendResult, ArtifactWriteJsonStreamArguments,
+        ArtifactWriteJsonStreamBeginResult, ExecutionResult, HOST_METHOD_ARTIFACT_WRITE_JSON,
+        HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY, HOST_METHOD_ARTIFACT_WRITE_JSON_LINES,
+        HOST_METHOD_REF, HostCallHandler, HostCallRequest, HostCallResult, MAX_INPUT_BYTES,
+        RefCandidate, ResultTooLargeSummary, WorkerProcess,
     },
 };
 
@@ -711,9 +717,25 @@ struct WorkerSlot {
     identity_pin: CredentialIdentityPin,
     artifact_namespace: Option<ArtifactNamespace>,
     artifact_store: Option<Arc<dyn ArtifactStore>>,
-    pending_artifacts: Mutex<Vec<ArtifactStage>>,
+    artifact_transaction: Mutex<ArtifactTransaction>,
     refs: Mutex<RefStore>,
     ref_changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct ArtifactTransaction {
+    run_id: Option<String>,
+    accepting: bool,
+    stages: Vec<ArtifactStage>,
+    streams: HashMap<String, ActiveArtifactStream>,
+}
+
+struct ActiveArtifactStream {
+    stream: ArtifactStream,
+    format: ArtifactStreamFormat,
+    compression: ArtifactCompression,
+    next_sequence: u16,
+    items: u64,
 }
 
 /// Cancellation guard for the gap between registry insertion and worker
@@ -832,7 +854,7 @@ impl WorkerSlot {
             identity_pin,
             artifact_namespace: None,
             artifact_store: None,
-            pending_artifacts: Mutex::new(Vec::new()),
+            artifact_transaction: Mutex::new(ArtifactTransaction::default()),
             refs: Mutex::new(RefStore::default()),
             ref_changed: tokio::sync::Notify::new(),
         }
@@ -858,33 +880,42 @@ impl WorkerSlot {
         self.rollback_pending_artifacts().await
     }
 
-    async fn stage_artifact(&self, stage: ArtifactStage) -> Result<(), ArtifactStage> {
-        let mut pending = self.pending_artifacts.lock().await;
-        if *self.cancellation.borrow() {
-            return Err(stage);
+    async fn begin_artifact_run(&self, run_id: &str) -> Result<(), ArtifactError> {
+        if self.artifact_store.is_none() {
+            return Ok(());
         }
-        pending.push(stage);
+        let mut transaction = self.artifact_transaction.lock().await;
+        if *self.cancellation.borrow()
+            || transaction.run_id.is_some()
+            || !transaction.stages.is_empty()
+            || !transaction.streams.is_empty()
+        {
+            return Err(ArtifactError::Unavailable);
+        }
+        transaction.run_id = Some(run_id.to_owned());
+        transaction.accepting = true;
         Ok(())
     }
 
-    async fn commit_pending_artifacts(&self) -> Result<(), ArtifactError> {
-        let mut pending = self.pending_artifacts.lock().await;
-        if *self.cancellation.borrow() {
-            if !pending.is_empty() {
-                let (Some(store), Some(namespace)) = (
-                    self.artifact_store.as_ref(),
-                    self.artifact_namespace.as_ref(),
-                ) else {
-                    return Err(ArtifactError::Unavailable);
-                };
-                store
-                    .discard_staged(namespace.clone(), pending.clone())
-                    .await?;
-                pending.clear();
-            }
+    async fn commit_pending_artifacts(&self, run_id: &str) -> Result<(), ArtifactError> {
+        if self.artifact_store.is_none() {
+            return Ok(());
+        }
+        let mut transaction = self.artifact_transaction.lock().await;
+        if !artifact_transaction_accepts(&transaction, run_id) {
             return Err(ArtifactError::Unavailable);
         }
-        if pending.is_empty() {
+        transaction.accepting = false;
+        if *self.cancellation.borrow() {
+            self.discard_artifact_transaction(&mut transaction).await?;
+            return Err(ArtifactError::Unavailable);
+        }
+        if !transaction.streams.is_empty() {
+            self.discard_artifact_transaction(&mut transaction).await?;
+            return Err(ArtifactError::Unavailable);
+        }
+        if transaction.stages.is_empty() {
+            transaction.run_id = None;
             return Ok(());
         }
         let (Some(store), Some(namespace)) = (
@@ -893,39 +924,78 @@ impl WorkerSlot {
         ) else {
             return Err(ArtifactError::Unavailable);
         };
-        let stages = pending.clone();
+        let stages = transaction.stages.clone();
         store
             .commit_staged(namespace.clone(), stages.clone())
             .await?;
         if *self.cancellation.borrow() {
             store.discard_staged(namespace.clone(), stages).await?;
-            pending.clear();
+            transaction.stages.clear();
+            transaction.run_id = None;
             return Err(ArtifactError::Unavailable);
         }
         // There is deliberately no await between the final cancellation check
         // and clearing ownership. Publication wins at this boundary; the MCP
         // layer prioritizes the now-complete run over simultaneous cancellation.
         store.finalize_staged(namespace, &stages)?;
-        pending.clear();
+        transaction.stages.clear();
+        transaction.run_id = None;
         Ok(())
     }
 
     async fn rollback_pending_artifacts(&self) -> Result<(), ArtifactError> {
-        let mut pending = self.pending_artifacts.lock().await;
-        if pending.is_empty() {
+        let mut transaction = self.artifact_transaction.lock().await;
+        transaction.accepting = false;
+        if transaction.run_id.is_none()
+            && transaction.stages.is_empty()
+            && transaction.streams.is_empty()
+        {
             return Ok(());
         }
+        self.discard_artifact_transaction(&mut transaction).await
+    }
+
+    async fn discard_artifact_transaction(
+        &self,
+        transaction: &mut ArtifactTransaction,
+    ) -> Result<(), ArtifactError> {
         let (Some(store), Some(namespace)) = (
             self.artifact_store.as_ref(),
             self.artifact_namespace.as_ref(),
         ) else {
+            if transaction.stages.is_empty() && transaction.streams.is_empty() {
+                transaction.run_id = None;
+                return Ok(());
+            }
             return Err(ArtifactError::Unavailable);
         };
-        store
-            .discard_staged(namespace.clone(), pending.clone())
-            .await?;
-        pending.clear();
-        Ok(())
+        let streams = transaction
+            .streams
+            .drain()
+            .map(|(_, active)| active.stream)
+            .collect::<Vec<_>>();
+        let mut first_error = if streams.is_empty() {
+            None
+        } else {
+            store
+                .discard_streams(namespace.clone(), streams)
+                .await
+                .err()
+        };
+        if !transaction.stages.is_empty() {
+            match store
+                .discard_staged(namespace.clone(), transaction.stages.clone())
+                .await
+            {
+                Ok(()) => transaction.stages.clear(),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if first_error.is_none() {
+            transaction.run_id = None;
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn next_ref_expiry(&self) -> Option<Instant> {
@@ -943,6 +1013,10 @@ impl WorkerSlot {
     fn subscribe(&self) -> watch::Receiver<bool> {
         self.cancellation.subscribe()
     }
+}
+
+fn artifact_transaction_accepts(transaction: &ArtifactTransaction, run_id: &str) -> bool {
+    transaction.accepting && transaction.run_id.as_deref() == Some(run_id)
 }
 
 /// Stateful orchestration for the v0 application tools.
@@ -1414,6 +1488,12 @@ impl Application {
                 return Err(error);
             }
         };
+        if worker.begin_artifact_run(&correlation_id).await.is_err() {
+            let _ = self.inner.registry.close(id.as_str());
+            let _ = self.close_worker(id.as_str()).await;
+            abort_guard.disarm();
+            return Err(AppError::new(AppErrorCode::UpstreamError));
+        }
         let adapter = self.inner.host_client_factory.as_ref().map(|factory| {
             let mut adapter = HostAdapter::with_identity_pin(
                 lease.context(),
@@ -1443,6 +1523,17 @@ impl Application {
                     handle_ref_host_call(ref_worker, request).await
                 } else if request.method == HOST_METHOD_ARTIFACT_WRITE_JSON {
                     handle_artifact_host_call(
+                        ref_worker,
+                        artifact_audit,
+                        artifact_correlation_id.clone(),
+                        artifact_error,
+                        request,
+                    )
+                    .await
+                } else if request.method == HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY
+                    || request.method == HOST_METHOD_ARTIFACT_WRITE_JSON_LINES
+                {
+                    handle_artifact_stream_host_call(
                         ref_worker,
                         artifact_audit,
                         artifact_correlation_id,
@@ -1518,7 +1609,7 @@ impl Application {
                     None => Ok(std::mem::take(&mut result.value)),
                 };
                 match value {
-                    Ok(value) => match worker.commit_pending_artifacts().await {
+                    Ok(value) => match worker.commit_pending_artifacts(&correlation_id).await {
                         Ok(()) => {
                             drop(lease);
                             run_result(value, result, records, context, correlation_id)
@@ -2157,14 +2248,31 @@ async fn handle_artifact_host_call(
             }
         };
     let transaction_worker = Arc::clone(&worker);
+    let run_id = correlation_id.clone();
     let transaction = tokio::spawn(async move {
         let prepared = store
             .prepare_json(arguments.name, arguments.value)
             .map_err(|error| (map_artifact_error(error), "artifact write was rejected"))?;
+        let mut state = transaction_worker.artifact_transaction.lock().await;
+        if *transaction_worker.cancellation.borrow()
+            || !artifact_transaction_accepts(&state, &run_id)
+        {
+            return Err((
+                AppErrorCode::UpstreamError,
+                "artifact context is unavailable",
+            ));
+        }
         if audit.prepare().is_err() {
             return Err((AppErrorCode::UpstreamError, "artifact audit is unavailable"));
         }
-        let audit_record = ArtifactWriteAuditRecord::authorized(correlation_id, prepared.bytes());
+        let audit_record = ArtifactWriteAuditRecord::authorized(
+            correlation_id,
+            HOST_METHOD_ARTIFACT_WRITE_JSON,
+            prepared.bytes(),
+            prepared.bytes(),
+            None,
+            "application/json",
+        );
         if audit.append_artifact(&audit_record).is_err() {
             return Err((AppErrorCode::UpstreamError, "artifact audit is unavailable"));
         }
@@ -2172,6 +2280,21 @@ async fn handle_artifact_host_call(
             .stage_prepared(namespace.clone(), prepared)
             .await
             .map_err(|error| (map_artifact_error(error), "artifact write was rejected"))?;
+        if *transaction_worker.cancellation.borrow() {
+            store
+                .discard_staged(namespace.clone(), vec![stage])
+                .await
+                .map_err(|_| {
+                    (
+                        AppErrorCode::UpstreamError,
+                        "artifact cleanup is unavailable",
+                    )
+                })?;
+            return Err((
+                AppErrorCode::UpstreamError,
+                "artifact context is unavailable",
+            ));
+        }
         let value = serde_json::to_value(stage.receipt()).map_err(|_| {
             (
                 AppErrorCode::UpstreamError,
@@ -2194,19 +2317,368 @@ async fn handle_artifact_host_call(
                 return Err(error);
             }
         };
-        if let Err(stage) = transaction_worker.stage_artifact(stage).await {
-            if store.discard_staged(namespace, vec![stage]).await.is_err() {
-                return Err((
-                    AppErrorCode::UpstreamError,
-                    "artifact cleanup is unavailable",
-                ));
-            }
-            return Err((
-                AppErrorCode::UpstreamError,
-                "artifact context is unavailable",
-            ));
-        }
+        state.stages.push(stage);
         Ok(value)
+    });
+    match transaction.await {
+        Ok(Ok(value)) => HostCallResult::success(&request, value),
+        Ok(Err((code, message))) => {
+            record_artifact_error(&last_error, code);
+            HostCallResult::failure(&request, message)
+        }
+        Err(_) => {
+            record_artifact_error(&last_error, AppErrorCode::UpstreamError);
+            HostCallResult::failure(&request, "artifact storage is unavailable")
+        }
+    }
+}
+
+async fn handle_artifact_stream_host_call(
+    worker: Arc<WorkerSlot>,
+    audit: Option<Arc<dyn AuditSink>>,
+    run_correlation_id: String,
+    last_error: Arc<std::sync::Mutex<Option<AppErrorCode>>>,
+    request: HostCallRequest,
+) -> HostCallResult {
+    let Some(namespace) = worker.artifact_namespace.clone() else {
+        record_artifact_error(&last_error, AppErrorCode::CapabilityDenied);
+        return HostCallResult::failure(&request, "artifact writing is not granted");
+    };
+    let Some(store) = worker.artifact_store.clone() else {
+        record_artifact_error(&last_error, AppErrorCode::UpstreamError);
+        return HostCallResult::failure(&request, "artifact storage is unavailable");
+    };
+    let Some(audit) = audit else {
+        record_artifact_error(&last_error, AppErrorCode::UpstreamError);
+        return HostCallResult::failure(&request, "artifact audit is unavailable");
+    };
+    let (format, operation) = match request.method.as_str() {
+        HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY => (
+            ArtifactStreamFormat::JsonArray,
+            HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY,
+        ),
+        HOST_METHOD_ARTIFACT_WRITE_JSON_LINES => (
+            ArtifactStreamFormat::JsonLines,
+            HOST_METHOD_ARTIFACT_WRITE_JSON_LINES,
+        ),
+        _ => {
+            record_artifact_error(&last_error, AppErrorCode::InvalidInput);
+            return HostCallResult::failure(&request, "invalid artifact stream method");
+        }
+    };
+    let arguments =
+        match serde_json::from_value::<ArtifactWriteJsonStreamArguments>(request.arguments.clone())
+        {
+            Ok(arguments) if arguments.validate().is_ok() => arguments,
+            _ => {
+                record_artifact_error(&last_error, AppErrorCode::InvalidInput);
+                return HostCallResult::failure(&request, "invalid artifact stream arguments");
+            }
+        };
+
+    let transaction_worker = Arc::clone(&worker);
+    let run_id = run_correlation_id.clone();
+    let transaction = tokio::spawn(async move {
+        match arguments {
+            ArtifactWriteJsonStreamArguments::Begin { name, compression } => {
+                if audit.prepare().is_err() {
+                    return Err((AppErrorCode::UpstreamError, "artifact audit is unavailable"));
+                }
+                let compression = match compression {
+                    ArtifactWriteCompression::Identity => ArtifactCompression::Identity,
+                    ArtifactWriteCompression::Lz4 => ArtifactCompression::Lz4Frame,
+                };
+                let external_id = format!(
+                    "stream_{}",
+                    correlation_id().map_err(|_| {
+                        (
+                            AppErrorCode::CorrelationUnavailable,
+                            "artifact stream ID is unavailable",
+                        )
+                    })?
+                );
+                let mut state = transaction_worker.artifact_transaction.lock().await;
+                if *transaction_worker.cancellation.borrow()
+                    || !artifact_transaction_accepts(&state, &run_id)
+                {
+                    return Err((
+                        AppErrorCode::UpstreamError,
+                        "artifact context is unavailable",
+                    ));
+                }
+                let stream = store
+                    .begin_json_stream(namespace.clone(), name, compression, format)
+                    .await
+                    .map_err(|error| (map_artifact_error(error), "artifact stream was rejected"))?;
+                if *transaction_worker.cancellation.borrow() {
+                    store
+                        .discard_stream(namespace.clone(), stream)
+                        .await
+                        .map_err(|_| {
+                            (
+                                AppErrorCode::UpstreamError,
+                                "artifact cleanup is unavailable",
+                            )
+                        })?;
+                    return Err((
+                        AppErrorCode::UpstreamError,
+                        "artifact context is unavailable",
+                    ));
+                }
+                if state.streams.contains_key(&external_id) {
+                    store
+                        .discard_stream(namespace.clone(), stream)
+                        .await
+                        .map_err(|_| {
+                            (
+                                AppErrorCode::UpstreamError,
+                                "artifact cleanup is unavailable",
+                            )
+                        })?;
+                    return Err((
+                        AppErrorCode::CorrelationUnavailable,
+                        "artifact stream ID is unavailable",
+                    ));
+                }
+                state.streams.insert(
+                    external_id.clone(),
+                    ActiveArtifactStream {
+                        stream,
+                        format,
+                        compression,
+                        next_sequence: 0,
+                        items: 0,
+                    },
+                );
+                serde_json::to_value(ArtifactWriteJsonStreamBeginResult {
+                    stream_id: external_id,
+                })
+                .map_err(|_| {
+                    (
+                        AppErrorCode::UpstreamError,
+                        "artifact receipt is unavailable",
+                    )
+                })
+            }
+            ArtifactWriteJsonStreamArguments::Append {
+                stream_id,
+                sequence,
+                values,
+            } => {
+                let mut state = transaction_worker.artifact_transaction.lock().await;
+                if *transaction_worker.cancellation.borrow()
+                    || !artifact_transaction_accepts(&state, &run_id)
+                {
+                    return Err((
+                        AppErrorCode::UpstreamError,
+                        "artifact context is unavailable",
+                    ));
+                }
+                let Some(mut active) = state.streams.remove(&stream_id) else {
+                    return Err((AppErrorCode::InvalidInput, "artifact stream is unavailable"));
+                };
+                if active.format != format
+                    || active.compression != active.stream.compression()
+                    || active.next_sequence != sequence
+                {
+                    state.streams.insert(stream_id, active);
+                    return Err((
+                        AppErrorCode::InvalidInput,
+                        "artifact stream sequence is invalid",
+                    ));
+                }
+                let added_items = u64::try_from(values.len()).map_err(|_| {
+                    (
+                        AppErrorCode::ResultTooLarge,
+                        "artifact stream item count is too large",
+                    )
+                })?;
+                let next_items = active.items.checked_add(added_items).ok_or((
+                    AppErrorCode::ResultTooLarge,
+                    "artifact stream item count is too large",
+                ))?;
+                active.stream = store
+                    .append_json_array(namespace.clone(), active.stream, values)
+                    .await
+                    .map_err(|error| (map_artifact_error(error), "artifact stream was rejected"))?;
+                if *transaction_worker.cancellation.borrow() {
+                    store
+                        .discard_stream(namespace.clone(), active.stream)
+                        .await
+                        .map_err(|_| {
+                            (
+                                AppErrorCode::UpstreamError,
+                                "artifact cleanup is unavailable",
+                            )
+                        })?;
+                    return Err((
+                        AppErrorCode::UpstreamError,
+                        "artifact context is unavailable",
+                    ));
+                }
+                active.next_sequence = active.next_sequence.checked_add(1).ok_or((
+                    AppErrorCode::ResultTooLarge,
+                    "artifact stream chunk count is too large",
+                ))?;
+                active.items = next_items;
+                state.streams.insert(stream_id, active);
+                serde_json::to_value(ArtifactWriteJsonStreamAppendResult {
+                    accepted_sequence: sequence,
+                })
+                .map_err(|_| {
+                    (
+                        AppErrorCode::UpstreamError,
+                        "artifact acknowledgement is unavailable",
+                    )
+                })
+            }
+            ArtifactWriteJsonStreamArguments::Finish {
+                stream_id,
+                chunks,
+                items,
+            } => {
+                let mut state = transaction_worker.artifact_transaction.lock().await;
+                if *transaction_worker.cancellation.borrow()
+                    || !artifact_transaction_accepts(&state, &run_id)
+                {
+                    return Err((
+                        AppErrorCode::UpstreamError,
+                        "artifact context is unavailable",
+                    ));
+                }
+                let Some(active) = state.streams.remove(&stream_id) else {
+                    return Err((AppErrorCode::InvalidInput, "artifact stream is unavailable"));
+                };
+                if active.format != format
+                    || active.compression != active.stream.compression()
+                    || active.next_sequence != chunks
+                    || active.items != items
+                {
+                    state.streams.insert(stream_id, active);
+                    return Err((
+                        AppErrorCode::InvalidInput,
+                        "artifact stream totals are invalid",
+                    ));
+                }
+                let stage = store
+                    .finish_json_array(namespace.clone(), active.stream)
+                    .await
+                    .map_err(|error| (map_artifact_error(error), "artifact stream was rejected"))?;
+                if *transaction_worker.cancellation.borrow() {
+                    store
+                        .discard_staged(namespace.clone(), vec![stage])
+                        .await
+                        .map_err(|_| {
+                            (
+                                AppErrorCode::UpstreamError,
+                                "artifact cleanup is unavailable",
+                            )
+                        })?;
+                    return Err((
+                        AppErrorCode::UpstreamError,
+                        "artifact context is unavailable",
+                    ));
+                }
+                let receipt = stage.receipt();
+                let audit_record = ArtifactWriteAuditRecord::authorized(
+                    run_correlation_id,
+                    operation,
+                    receipt.bytes(),
+                    receipt.logical_bytes(),
+                    receipt.content_encoding(),
+                    receipt.media_type(),
+                );
+                if audit.append_artifact(&audit_record).is_err() {
+                    store
+                        .discard_staged(namespace.clone(), vec![stage])
+                        .await
+                        .map_err(|_| {
+                            (
+                                AppErrorCode::UpstreamError,
+                                "artifact cleanup is unavailable",
+                            )
+                        })?;
+                    return Err((AppErrorCode::UpstreamError, "artifact audit is unavailable"));
+                }
+                let value = serde_json::to_value(receipt).map_err(|_| {
+                    (
+                        AppErrorCode::UpstreamError,
+                        "artifact receipt is unavailable",
+                    )
+                });
+                let value = match value {
+                    Ok(value) => value,
+                    Err(error) => {
+                        store
+                            .discard_staged(namespace.clone(), vec![stage])
+                            .await
+                            .map_err(|_| {
+                                (
+                                    AppErrorCode::UpstreamError,
+                                    "artifact cleanup is unavailable",
+                                )
+                            })?;
+                        return Err(error);
+                    }
+                };
+                state.stages.push(stage);
+                Ok(value)
+            }
+            ArtifactWriteJsonStreamArguments::Abort { stream_id } => {
+                let mut state = transaction_worker.artifact_transaction.lock().await;
+                if !artifact_transaction_accepts(&state, &run_id) {
+                    return serde_json::to_value(ArtifactWriteJsonStreamAbortResult {
+                        aborted: false,
+                    })
+                    .map_err(|_| {
+                        (
+                            AppErrorCode::UpstreamError,
+                            "artifact acknowledgement is unavailable",
+                        )
+                    });
+                }
+                let Some(active) = state.streams.remove(&stream_id) else {
+                    return serde_json::to_value(ArtifactWriteJsonStreamAbortResult {
+                        aborted: false,
+                    })
+                    .map_err(|_| {
+                        (
+                            AppErrorCode::UpstreamError,
+                            "artifact acknowledgement is unavailable",
+                        )
+                    });
+                };
+                if active.format != format {
+                    state.streams.insert(stream_id, active);
+                    return serde_json::to_value(ArtifactWriteJsonStreamAbortResult {
+                        aborted: false,
+                    })
+                    .map_err(|_| {
+                        (
+                            AppErrorCode::UpstreamError,
+                            "artifact acknowledgement is unavailable",
+                        )
+                    });
+                }
+                store
+                    .discard_stream(namespace, active.stream)
+                    .await
+                    .map_err(|_| {
+                        (
+                            AppErrorCode::UpstreamError,
+                            "artifact cleanup is unavailable",
+                        )
+                    })?;
+                serde_json::to_value(ArtifactWriteJsonStreamAbortResult { aborted: true }).map_err(
+                    |_| {
+                        (
+                            AppErrorCode::UpstreamError,
+                            "artifact acknowledgement is unavailable",
+                        )
+                    },
+                )
+            }
+        }
     });
     match transaction.await {
         Ok(Ok(value)) => HostCallResult::success(&request, value),
@@ -2424,7 +2896,10 @@ mod tests {
         policy::PolicyBundle,
     };
     use serde_json::json;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        io::Read as _,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -2870,6 +3345,25 @@ mod tests {
 
     struct RefWorker;
 
+    async fn artifact_host_call(
+        handler: &HostCallHandler,
+        call_id: u64,
+        method: &'static str,
+        arguments: Value,
+    ) -> Result<Value, DependencyError> {
+        let response = handler(HostCallRequest {
+            id: 1,
+            call_id,
+            method: method.to_owned(),
+            arguments,
+        })
+        .await;
+        if !response.ok {
+            return Err(DependencyError::ExecutionFailed);
+        }
+        response.value.ok_or(DependencyError::ExecutionFailed)
+    }
+
     impl WorkerHandle for RefWorker {
         fn execute<'a>(
             &'a mut self,
@@ -2879,6 +3373,110 @@ mod tests {
         ) -> BoxFuture<'a, Result<ExecutionResult, DependencyError>> {
             let code = code.to_owned();
             Box::pin(async move {
+                if matches!(
+                    code.as_str(),
+                    "__artifact_stream__"
+                        | "__artifact_stream_unfinished__"
+                        | "__artifact_stream_then_fail__"
+                ) {
+                    let Some(handler) = host_handler else {
+                        return Err(DependencyError::ExecutionFailed);
+                    };
+                    let opened = artifact_host_call(
+                        &handler,
+                        1,
+                        HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY,
+                        json!({
+                            "phase": "begin",
+                            "name": "series.json",
+                            "compression": "identity",
+                        }),
+                    )
+                    .await?;
+                    let stream_id = opened["streamId"]
+                        .as_str()
+                        .ok_or(DependencyError::ExecutionFailed)?;
+                    if code == "__artifact_stream_unfinished__" {
+                        return Ok(ExecutionResult {
+                            value: opened,
+                            logs: Vec::new(),
+                            logs_omitted: 0,
+                            ref_candidate: None,
+                        });
+                    }
+                    artifact_host_call(
+                        &handler,
+                        2,
+                        HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY,
+                        json!({
+                            "phase": "append",
+                            "streamId": stream_id,
+                            "sequence": 0,
+                            "values": [{"timestamp": "2026-08-14T00:00:00Z", "value": 1}, 2],
+                        }),
+                    )
+                    .await?;
+                    let array_receipt = artifact_host_call(
+                        &handler,
+                        3,
+                        HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY,
+                        json!({
+                            "phase": "finish",
+                            "streamId": stream_id,
+                            "chunks": 1,
+                            "items": 2,
+                        }),
+                    )
+                    .await?;
+                    if code == "__artifact_stream_then_fail__" {
+                        return Err(DependencyError::ExecutionFailed);
+                    }
+
+                    let opened = artifact_host_call(
+                        &handler,
+                        4,
+                        HOST_METHOD_ARTIFACT_WRITE_JSON_LINES,
+                        json!({
+                            "phase": "begin",
+                            "name": "rows.jsonl.lz4",
+                            "compression": "lz4",
+                        }),
+                    )
+                    .await?;
+                    let stream_id = opened["streamId"]
+                        .as_str()
+                        .ok_or(DependencyError::ExecutionFailed)?;
+                    artifact_host_call(
+                        &handler,
+                        5,
+                        HOST_METHOD_ARTIFACT_WRITE_JSON_LINES,
+                        json!({
+                            "phase": "append",
+                            "streamId": stream_id,
+                            "sequence": 0,
+                            "values": [{"row": 1}, {"row": 2}],
+                        }),
+                    )
+                    .await?;
+                    let lines_receipt = artifact_host_call(
+                        &handler,
+                        6,
+                        HOST_METHOD_ARTIFACT_WRITE_JSON_LINES,
+                        json!({
+                            "phase": "finish",
+                            "streamId": stream_id,
+                            "chunks": 1,
+                            "items": 2,
+                        }),
+                    )
+                    .await?;
+                    return Ok(ExecutionResult {
+                        value: json!({"array": array_receipt, "lines": lines_receipt}),
+                        logs: Vec::new(),
+                        logs_omitted: 0,
+                        ref_candidate: None,
+                    });
+                }
                 if matches!(code.as_str(), "__artifact__" | "__artifact_then_fail__") {
                     let Some(handler) = host_handler else {
                         return Err(DependencyError::ExecutionFailed);
@@ -3030,6 +3628,28 @@ mod tests {
             .filter(|path| {
                 path.extension()
                     .is_some_and(|extension| extension == "json")
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    fn artifact_data_files(root: &Path) -> Vec<PathBuf> {
+        let mut files = std::fs::read_dir(root)
+            .expect("artifact root")
+            .filter_map(|entry| {
+                let path = entry.expect("artifact root entry").path();
+                path.is_dir().then_some(path)
+            })
+            .flat_map(|entry| {
+                std::fs::read_dir(entry)
+                    .expect("namespace")
+                    .map(|file| file.expect("artifact entry").path())
+            })
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.starts_with('.'))
             })
             .collect::<Vec<_>>();
         files.sort();
@@ -3610,6 +4230,9 @@ mod tests {
             CredentialIdentityPin::new(),
         )
         .with_artifact_binding(Some(namespace.clone()), Some(store.clone()));
+        slot.begin_artifact_run("run-1")
+            .await
+            .expect("artifact transaction");
         let stage = store
             .stage_prepared(
                 namespace,
@@ -3619,12 +4242,12 @@ mod tests {
             )
             .await
             .expect("staged artifact");
-        slot.stage_artifact(stage).await.expect("pending stage");
+        slot.artifact_transaction.lock().await.stages.push(stage);
 
         slot.cancel().await.expect("cancel artifact slot");
 
         assert_eq!(
-            slot.commit_pending_artifacts()
+            slot.commit_pending_artifacts("run-1")
                 .await
                 .expect_err("cancelled slot cannot report commit success"),
             ArtifactError::Unavailable
@@ -3925,6 +4548,170 @@ mod tests {
             })
             .await
             .expect("close audit-failure context");
+    }
+
+    #[tokio::test]
+    async fn streamed_arrays_and_json_lines_publish_transactionally_with_redacted_audit() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let artifact_root = temporary.path().join("artifacts");
+        let store = Arc::new(FileArtifactStore::new(&artifact_root).expect("artifact store"));
+        let audit = Arc::new(RecordingAudit::default());
+        let application = Application::from_arcs(
+            Config::empty(),
+            default_registry().expect("registry"),
+            Arc::new(MemoryProfileSource::new(profile(&row(
+                SUB,
+                TENANT,
+                "AzureCloud",
+                "alice",
+            )))),
+            Arc::new(Validator::default()),
+            Arc::new(RefFactory),
+            DEFAULT_POLICY_HASH,
+            DEFAULT_POLICY_VERSION,
+        )
+        .expect("application")
+        .with_audit_sink(audit.clone())
+        .with_artifact_store(store);
+        let granted = application
+            .context_open(ContextOpenArgs {
+                local_capabilities: vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()],
+                ..ContextOpenArgs::default()
+            })
+            .await
+            .expect("context");
+
+        let result = application
+            .run(RunArgs {
+                context_id: granted.context_id.clone(),
+                code: "__artifact_stream__".to_owned(),
+                timeout_ms: None,
+            })
+            .await
+            .expect("streamed artifacts");
+        let array_path = PathBuf::from(
+            result.value["array"]["path"]
+                .as_str()
+                .expect("array receipt path"),
+        );
+        let lines_path = PathBuf::from(
+            result.value["lines"]["path"]
+                .as_str()
+                .expect("lines receipt path"),
+        );
+        assert_eq!(
+            std::fs::read(&array_path).expect("array bytes"),
+            br#"[{"timestamp":"2026-08-14T00:00:00Z","value":1},2]
+"#
+        );
+        let compressed = std::fs::read(&lines_path).expect("compressed JSON Lines");
+        let mut decoded = Vec::new();
+        lz4_flex::frame::FrameDecoder::new(compressed.as_slice())
+            .read_to_end(&mut decoded)
+            .expect("decode LZ4 frame");
+        assert_eq!(decoded, b"{\"row\":1}\n{\"row\":2}\n");
+        assert_eq!(result.value["array"]["mediaType"], "application/json");
+        assert!(result.value["array"].get("contentEncoding").is_none());
+        assert_eq!(result.value["lines"]["mediaType"], "application/x-ndjson");
+        assert_eq!(result.value["lines"]["contentEncoding"], "lz4");
+        assert_eq!(
+            result.value["lines"]["bytes"],
+            u64::try_from(compressed.len()).unwrap()
+        );
+        assert_eq!(
+            result.value["lines"]["logicalBytes"],
+            u64::try_from(decoded.len()).unwrap()
+        );
+        assert_eq!(artifact_data_files(&artifact_root).len(), 2);
+
+        let records = audit
+            .artifact_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].operation, HOST_METHOD_ARTIFACT_WRITE_JSON_ARRAY);
+        assert_eq!(records[0].media_type, "application/json");
+        assert_eq!(records[1].operation, HOST_METHOD_ARTIFACT_WRITE_JSON_LINES);
+        assert_eq!(records[1].content_encoding, Some("lz4"));
+        let encoded_audit = serde_json::to_string(&records).expect("audit JSON");
+        assert!(!encoded_audit.contains("series.json"));
+        assert!(!encoded_audit.contains("rows.jsonl"));
+        assert!(!encoded_audit.contains("timestamp"));
+
+        let failed = application
+            .context_open(ContextOpenArgs {
+                local_capabilities: vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()],
+                ..ContextOpenArgs::default()
+            })
+            .await
+            .expect("failed-run context");
+        assert_eq!(
+            application
+                .run(RunArgs {
+                    context_id: failed.context_id,
+                    code: "__artifact_stream_then_fail__".to_owned(),
+                    timeout_ms: None,
+                })
+                .await
+                .expect_err("failed run rolls back finished stream")
+                .kind(),
+            AppErrorCode::ExecutionFailed
+        );
+        assert_eq!(artifact_data_files(&artifact_root).len(), 2);
+
+        let unfinished = application
+            .context_open(ContextOpenArgs {
+                local_capabilities: vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()],
+                ..ContextOpenArgs::default()
+            })
+            .await
+            .expect("unfinished-stream context");
+        assert_eq!(
+            application
+                .run(RunArgs {
+                    context_id: unfinished.context_id,
+                    code: "__artifact_stream_unfinished__".to_owned(),
+                    timeout_ms: None,
+                })
+                .await
+                .expect_err("unfinished stream rejects successful run")
+                .kind(),
+            AppErrorCode::UpstreamError
+        );
+        assert_eq!(artifact_data_files(&artifact_root).len(), 2);
+
+        audit.reject_artifacts.store(true, Ordering::SeqCst);
+        let rejected = application
+            .context_open(ContextOpenArgs {
+                local_capabilities: vec![ARTIFACTS_WRITE_CAPABILITY.to_owned()],
+                ..ContextOpenArgs::default()
+            })
+            .await
+            .expect("audit-failure context");
+        assert_eq!(
+            application
+                .run(RunArgs {
+                    context_id: rejected.context_id,
+                    code: "__artifact_stream__".to_owned(),
+                    timeout_ms: None,
+                })
+                .await
+                .expect_err("stream audit failure removes its stage")
+                .kind(),
+            AppErrorCode::UpstreamError
+        );
+        assert_eq!(artifact_data_files(&artifact_root).len(), 2);
+        audit.reject_artifacts.store(false, Ordering::SeqCst);
+
+        application
+            .context_close(ContextCloseArgs {
+                context_id: granted.context_id,
+            })
+            .await
+            .expect("close successful context");
+        assert!(array_path.is_file());
+        assert!(lines_path.is_file());
     }
 
     #[tokio::test]

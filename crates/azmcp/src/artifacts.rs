@@ -29,6 +29,7 @@ pub const DEFAULT_MAX_ARTIFACT_BYTES: usize = 480 * 1024;
 pub const DEFAULT_MAX_STREAM_LOGICAL_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum stored bytes in one streamed artifact, including compression framing.
 pub const DEFAULT_MAX_STREAM_STORED_BYTES: usize = 65 * 1024 * 1024;
+const _: () = assert!(DEFAULT_MAX_STREAM_STORED_BYTES > DEFAULT_MAX_STREAM_LOGICAL_BYTES);
 /// Maximum encoded bytes accepted in one append operation.
 pub const MAX_STREAM_APPEND_BYTES: usize = 400 * 1024;
 /// Maximum artifacts retained in one context namespace.
@@ -3291,7 +3292,6 @@ mod tests {
             .unwrap();
         assert_eq!(decoded.first(), Some(&b'['));
         assert_eq!(decoded.last(), Some(&b'\n'));
-        assert!(DEFAULT_MAX_STREAM_STORED_BYTES > DEFAULT_MAX_STREAM_LOGICAL_BYTES);
         assert_eq!(
             serde_json::to_value(&receipt).unwrap()["contentEncoding"],
             json!("lz4")

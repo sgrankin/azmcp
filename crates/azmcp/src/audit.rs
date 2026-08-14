@@ -47,16 +47,30 @@ pub struct ArtifactWriteAuditRecord {
     pub operation: &'static str,
     pub decision: &'static str,
     pub bytes: usize,
+    pub logical_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<&'static str>,
+    pub media_type: &'static str,
     pub sensitivity: &'static str,
 }
 
 impl ArtifactWriteAuditRecord {
-    pub fn authorized(correlation_id: impl Into<String>, bytes: usize) -> Self {
+    pub fn authorized(
+        correlation_id: impl Into<String>,
+        operation: &'static str,
+        bytes: usize,
+        logical_bytes: usize,
+        content_encoding: Option<&'static str>,
+        media_type: &'static str,
+    ) -> Self {
         Self {
             correlation_id: correlation_id.into(),
-            operation: "az.artifacts.writeJson",
+            operation,
             decision: "authorized",
             bytes,
+            logical_bytes,
+            content_encoding,
+            media_type,
             sensitivity: "customerData",
         }
     }
@@ -390,13 +404,23 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("audit/requests.jsonl");
         let sink = FileAuditLog::new(FileAuditConfig::with_defaults(&path).expect("config"));
-        sink.append_artifact(&ArtifactWriteAuditRecord::authorized("corr-2", 123))
-            .expect("append artifact");
+        sink.append_artifact(&ArtifactWriteAuditRecord::authorized(
+            "corr-2",
+            "az.artifacts.writeJson",
+            123,
+            123,
+            None,
+            "application/json",
+        ))
+        .expect("append artifact");
 
         let line = fs::read_to_string(&path).expect("audit file");
         let value: serde_json::Value = serde_json::from_str(line.trim()).expect("json record");
         assert_eq!(value["operation"], "az.artifacts.writeJson");
         assert_eq!(value["bytes"], 123);
+        assert_eq!(value["logicalBytes"], 123);
+        assert_eq!(value["mediaType"], "application/json");
+        assert!(value.get("contentEncoding").is_none());
         assert_eq!(value["sensitivity"], "customerData");
         assert!(value.get("path").is_none());
         assert!(value.get("name").is_none());
