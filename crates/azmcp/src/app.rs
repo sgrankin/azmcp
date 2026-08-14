@@ -38,6 +38,7 @@ use tokio::sync::{Mutex, watch};
 use crate::{
     audit::AuditSink,
     host::{CallDecision, CallRecord, CallRecords, HostAdapter, HttpClientFactory},
+    refs::RefStore,
     tools::{
         AccountsArgs, ContextCloseArgs, ContextOpenArgs, GraphScopeArgs, GraphSubscriptionsArgs,
         LogsScopeOverrides, RunArgs, SchemaGetArgs, SchemaSearchArgs,
@@ -678,6 +679,7 @@ struct WorkerSlot {
     worker: Mutex<Box<dyn WorkerHandle>>,
     cancellation: watch::Sender<bool>,
     identity_pin: CredentialIdentityPin,
+    refs: Mutex<RefStore>,
 }
 
 /// Cancellation guard for the gap between registry insertion and worker
@@ -789,11 +791,15 @@ impl WorkerSlot {
             worker: Mutex::new(worker),
             cancellation,
             identity_pin,
+            refs: Mutex::new(RefStore::default()),
         }
     }
 
     fn cancel(&self) {
         self.cancellation.send_replace(true);
+        if let Ok(mut refs) = self.refs.try_lock() {
+            refs.clear();
+        }
     }
 
     fn subscribe(&self) -> watch::Receiver<bool> {
@@ -2821,6 +2827,28 @@ mod tests {
         assert_eq!(result.expect_err("cancelled run").code(), "worker_crashed");
         assert_eq!(state.terminates.load(Ordering::SeqCst), 1);
         assert_eq!(state.closes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_worker_slot_disposes_context_refs() {
+        let state = state(None);
+        let slot = WorkerSlot::new(
+            Box::new(FakeWorker {
+                state: Arc::clone(&state),
+            }),
+            CredentialIdentityPin::new(),
+        );
+        let now = Instant::now();
+        {
+            let mut refs = slot.refs.lock().await;
+            refs.put(serde_json::json!({"private": true}), now)
+                .expect("reference");
+            assert_eq!(refs.len(), 1);
+        }
+
+        slot.cancel();
+
+        assert!(slot.refs.lock().await.is_empty());
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@
 pub mod app;
 pub mod audit;
 pub mod host;
+pub mod refs;
 pub mod runtime;
 pub mod tools;
 pub mod worker;
