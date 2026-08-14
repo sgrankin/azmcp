@@ -41,6 +41,8 @@ pub enum RoutePurpose {
     Request,
     /// The first-class `az.graph` operation, whose body has separate scope validation.
     ResourceGraph,
+    /// The first-class `az.logs.query` operation, whose body is host-owned.
+    LogsQuery,
     /// Server-owned validation and metadata calls.
     Internal,
     /// Server-owned single-resource Azure Monitor Metrics calls.

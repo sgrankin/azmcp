@@ -186,7 +186,13 @@ is inferred by string substitution.
 
 Resolved per cloud: `resourceManager`, `activeDirectory` (authority),
 `authentication.audiences`, `suffixes.*`, and the explicitly supported data-plane
-endpoints. The manifest version and source are recorded in the call log.
+endpoints. The first direct Logs Query slice pins the commercial origin to
+`https://api.loganalytics.azure.com/` with token resource
+`https://api.loganalytics.io`, and Government to
+`https://api.loganalytics.us/` with token resource
+`https://api.loganalytics.us`. These origin/resource pairs are independent manifest
+values; neither is derived by hostname substitution. The manifest version and source
+are recorded in the call log.
 
 ### 2.4 API version resolution
 
@@ -769,11 +775,12 @@ Deliberately small — the API surface lives in the code, not in the tool list.
 | `azure_schema_get` | v1 | Full request/response schema for a type + api-version |
 | `azure_apply` | v2 | Elicit human approval, then replay an immutable mutation plan |
 
-`tools/list` advertises only tools implemented in the running release. Likewise, v0's
-`azure_context_open` input schema accepts only `identity: "user"`,
-`armTier: "inspect"`, and an empty `dataPlanes` list. Later-phase enum values do not appear
-early as accepted-but-unimplemented options. There are no placeholder tools or successful
-stub results.
+`tools/list` advertises only tools implemented in the running release. The first direct
+Logs Query slice accepts `dataPlanes: []` or `dataPlanes: ["logs.query"]`; when the grant is
+present, `logsScopes` may contain only per-cloud `{ "scope": "allAccessible" }` entries.
+An omitted cloud entry denies Logs Query for that cloud. Later-phase enum values do not
+appear early as accepted-but-unimplemented options. There are no placeholder tools or
+successful stub results.
 
 ### 6.3 Application execution contexts are explicit
 
@@ -784,9 +791,9 @@ through an explicit handle in every call:
 
 ```
 azure_context_open({ identity?, armTier?, dataPlanes?, bindings?,
-                     allowedSubscriptions?, graphScopes? })
+                     allowedSubscriptions?, graphScopes?, logsScopes? })
   → { contextId, identity, armTier, dataPlanes, resolvedBindings,
-      allowedSubscriptions, graphScopes, expiresAt }
+      allowedSubscriptions, graphScopes, logsScopes, expiresAt }
 azure_run({ contextId, code, timeoutMs? })
 azure_context_close({ contextId })
 ```
@@ -806,6 +813,9 @@ The v0 JSON representation is closed and explicit:
   "graphScopes": {
     "AzureCloud": { "subscriptions": ["<uuid>"] },
     "AzureUSGovernment": { "scope": "allAccessible" }
+  },
+  "logsScopes": {
+    "AzureCloud": { "scope": "allAccessible" }
   }
 }
 ```
@@ -818,6 +828,10 @@ An omitted graph scope normalizes to the cloud's primary binding.
 Every explicitly listed graph subscription must occur in that cloud's normalized
 subscription allowlist.
 `allAccessible` widens only `az.graph`; it never widens `az.request`.
+For Logs Query, `dataPlanes: ["logs.query"]` is required in addition to a per-cloud
+`logsScopes` entry. The only accepted Logs scope is `{ "scope": "allAccessible" }`.
+Omitting that entry denies the cloud. An explicit workspace list is intentionally not
+supported: KQL `workspace()` and stored functions make it a false security boundary.
 Unknown cloud keys, duplicate subscription IDs, and ambiguous tenant routes are errors.
 
 Contexts are evicted on idle TTL, absolute max age, process restart, or memory pressure.
@@ -1134,40 +1148,46 @@ inherit the ARM tier table, and each needs its own small ruleset.
 KQL is a first-class citizen, not an afterthought:
 
 ```js
-await az.gov.logs(WORKSPACE_ID, `
-  AppServiceHTTPLogs
-  | where TimeGenerated > ago(1h)
-  | summarize p95 = percentile(TimeTaken, 95) by CsHost
-`, { timespan: 'PT1H' });
+await az.logs.query({
+  cloud: 'AzureCloud',
+  workspaceId: WORKSPACE_ID,
+  query: `
+    AppRequests
+    | where TimeGenerated > ago(1h)
+    | summarize p95 = percentile(DurationMs, 95) by AppRoleName
+  `,
+  timespan: 'PT1H',
+});
 ```
 
-Two possible routes, and they trade off:
+The first slice is direct data plane only:
 
-| Route | Pros | Cons |
-|---|---|---|
-| **Direct data plane** — `POST {api.loganalytics.*}/v1/workspaces/{id}/query` | Real query limits, `Prefer: wait=600` for long queries, cross-workspace `workspaces()` | Second audience, second token, own policy path |
-| **ARM-proxied** — `POST …/Microsoft.OperationalInsights/workspaces/{n}/api/query` | Reuses the ARM token and route-policy path | Tighter throttling and shorter timeouts |
+| Cloud | Request origin | Token resource | Route |
+|---|---|---|---|
+| `AzureCloud` | `https://api.loganalytics.azure.com/` | `https://api.loganalytics.io` | `POST /v1/workspaces/{workspaceId}/query` |
+| `AzureUSGovernment` | `https://api.loganalytics.us/` | `https://api.loganalytics.us` | `POST /v1/workspaces/{workspaceId}/query` |
 
-**Recommendation: direct data plane**, with the ARM-proxied path as a fallback when the
-Log Analytics audience is unavailable. The query limits matter for anything fleet-shaped.
+There is no ARM-proxied fallback, no ARM `api-version` query parameter, and no caller
+`Prefer` or other request headers. The host owns the JSON body
+`{ "query": string, "timespan": string }`; it does not rewrite KQL. The helper accepts
+the explicit object form only: `cloud`, `workspaceId`, `query`, and `timespan`, with an
+optional `subscription` selected from the context allowlist.
 
-Policy: a KQL query requires the `logs.query` data-plane grant and is non-mutating within
-that plane. KQL is read-only by construction, so unlike SQL (§9.4) no statement
-classification is required. Enforce both response-byte and row caps, then route overflow
-into the ref store (§6.4). Do not inject `take` into the user's query; silently rewriting
-query semantics violates the design's visibility rule.
+Policy: a KQL query requires the `logs.query` data-plane grant and a matching per-cloud
+`logsScopes` entry of `{ "scope": "allAccessible" }`. Omitted scope denies that cloud.
+The reviewed action is
+`Microsoft.OperationalInsights/workspaces/query/read`. The initial implementation
+requires a non-empty query and a bounded ISO8601 duration (maximum 30 days), and rejects
+oversized or malformed table/column/row responses before returning JSON. It enforces both
+response-byte and total-row caps. The result is `customerData` and audit records retain
+only operation, cloud, binding, reviewed route, scope, status, and policy metadata — never
+the workspace ID, KQL, token, or response rows.
 
-The `logs.query` grant authorizes log data reachable by the resolved Azure principal; a
-workspace parameter is routing, not a security boundary. The helper requires
-`scope: 'allAccessible'` or an explicit workspace list for the cross-workspace forms it can
-observe, and logs that scope distinctly, but generated KQL can contain `workspace()` and
-`resource()` references. Do not claim a workspace allowlist without a complete KQL parser
-and enforcement strategy. Deployments that need a real workspace boundary use a dedicated
-principal with workspace-scoped `Log Analytics Reader` assignments.
-
-Workspace-based Application Insights is Log Analytics; same path, `AppRequests` /
-`AppDependencies` tables. Classic AI resources use `api.applicationinsights.io` and should
-be treated as a separate endpoint if any remain.
+An explicit workspace list is intentionally not supported: KQL `workspace()` and stored
+functions make it a false security boundary. Workspace-based Application Insights is
+Log Analytics and uses the same path (`AppRequests`, `AppDependencies`, and related
+tables). Classic Application Insights (`api.applicationinsights.io`) remains outside this
+slice and is not advertised.
 
 ### 9.2 Azure Monitor metrics
 

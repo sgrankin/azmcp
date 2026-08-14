@@ -49,6 +49,8 @@ const METRICS_BATCH_QUERY_PARAMETERS: &[&str] = &[
     "filter",
     "rollupby",
 ];
+pub const LOGS_QUERY_API_VERSION: &str = "v1";
+pub const LOGS_QUERY_RBAC_ACTION: &str = "Microsoft.OperationalInsights/workspaces/query/read";
 
 /// Construct the deliberately small route bundle used by the first v0 scenarios.
 ///
@@ -110,6 +112,15 @@ pub fn v0_policy() -> Result<PolicyBundle, V0PolicyError> {
             )?
             .with_query_parameters(METRICS_BATCH_QUERY_PARAMETERS.iter().copied())?,
         );
+        routes.push(ReviewedRoute::new(
+            cloud,
+            RoutePurpose::LogsQuery,
+            HttpMethod::Post,
+            "/v1/workspaces/{workspaceId}/query",
+            [LOGS_QUERY_API_VERSION],
+            LOGS_QUERY_RBAC_ACTION,
+            ArmTier::Inspect,
+        )?);
     }
     Ok(PolicyBundle::new(V0_POLICY_VERSION, routes)?)
 }
@@ -158,6 +169,21 @@ mod tests {
                         HttpMethod::Post,
                         &graph,
                         RESOURCE_GRAPH_API_VERSION,
+                    )
+                    .is_ok()
+            );
+            let logs = RelativeRequestTarget::parse(
+                "/v1/workspaces/11111111-1111-1111-1111-111111111111/query",
+            )
+            .expect("logs query target");
+            assert!(
+                policy
+                    .classify(
+                        cloud,
+                        RoutePurpose::LogsQuery,
+                        HttpMethod::Post,
+                        &logs,
+                        LOGS_QUERY_API_VERSION,
                     )
                     .is_ok()
             );

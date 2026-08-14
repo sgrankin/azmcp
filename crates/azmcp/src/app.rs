@@ -22,7 +22,7 @@ use azmcp_core::{
     },
     context::{
         ArmTier, BindingSource, Context, ContextOptions, ContextRegistry, ContextRegistryError,
-        GraphScope, Identity, RegistryConfig,
+        GraphScope, Identity, LogsScope, RegistryConfig,
     },
     credential::{CredentialError, CredentialIdentityPin},
     http::{HttpError, HttpRequest},
@@ -40,7 +40,7 @@ use crate::{
     host::{CallDecision, CallRecord, CallRecords, HostAdapter, HttpClientFactory},
     tools::{
         AccountsArgs, ContextCloseArgs, ContextOpenArgs, GraphScopeArgs, GraphSubscriptionsArgs,
-        RunArgs, SchemaGetArgs, SchemaSearchArgs,
+        LogsScopeOverrides, RunArgs, SchemaGetArgs, SchemaSearchArgs,
     },
     worker::{ExecutionResult, HostCallHandler, ResultTooLargeSummary, WorkerProcess},
 };
@@ -207,6 +207,8 @@ impl BindingValidator for HttpBindingValidator {
                     retry_count: 0,
                     remaining_subscription_reads: remaining_reads,
                     graph_scope: None,
+                    data_plane: None,
+                    data_scope: None,
                 };
                 if let Some(sink) = &self.audit_sink {
                     sink.append(&record)
@@ -424,10 +426,11 @@ pub struct ContextOpenResult {
     pub context_id: String,
     pub identity: &'static str,
     pub arm_tier: &'static str,
-    pub data_planes: Vec<Value>,
+    pub data_planes: Vec<String>,
     pub resolved_bindings: Vec<ResolvedBindingResult>,
     pub allowed_subscriptions: BTreeMap<AzureCloud, Vec<AllowedSubscriptionResult>>,
     pub graph_scopes: BTreeMap<AzureCloud, GraphScopeArgs>,
+    pub logs_scopes: LogsScopeOverrides,
     pub expires_at: String,
 }
 
@@ -441,6 +444,7 @@ impl ContextOpenResult {
             "bindings": self.resolved_bindings,
             "allowedSubscriptions": self.allowed_subscriptions,
             "graphScopes": self.graph_scopes,
+            "logsScopes": self.logs_scopes,
             "policyHash": policy_hash,
         })
     }
@@ -1073,16 +1077,18 @@ impl Application {
         let identity_pin = CredentialIdentityPin::new();
         let (bindings, binding_sources) = self.resolve_bindings(&args).await?;
         let graph_scopes = resolve_graph_scopes(&args, &bindings)?;
+        let logs_scopes = resolve_logs_scopes(&args, &bindings)?;
         let options = ContextOptions::new(
             Identity::User,
             ArmTier::Inspect,
-            Vec::new(),
+            args.data_planes.clone(),
             bindings.clone(),
             self.inner.policy_hash.clone(),
             self.inner.policy_version.clone(),
         )
         .and_then(|options| options.with_binding_sources(binding_sources))
         .and_then(|options| options.with_graph_scopes(graph_scopes))
+        .and_then(|options| options.with_logs_scopes(logs_scopes))
         .map_err(|_| AppError::new(AppErrorCode::InvalidInput))?;
 
         let mut validation_error = None;
@@ -1145,10 +1151,11 @@ impl Application {
             context_id: id,
             identity: "user",
             arm_tier: "inspect",
-            data_planes: Vec::new(),
+            data_planes: context.data_planes().to_vec(),
             resolved_bindings: resolved_binding_results(&context),
             allowed_subscriptions: allowed_subscription_results(&context),
             graph_scopes: graph_scope_results(&context),
+            logs_scopes: logs_scope_results(&context),
             expires_at: format_expiry(context.expires_at()),
         })
     }
@@ -1636,6 +1643,26 @@ fn resolve_graph_scopes(
         .collect()
 }
 
+fn resolve_logs_scopes(
+    args: &ContextOpenArgs,
+    bindings: &[ResolvedCloudBinding],
+) -> Result<BTreeMap<AzureCloud, LogsScope>, AppError> {
+    for cloud in [AzureCloud::AzureCloud, AzureCloud::AzureUSGovernment] {
+        if args.logs_scopes.get(cloud).is_some()
+            && !bindings.iter().any(|binding| binding.cloud() == cloud)
+        {
+            return Err(AppError::new(AppErrorCode::InvalidInput));
+        }
+    }
+    let mut scopes = BTreeMap::new();
+    for binding in bindings {
+        if args.logs_scopes.get(binding.cloud()).is_some() {
+            scopes.insert(binding.cloud(), LogsScope::AllAccessible);
+        }
+    }
+    Ok(scopes)
+}
+
 fn resolved_binding_results(context: &Context) -> Vec<ResolvedBindingResult> {
     context
         .resolved_bindings()
@@ -1693,6 +1720,20 @@ fn graph_scope_results(context: &Context) -> BTreeMap<AzureCloud, GraphScopeArgs
             (*cloud, result)
         })
         .collect()
+}
+
+fn logs_scope_results(context: &Context) -> LogsScopeOverrides {
+    let mut result = LogsScopeOverrides::default();
+    for cloud in context.logs_scopes().keys() {
+        let scope = crate::tools::LogsAllAccessibleArgs {
+            scope: crate::tools::AllAccessibleScope::AllAccessible,
+        };
+        match cloud {
+            AzureCloud::AzureCloud => result.commercial = Some(scope),
+            AzureCloud::AzureUSGovernment => result.government = Some(scope),
+        }
+    }
+    result
 }
 
 fn map_binding_resolution(error: BindingResolutionError) -> AppError {
@@ -1833,6 +1874,7 @@ fn context_summary(context: &Context) -> Value {
         "bindings": resolved_binding_results(context),
         "allowedSubscriptions": allowed_subscription_results(context),
         "graphScopes": graph_scope_results(context),
+        "logsScopes": logs_scope_results(context),
         "policyHash": context.policy_hash(),
     })
 }
@@ -2342,6 +2384,74 @@ mod tests {
             validator.calls.load(Ordering::SeqCst),
             1,
             "invalid graph scope is rejected before live validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_grant_and_scope_are_explicit_per_cloud() {
+        let validator = Arc::new(Validator::default());
+        let application = app(
+            b"not a profile".to_vec(),
+            Arc::clone(&validator),
+            factory(state(None)),
+        );
+        let mut args = ContextOpenArgs::default();
+        args.bindings.commercial = Some(crate::tools::BindingArgs {
+            subscription: SUB.to_owned(),
+            tenant: Some(TENANT.to_owned()),
+        });
+        args.data_planes = vec!["logs.query".to_owned()];
+        args.logs_scopes.commercial = Some(crate::tools::LogsAllAccessibleArgs {
+            scope: crate::tools::AllAccessibleScope::AllAccessible,
+        });
+        let opened = application.context_open(args).await.expect("open");
+        assert_eq!(opened.data_planes, vec!["logs.query"]);
+        assert_eq!(
+            opened.logs_scopes.commercial,
+            Some(crate::tools::LogsAllAccessibleArgs {
+                scope: crate::tools::AllAccessibleScope::AllAccessible,
+            })
+        );
+        assert!(opened.logs_scopes.government.is_none());
+
+        let mut missing_grant = ContextOpenArgs::default();
+        missing_grant.bindings.commercial = Some(crate::tools::BindingArgs {
+            subscription: SUB.to_owned(),
+            tenant: Some(TENANT.to_owned()),
+        });
+        missing_grant.logs_scopes.commercial = Some(crate::tools::LogsAllAccessibleArgs {
+            scope: crate::tools::AllAccessibleScope::AllAccessible,
+        });
+        assert_eq!(
+            application
+                .context_open(missing_grant)
+                .await
+                .expect_err("scope without data-plane grant")
+                .kind(),
+            AppErrorCode::InvalidInput
+        );
+
+        let mut unbound_scope = ContextOpenArgs::default();
+        unbound_scope.bindings.commercial = Some(crate::tools::BindingArgs {
+            subscription: SUB.to_owned(),
+            tenant: Some(TENANT.to_owned()),
+        });
+        unbound_scope.data_planes = vec!["logs.query".to_owned()];
+        unbound_scope.logs_scopes.government = Some(crate::tools::LogsAllAccessibleArgs {
+            scope: crate::tools::AllAccessibleScope::AllAccessible,
+        });
+        assert_eq!(
+            application
+                .context_open(unbound_scope)
+                .await
+                .expect_err("scope for an unbound cloud")
+                .kind(),
+            AppErrorCode::InvalidInput
+        );
+        assert_eq!(
+            validator.calls.load(Ordering::SeqCst),
+            1,
+            "scope invariants are rejected before live validation"
         );
     }
 

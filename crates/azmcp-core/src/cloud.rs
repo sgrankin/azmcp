@@ -106,6 +106,7 @@ impl CloudManifest {
                 audiences: vec![
                     AZURE_CLOUD_ARM_AUDIENCE.to_owned(),
                     AZURE_CLOUD_METRICS_AUDIENCE.to_owned(),
+                    AZURE_CLOUD_LOGS_AUDIENCE.to_owned(),
                 ],
             },
             suffixes: EndpointSuffixes {
@@ -117,6 +118,8 @@ impl CloudManifest {
             data_plane: DataPlaneEndpoints {
                 resource_graph: AZURE_CLOUD_RESOURCE_GRAPH.to_owned(),
                 metrics: "metrics.monitor.azure.com".to_owned(),
+                logs_query: AZURE_CLOUD_LOGS_QUERY.to_owned(),
+                logs_token_resource: AZURE_CLOUD_LOGS_AUDIENCE.to_owned(),
             },
         }
     }
@@ -132,6 +135,7 @@ impl CloudManifest {
                 audiences: vec![
                     AZURE_US_GOVERNMENT_ARM_AUDIENCE.to_owned(),
                     AZURE_US_GOVERNMENT_METRICS_AUDIENCE.to_owned(),
+                    AZURE_US_GOVERNMENT_LOGS_AUDIENCE.to_owned(),
                 ],
             },
             suffixes: EndpointSuffixes {
@@ -143,6 +147,8 @@ impl CloudManifest {
             data_plane: DataPlaneEndpoints {
                 resource_graph: AZURE_US_GOVERNMENT_RESOURCE_GRAPH.to_owned(),
                 metrics: "metrics.monitor.azure.us".to_owned(),
+                logs_query: AZURE_US_GOVERNMENT_LOGS_QUERY.to_owned(),
+                logs_token_resource: AZURE_US_GOVERNMENT_LOGS_AUDIENCE.to_owned(),
             },
         }
     }
@@ -235,6 +241,8 @@ impl EndpointSuffixes {
 pub struct DataPlaneEndpoints {
     resource_graph: String,
     metrics: String,
+    logs_query: String,
+    logs_token_resource: String,
 }
 
 impl DataPlaneEndpoints {
@@ -246,6 +254,16 @@ impl DataPlaneEndpoints {
     pub fn metrics(&self) -> &str {
         &self.metrics
     }
+
+    /// The exact Log Analytics Query API origin for this cloud.
+    pub fn logs_query(&self) -> &str {
+        &self.logs_query
+    }
+
+    /// The exact OAuth resource used to acquire a Log Analytics token.
+    pub fn logs_token_resource(&self) -> &str {
+        &self.logs_token_resource
+    }
 }
 
 pub const AZURE_CLOUD_METADATA_URL: &str =
@@ -256,6 +274,8 @@ pub const AZURE_CLOUD_ARM_AUDIENCE: &str = "https://management.azure.com/";
 pub const AZURE_CLOUD_METRICS_AUDIENCE: &str = "https://metrics.monitor.azure.com/";
 pub const AZURE_CLOUD_RESOURCE_GRAPH: &str =
     "https://management.azure.com/providers/Microsoft.ResourceGraph/resources";
+pub const AZURE_CLOUD_LOGS_QUERY: &str = "https://api.loganalytics.azure.com/";
+pub const AZURE_CLOUD_LOGS_AUDIENCE: &str = "https://api.loganalytics.io";
 
 pub const AZURE_US_GOVERNMENT_METADATA_URL: &str =
     "https://management.usgovcloudapi.net/metadata/endpoints?api-version=2020-01-01";
@@ -265,6 +285,8 @@ pub const AZURE_US_GOVERNMENT_ARM_AUDIENCE: &str = "https://management.usgovclou
 pub const AZURE_US_GOVERNMENT_METRICS_AUDIENCE: &str = "https://metrics.monitor.azure.us/";
 pub const AZURE_US_GOVERNMENT_RESOURCE_GRAPH: &str =
     "https://management.usgovcloudapi.net/providers/Microsoft.ResourceGraph/resources";
+pub const AZURE_US_GOVERNMENT_LOGS_QUERY: &str = "https://api.loganalytics.us/";
+pub const AZURE_US_GOVERNMENT_LOGS_AUDIENCE: &str = "https://api.loganalytics.us";
 
 /// Short alias for the closed v0 cloud value.
 pub type Cloud = AzureCloud;
@@ -308,6 +330,19 @@ mod tests {
         assert_ne!(
             commercial.data_plane().resource_graph(),
             government.data_plane().resource_graph()
+        );
+        assert_eq!(commercial.data_plane().logs_query(), AZURE_CLOUD_LOGS_QUERY);
+        assert_eq!(
+            government.data_plane().logs_query(),
+            AZURE_US_GOVERNMENT_LOGS_QUERY
+        );
+        assert_eq!(
+            commercial.data_plane().logs_token_resource(),
+            AZURE_CLOUD_LOGS_AUDIENCE
+        );
+        assert_eq!(
+            government.data_plane().logs_token_resource(),
+            AZURE_US_GOVERNMENT_LOGS_AUDIENCE
         );
     }
 

@@ -15,14 +15,14 @@ use std::{
 use azmcp_core::{
     cloud::AzureCloud,
     config::{CloudBinding, ResolvedCloudBinding, SubscriptionId},
-    context::{ArmTier, BindingSource, Context, GraphScope, Identity},
+    context::{ArmTier, BindingSource, Context, GraphScope, Identity, LogsScope},
     credential::{CredentialError, CredentialIdentityPin, TokenAudience},
     http::{
-        CredentialProvider, HttpClient, HttpError, HttpRequest, HttpResponse, MetricsOrigin,
-        RequestOrigin,
+        CredentialProvider, HttpClient, HttpError, HttpRequest, HttpResponse, LogsHttpClient,
+        LogsHttpRequest, MetricsOrigin, RequestOrigin,
     },
     policy::{HttpMethod, PolicyBundle, PolicyDenial, RoutePurpose},
-    routes::RESOURCE_GRAPH_API_VERSION,
+    routes::{LOGS_QUERY_API_VERSION, RESOURCE_GRAPH_API_VERSION},
     target::RelativeRequestTarget,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -31,8 +31,8 @@ use serde_json::{Value, json};
 use crate::{
     audit::AuditSink,
     worker::{
-        HOST_METHOD_GRAPH, HOST_METHOD_METRICS_BATCH, HOST_METHOD_METRICS_SINGLE,
-        HOST_METHOD_REQUEST, HostCallRequest, HostCallResult,
+        HOST_METHOD_GRAPH, HOST_METHOD_LOGS_QUERY, HOST_METHOD_METRICS_BATCH,
+        HOST_METHOD_METRICS_SINGLE, HOST_METHOD_REQUEST, HostCallRequest, HostCallResult,
     },
 };
 
@@ -47,6 +47,17 @@ pub const MAX_DECODED_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Maximum KQL query accepted by the Resource Graph host operation.
 pub const MAX_GRAPH_QUERY_BYTES: usize = 256 * 1024;
+
+/// Maximum KQL query accepted by the direct Logs Query operation.
+pub const MAX_LOGS_QUERY_BYTES: usize = 256 * 1024;
+/// Maximum ISO8601 duration accepted by the direct Logs Query operation.
+pub const MAX_LOGS_TIMESPAN_BYTES: usize = 128;
+/// Maximum duration represented by a Logs Query timespan.
+pub const MAX_LOGS_TIMESPAN_SECONDS: u64 = 30 * 24 * 60 * 60;
+/// Maximum decoded bytes retained for a valid Logs Query JSON response.
+pub const MAX_LOGS_RESULT_BYTES: usize = 1024 * 1024;
+/// Maximum rows retained across all returned Logs Query tables.
+pub const MAX_LOGS_ROWS: usize = 50_000;
 
 /// Maximum number of call records retained for one JavaScript run.
 pub const MAX_CALL_RECORDS: usize = 128;
@@ -67,6 +78,16 @@ pub trait HttpClientFactory: Send + Sync {
         &self,
         binding: &ResolvedCloudBinding,
     ) -> Result<Arc<HttpClient>, ClientFactoryError>;
+
+    /// Construct a dedicated client for the direct Logs Query data plane.
+    /// Implementations that do not opt into that data plane remain valid and
+    /// fail closed when a Logs helper is called.
+    fn logs_client_for(
+        &self,
+        _binding: &ResolvedCloudBinding,
+    ) -> Result<Arc<LogsHttpClient>, ClientFactoryError> {
+        Err(ClientFactoryError::Unavailable)
+    }
 }
 
 /// Production client factory using reviewed cloud origins and one credential
@@ -99,6 +120,19 @@ impl HttpClientFactory for ReviewedHttpClientFactory {
                 self.policy.clone(),
             )
             .map_err(|_| ClientFactoryError::Unavailable)?,
+        )
+        .map(Arc::new)
+        .map_err(|_| ClientFactoryError::Unavailable)
+    }
+
+    fn logs_client_for(
+        &self,
+        binding: &ResolvedCloudBinding,
+    ) -> Result<Arc<LogsHttpClient>, ClientFactoryError> {
+        LogsHttpClient::from_config(
+            Arc::clone(&self.credentials),
+            azmcp_core::http::LogsHttpClientConfig::from_binding(binding, self.policy.clone())
+                .map_err(|_| ClientFactoryError::Unavailable)?,
         )
         .map(Arc::new)
         .map_err(|_| ClientFactoryError::Unavailable)
@@ -174,6 +208,8 @@ pub struct CallRecord {
     pub retry_count: u32,
     pub remaining_subscription_reads: Option<u64>,
     pub graph_scope: Option<String>,
+    pub data_plane: Option<String>,
+    pub data_scope: Option<String>,
 }
 
 /// A bounded record collection returned to the application after one run.
@@ -266,6 +302,14 @@ impl HostError {
         Self::new(
             HostErrorCode::CapabilityDenied,
             "Resource Graph scope is not authorized by this context",
+            false,
+        )
+    }
+
+    fn logs_capability_denied() -> Self {
+        Self::new(
+            HostErrorCode::CapabilityDenied,
+            "Logs Query is not authorized by this context",
             false,
         )
     }
@@ -408,6 +452,18 @@ pub struct MetricsBatchArgs {
     pub rollup_by: Option<String>,
 }
 
+/// Closed arguments for the `az.logs.query` host operation.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct LogsQueryArgs {
+    #[serde(default)]
+    pub cloud: Option<AzureCloud>,
+    #[serde(default)]
+    pub subscription: Option<String>,
+    pub workspace_id: String,
+    pub query: String,
+    pub timespan: String,
+}
 #[derive(Clone, Debug)]
 struct RecordBuilder {
     correlation_id: String,
@@ -428,6 +484,8 @@ struct RecordBuilder {
     status: Option<u16>,
     remaining_subscription_reads: Option<u64>,
     graph_scope: Option<String>,
+    data_plane: Option<String>,
+    data_scope: Option<String>,
     started: Instant,
 }
 
@@ -452,6 +510,8 @@ impl RecordBuilder {
             status: None,
             remaining_subscription_reads: None,
             graph_scope: None,
+            data_plane: None,
+            data_scope: None,
             started: Instant::now(),
         }
     }
@@ -483,6 +543,8 @@ impl RecordBuilder {
             retry_count: 0,
             remaining_subscription_reads: self.remaining_subscription_reads,
             graph_scope: self.graph_scope,
+            data_plane: self.data_plane,
+            data_scope: self.data_scope,
         }
     }
 }
@@ -607,6 +669,7 @@ impl HostAdapter {
             HOST_METHOD_GRAPH => self.dispatch_graph(arguments).await,
             HOST_METHOD_METRICS_SINGLE => self.dispatch_metrics_single(arguments).await,
             HOST_METHOD_METRICS_BATCH => self.dispatch_metrics_batch(arguments).await,
+            HOST_METHOD_LOGS_QUERY => self.dispatch_logs_query(arguments).await,
             _ => Err(HostError::new(
                 HostErrorCode::ProtocolError,
                 "unknown host operation",
@@ -982,6 +1045,97 @@ impl HostAdapter {
         decode_http_response(response)
     }
 
+    async fn dispatch_logs_query(&self, arguments: Value) -> Result<Value, HostError> {
+        let args: LogsQueryArgs = decode_arguments(arguments)?;
+        let cloud = args.cloud.ok_or_else(|| {
+            HostError::new(HostErrorCode::CloudRequired, "cloud is required", false)
+        })?;
+        let mut record = RecordBuilder::new(
+            HOST_METHOD_LOGS_QUERY,
+            cloud,
+            &self.context,
+            &self.correlation_id,
+        );
+        record.method = "POST".to_owned();
+        record.api_version = LOGS_QUERY_API_VERSION.to_owned();
+        record.api_version_source = "reviewedRoute".to_owned();
+        record.data_plane = Some("logs.query".to_owned());
+        record.data_scope = Some("allAccessible".to_owned());
+
+        let result = match self.prepare_audit() {
+            Ok(()) => self.execute_logs_query(args, &mut record).await,
+            Err(error) => Err(error),
+        };
+        let audit = self.push_record(record.finish(&result));
+        if audit.is_err() {
+            return Err(HostError::audit_unavailable());
+        }
+        result
+    }
+
+    async fn execute_logs_query(
+        &self,
+        args: LogsQueryArgs,
+        record: &mut RecordBuilder,
+    ) -> Result<Value, HostError> {
+        if args.query.trim().is_empty() || args.query.len() > MAX_LOGS_QUERY_BYTES {
+            return Err(HostError::invalid());
+        }
+        if !valid_logs_timespan(&args.timespan) {
+            return Err(HostError::invalid());
+        }
+        let (binding, source) = self.resolve_binding(args.cloud_required(), args.subscription)?;
+        record.subscription = Some(binding.subscription_id().to_owned());
+        record.subscription_source = Some(source);
+        record.tenant = Some(binding.tenant_id().to_owned());
+        if !self
+            .context
+            .data_planes()
+            .iter()
+            .any(|data_plane| data_plane == "logs.query")
+            || !matches!(
+                self.context.logs_scopes().get(&binding.cloud()),
+                Some(LogsScope::AllAccessible)
+            )
+        {
+            return Err(HostError::logs_capability_denied());
+        }
+
+        let workspace_id =
+            SubscriptionId::new(args.workspace_id).map_err(|_| HostError::invalid())?;
+        let target = RelativeRequestTarget::parse(&format!(
+            "/v1/workspaces/{}/query",
+            workspace_id.as_str()
+        ))
+        .map_err(|_| HostError::invalid())?;
+        let client = self.logs_client_for(&binding)?;
+        let route = client
+            .config()
+            .policy()
+            .classify(
+                binding.cloud(),
+                RoutePurpose::LogsQuery,
+                HttpMethod::Post,
+                &target,
+                LOGS_QUERY_API_VERSION,
+            )
+            .map_err(|_| HostError::route_denied())?;
+        record.path_template = route.path_template().to_owned();
+        record.rbac_action = Some(route.rbac_action().to_owned());
+        record.decision = CallDecision::Allowed;
+        let body = serde_json::to_vec(&json!({
+            "query": args.query,
+            "timespan": args.timespan,
+        }))
+        .map_err(|_| HostError::invalid())?;
+        let request = LogsHttpRequest::new(target, body).map_err(|_| HostError::invalid())?;
+        let response = client
+            .execute_with_identity_pin(request, Some(&self.identity_pin))
+            .await
+            .map_err(|error| map_http_error(error, &binding))?;
+        record.status = Some(response.status());
+        decode_logs_query_response(response)
+    }
     fn resolve_binding(
         &self,
         cloud: AzureCloud,
@@ -1151,6 +1305,31 @@ impl HostAdapter {
         Ok(Arc::new(client))
     }
 
+    fn logs_client_for(
+        &self,
+        binding: &ResolvedCloudBinding,
+    ) -> Result<Arc<LogsHttpClient>, HostError> {
+        let client = self.client_factory.logs_client_for(binding).map_err(|_| {
+            HostError::new(
+                HostErrorCode::ClientUnavailable,
+                "Logs Query client unavailable",
+                true,
+            )
+        })?;
+        let config = client.config();
+        if config.origin().cloud() != binding.cloud()
+            || config.subscription() != binding.subscription()
+            || config.tenant() != binding.tenant()
+            || config.audience() != TokenAudience::LogAnalytics
+        {
+            return Err(HostError::new(
+                HostErrorCode::ClientUnavailable,
+                "Logs Query client binding mismatch",
+                false,
+            ));
+        }
+        Ok(client)
+    }
     fn prepare_audit(&self) -> Result<(), HostError> {
         match &self.audit_sink {
             Some(sink) => sink.prepare().map_err(|_| HostError::audit_unavailable()),
@@ -1206,6 +1385,12 @@ impl MetricsBatchArgs {
     }
 }
 
+impl LogsQueryArgs {
+    fn cloud_required(&self) -> AzureCloud {
+        self.cloud
+            .expect("cloud checked before Logs Query execution")
+    }
+}
 #[derive(Clone, Debug)]
 enum GraphSelection {
     Subscriptions(Vec<SubscriptionId>),
@@ -1441,6 +1626,156 @@ fn decode_http_response(response: HttpResponse) -> Result<Value, HostError> {
     }))
 }
 
+fn valid_logs_timespan(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > MAX_LOGS_TIMESPAN_BYTES
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+        || !value.starts_with('P')
+    {
+        return false;
+    }
+    let mut seconds = 0_u64;
+    let mut number = 0_u64;
+    let mut have_number = false;
+    let mut in_time = false;
+    let mut have_component = false;
+    let mut have_time_component = false;
+    for character in value[1..].chars() {
+        if let Some(digit) = character.to_digit(10) {
+            number = match number
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(u64::from(digit)))
+            {
+                Some(number) => number,
+                None => return false,
+            };
+            have_number = true;
+            continue;
+        }
+        if character == 'T' {
+            if in_time || have_number {
+                return false;
+            }
+            in_time = true;
+            continue;
+        }
+        if !have_number {
+            return false;
+        }
+        let multiplier = match (in_time, character) {
+            (false, 'D') => 86_400,
+            (true, 'H') => 3_600,
+            (true, 'M') => 60,
+            (true, 'S') => 1,
+            _ => return false,
+        };
+        seconds = match number
+            .checked_mul(multiplier)
+            .and_then(|component| seconds.checked_add(component))
+        {
+            Some(seconds) => seconds,
+            None => return false,
+        };
+        number = 0;
+        have_number = false;
+        have_component = true;
+        have_time_component |= in_time;
+    }
+    have_component
+        && (!in_time || have_time_component)
+        && !have_number
+        && seconds > 0
+        && seconds <= MAX_LOGS_TIMESPAN_SECONDS
+}
+
+fn decode_logs_query_response(response: HttpResponse) -> Result<Value, HostError> {
+    if !(200..300).contains(&response.status()) {
+        return Err(HostError::new(
+            HostErrorCode::UpstreamError,
+            "upstream returned an error status",
+            response.status() == 429 || response.status() >= 500,
+        ));
+    }
+    if response.body().len() > MAX_LOGS_RESULT_BYTES {
+        return Err(HostError::new(
+            HostErrorCode::ResponseTooLarge,
+            "Logs Query response exceeds the host JSON limit",
+            false,
+        ));
+    }
+    let body = serde_json::from_slice::<Value>(response.body()).map_err(|_| {
+        HostError::new(
+            HostErrorCode::InvalidResponse,
+            "Logs Query response was not valid JSON",
+            false,
+        )
+    })?;
+    let tables = body
+        .get("tables")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            HostError::new(
+                HostErrorCode::InvalidResponse,
+                "Logs Query response has an invalid table shape",
+                false,
+            )
+        })?;
+    let mut row_count = 0_usize;
+    for table in tables {
+        let table = table.as_object().ok_or_else(|| {
+            HostError::new(
+                HostErrorCode::InvalidResponse,
+                "Logs Query response has an invalid table shape",
+                false,
+            )
+        })?;
+        let columns = table
+            .get("columns")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                HostError::new(
+                    HostErrorCode::InvalidResponse,
+                    "Logs Query response has an invalid column shape",
+                    false,
+                )
+            })?;
+        if columns.iter().any(|column| {
+            let Some(column) = column.as_object() else {
+                return true;
+            };
+            !column.get("name").is_some_and(Value::is_string)
+                || !column.get("type").is_some_and(Value::is_string)
+        }) {
+            return Err(HostError::new(
+                HostErrorCode::InvalidResponse,
+                "Logs Query response has an invalid column shape",
+                false,
+            ));
+        }
+        let rows = table.get("rows").and_then(Value::as_array).ok_or_else(|| {
+            HostError::new(
+                HostErrorCode::InvalidResponse,
+                "Logs Query response has an invalid row shape",
+                false,
+            )
+        })?;
+        row_count = row_count.saturating_add(rows.len());
+        if row_count > MAX_LOGS_ROWS
+            || rows
+                .iter()
+                .any(|row| row.as_array().is_none_or(|row| row.len() != columns.len()))
+        {
+            return Err(HostError::new(
+                HostErrorCode::InvalidResponse,
+                "Logs Query response exceeds the row limit or has an invalid row shape",
+                false,
+            ));
+        }
+    }
+    Ok(body)
+}
+
 fn map_http_error(error: HttpError, binding: &ResolvedCloudBinding) -> HostError {
     match error {
         HttpError::PolicyDenied(PolicyDenial::UnknownRoute)
@@ -1519,7 +1854,7 @@ mod tests {
     use azmcp_core::{
         config::{SubscriptionTenantPair, TenantId},
         context::{ArmTier, ContextOptions, ContextRegistry, Identity, RegistryConfig},
-        http::{ArmOrigin, BearerCredential, CredentialFuture, CredentialProvider},
+        http::{ArmOrigin, BearerCredential, CredentialFuture, CredentialProvider, LogsOrigin},
         policy::PolicyBundle,
     };
     use tokio::{
@@ -1531,6 +1866,7 @@ mod tests {
     const SUBSCRIPTION: &str = "11111111-1111-1111-1111-111111111111";
     const EXTRA_SUBSCRIPTION: &str = "22222222-2222-2222-2222-222222222222";
     const ESCAPE_SUBSCRIPTION: &str = "33333333-3333-3333-3333-333333333333";
+    const WORKSPACE: &str = "44444444-4444-4444-4444-444444444444";
     const TENANT: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const EXTRA_TENANT: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
@@ -1617,6 +1953,28 @@ mod tests {
             .map_err(|_| ClientFactoryError::Unavailable)?;
             Ok(Arc::new(client))
         }
+
+        fn logs_client_for(
+            &self,
+            binding: &ResolvedCloudBinding,
+        ) -> Result<Arc<LogsHttpClient>, ClientFactoryError> {
+            let origin = self
+                .origins
+                .get(&binding.cloud())
+                .ok_or(ClientFactoryError::Unavailable)?;
+            let origin = LogsOrigin::loopback_from_str(binding.cloud(), origin)
+                .map_err(|_| ClientFactoryError::Unavailable)?;
+            let client = LogsHttpClient::with_loopback_origin(
+                self.credentials.clone(),
+                binding.cloud(),
+                binding.subscription().clone(),
+                binding.tenant().clone(),
+                origin,
+                self.policy.clone(),
+            )
+            .map_err(|_| ClientFactoryError::Unavailable)?;
+            Ok(Arc::new(client))
+        }
     }
 
     async fn server(response: &'static str) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
@@ -1633,7 +1991,22 @@ mod tests {
                 }
                 request.extend_from_slice(&buffer[..count]);
                 if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
+                    let header_end = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                        .expect("header terminator");
+                    let content_length = String::from_utf8_lossy(&request[..header_end])
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end.saturating_add(content_length) {
+                        break;
+                    }
                 }
             }
             stream.write_all(response.as_bytes()).await.expect("write");
@@ -1689,6 +2062,38 @@ mod tests {
         context_for_cloud(AzureCloud::AzureCloud, graph_scope, extra)
     }
 
+    fn logs_context(clouds: &[AzureCloud]) -> Context {
+        let registry = ContextRegistry::new(RegistryConfig::new(
+            2,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(600),
+        ))
+        .expect("registry");
+        let bindings = clouds
+            .iter()
+            .copied()
+            .map(|cloud| binding(cloud, false))
+            .collect::<Vec<_>>();
+        let logs_scopes = clouds
+            .iter()
+            .copied()
+            .map(|cloud| (cloud, LogsScope::AllAccessible))
+            .collect();
+        let options = ContextOptions::new(
+            Identity::User,
+            ArmTier::Inspect,
+            vec!["logs.query".to_owned()],
+            bindings,
+            "test-policy-hash",
+            "test-policy-v1",
+        )
+        .expect("options")
+        .with_logs_scopes(logs_scopes)
+        .expect("logs scopes");
+        registry
+            .open(options, std::time::Instant::now())
+            .expect("context")
+    }
     fn policy() -> PolicyBundle {
         azmcp_core::routes::v0_policy().expect("v0 policy")
     }
@@ -1895,6 +2300,174 @@ mod tests {
             "/providers/Microsoft.ResourceGraph/resources"
         );
         server_task.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn logs_query_uses_dedicated_cross_cloud_route_and_audience() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 93\r\n\r\n{\"tables\":[{\"name\":\"PrimaryResult\",\"columns\":[{\"name\":\"value\",\"type\":\"long\"}],\"rows\":[[1]]}]}";
+        let (commercial_origin, commercial_server) = server(response).await;
+        let (government_origin, government_server) = server(response).await;
+        let credentials = Arc::new(FakeCredentials::default());
+        let factory = Arc::new(TestFactory {
+            credentials: credentials.clone(),
+            origins: [
+                (AzureCloud::AzureCloud, commercial_origin),
+                (AzureCloud::AzureUSGovernment, government_origin),
+            ]
+            .into_iter()
+            .collect(),
+            policy: policy(),
+        });
+        let context = logs_context(&[AzureCloud::AzureCloud, AzureCloud::AzureUSGovernment]);
+        let audit = Arc::new(RecordingAudit::default());
+        let adapter = HostAdapter::with_correlation_id(&context, factory, "logs-correlation")
+            .with_audit_sink(audit.clone());
+        for cloud in ["AzureCloud", "AzureUSGovernment"] {
+            let value = adapter
+                .dispatch(
+                    HOST_METHOD_LOGS_QUERY,
+                    json!({
+                        "cloud": cloud,
+                        "workspaceId": WORKSPACE,
+                        "query": "AppRequests | take 1",
+                        "timespan": "PT1H"
+                    }),
+                )
+                .await
+                .expect("logs response");
+            assert_eq!(value["tables"][0]["rows"][0][0], 1);
+        }
+        let requests = credentials.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].audience, TokenAudience::LogAnalytics);
+        assert_eq!(requests[0].resource(), "https://api.loganalytics.io");
+        assert_eq!(requests[1].audience, TokenAudience::LogAnalytics);
+        assert_eq!(requests[1].resource(), "https://api.loganalytics.us");
+        drop(requests);
+        let commercial_request = commercial_server.await.expect("commercial server");
+        let government_request = government_server.await.expect("government server");
+        for request in [commercial_request, government_request] {
+            let request = String::from_utf8_lossy(&request);
+            assert!(
+                request.starts_with(&format!("POST /v1/workspaces/{WORKSPACE}/query HTTP/1.1"))
+            );
+            assert!(!request.contains("api-version"));
+            assert!(request.contains("content-type: application/json"));
+            assert!(
+                request
+                    .contains("\r\n\r\n{\"query\":\"AppRequests | take 1\",\"timespan\":\"PT1H\"}")
+            );
+        }
+        let durable = audit
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(durable.len(), 2);
+        let encoded = serde_json::to_string(&durable[0]).expect("audit record");
+        assert!(!encoded.contains("AppRequests"));
+        assert!(!encoded.contains(WORKSPACE));
+        assert_eq!(durable[0].data_plane.as_deref(), Some("logs.query"));
+        assert_eq!(durable[0].data_scope.as_deref(), Some("allAccessible"));
+    }
+
+    #[tokio::test]
+    async fn logs_query_scope_and_input_limits_fail_before_network() {
+        let credentials = Arc::new(FakeCredentials::default());
+        let factory = Arc::new(TestFactory {
+            credentials: credentials.clone(),
+            origins: BTreeMap::new(),
+            policy: policy(),
+        });
+        let denied = HostAdapter::new(
+            &context(
+                GraphScope::Subscriptions(vec![SubscriptionId::new(SUBSCRIPTION).unwrap()]),
+                false,
+            ),
+            factory.clone(),
+        );
+        let error = denied
+            .dispatch(
+                HOST_METHOD_LOGS_QUERY,
+                json!({
+                    "cloud": "AzureCloud",
+                    "workspaceId": SUBSCRIPTION,
+                    "query": "AppRequests",
+                    "timespan": "PT1H"
+                }),
+            )
+            .await
+            .expect_err("omitted logs scope denies the cloud");
+        assert_eq!(error.code, HostErrorCode::CapabilityDenied);
+        assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+
+        let allowed = HostAdapter::new(&logs_context(&[AzureCloud::AzureCloud]), factory);
+        for arguments in [
+            json!({
+                "cloud": "AzureCloud",
+                "workspaceId": SUBSCRIPTION,
+                "query": "AppRequests",
+                "timespan": "P31D"
+            }),
+            json!({
+                "cloud": "AzureCloud",
+                "workspaceId": "not-a-guid",
+                "query": "AppRequests",
+                "timespan": "PT1H"
+            }),
+            json!({
+                "cloud": "AzureCloud",
+                "workspaceId": SUBSCRIPTION,
+                "query": "AppRequests",
+                "timespan": "PT1H",
+                "prefer": "wait=600"
+            }),
+        ] {
+            let error = allowed
+                .dispatch(HOST_METHOD_LOGS_QUERY, arguments)
+                .await
+                .expect_err("closed Logs Query arguments reject locally");
+            assert_eq!(error.code, HostErrorCode::InvalidRequest);
+        }
+        let error = allowed
+            .dispatch(
+                HOST_METHOD_LOGS_QUERY,
+                json!({
+                    "cloud": "AzureCloud",
+                    "workspaceId": SUBSCRIPTION,
+                    "query": "x".repeat(MAX_LOGS_QUERY_BYTES + 1),
+                    "timespan": "PT1H"
+                }),
+            )
+            .await
+            .expect_err("oversized KQL is rejected before credentials");
+        assert_eq!(error.code, HostErrorCode::InvalidRequest);
+        assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn logs_response_shape_and_byte_limits_are_fail_closed() {
+        assert!(valid_logs_timespan("PT1H"));
+        assert!(valid_logs_timespan("P1DT2H"));
+        assert!(!valid_logs_timespan("PT0S"));
+        assert!(!valid_logs_timespan("P31D"));
+        assert!(!valid_logs_timespan("P1M"));
+
+        let malformed = HttpResponse::from_parts(
+            200,
+            BTreeMap::new(),
+            br#"{"tables":[{"columns":[],"rows":[[1]]}]}"#.to_vec(),
+        );
+        assert_eq!(
+            decode_logs_query_response(malformed).unwrap_err().code,
+            HostErrorCode::InvalidResponse
+        );
+        let oversized =
+            HttpResponse::from_parts(200, BTreeMap::new(), vec![b' '; MAX_LOGS_RESULT_BYTES + 1]);
+        assert_eq!(
+            decode_logs_query_response(oversized).unwrap_err().code,
+            HostErrorCode::ResponseTooLarge
+        );
     }
 
     #[tokio::test]

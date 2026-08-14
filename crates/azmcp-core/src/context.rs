@@ -58,12 +58,22 @@ pub enum GraphScope {
     AllAccessible,
 }
 
+/// The only Logs Query scope exposed by the first direct data-plane slice.
+///
+/// This is deliberately not a workspace allowlist: KQL can name additional
+/// workspaces through `workspace()` and stored functions, so a list here would
+/// create a false security boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogsScope {
+    /// Permit queries against workspaces reachable by the selected principal.
+    AllAccessible,
+}
+
 /// A validated v0 context-open request.
 ///
 /// `data_planes` is retained as an explicit input so later versions can add
-/// reviewed grants without changing the context shape.  v0 accepts only an
-/// empty list.  The resolved bindings and policy values are copied into the
-/// opened context and cannot be changed through the registry.
+/// reviewed grants without changing the context shape.  The first direct
+/// data-plane slice accepts only `logs.query`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextOptions {
     identity: Identity,
@@ -72,6 +82,7 @@ pub struct ContextOptions {
     resolved_bindings: Vec<ResolvedCloudBinding>,
     binding_sources: BTreeMap<AzureCloud, BindingSource>,
     graph_scopes: BTreeMap<AzureCloud, GraphScope>,
+    logs_scopes: BTreeMap<AzureCloud, LogsScope>,
     policy_hash: String,
     policy_version: String,
 }
@@ -106,6 +117,7 @@ impl ContextOptions {
             resolved_bindings,
             binding_sources,
             graph_scopes,
+            logs_scopes: BTreeMap::new(),
             policy_hash: policy_hash.into(),
             policy_version: policy_version.into(),
         };
@@ -137,6 +149,16 @@ impl ContextOptions {
         Ok(self)
     }
 
+    /// Replace the optional per-cloud Logs Query scope grants.
+    pub fn with_logs_scopes(
+        mut self,
+        logs_scopes: BTreeMap<AzureCloud, LogsScope>,
+    ) -> Result<Self, ContextOptionsError> {
+        self.logs_scopes = logs_scopes;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Validate the closed v0 option set.
     pub fn validate(&self) -> Result<(), ContextOptionsError> {
         if self.identity != Identity::User {
@@ -145,8 +167,14 @@ impl ContextOptions {
         if self.arm_tier != ArmTier::Inspect {
             return Err(ContextOptionsError::UnsupportedArmTier);
         }
-        if !self.data_planes.is_empty() {
-            return Err(ContextOptionsError::DataPlanesNotSupported);
+        let mut data_planes = HashSet::with_capacity(self.data_planes.len());
+        for data_plane in &self.data_planes {
+            if data_plane != "logs.query" {
+                return Err(ContextOptionsError::UnsupportedDataPlane);
+            }
+            if !data_planes.insert(data_plane) {
+                return Err(ContextOptionsError::DuplicateDataPlane);
+            }
         }
         if self.policy_hash.is_empty() {
             return Err(ContextOptionsError::EmptyPolicyHash);
@@ -196,6 +224,17 @@ impl ContextOptions {
                 }
             }
         }
+        if !self
+            .data_planes
+            .iter()
+            .any(|data_plane| data_plane == "logs.query")
+            && !self.logs_scopes.is_empty()
+        {
+            return Err(ContextOptionsError::LogsScopeWithoutGrant);
+        }
+        if self.logs_scopes.keys().any(|cloud| !clouds.contains(cloud)) {
+            return Err(ContextOptionsError::LogsScopeCloudMismatch);
+        }
         Ok(())
     }
 
@@ -229,6 +268,11 @@ impl ContextOptions {
         &self.graph_scopes
     }
 
+    /// Optional per-cloud Logs Query grants fixed at context open.
+    pub fn logs_scopes(&self) -> &BTreeMap<AzureCloud, LogsScope> {
+        &self.logs_scopes
+    }
+
     /// The immutable policy content hash.
     pub fn policy_hash(&self) -> &str {
         &self.policy_hash
@@ -249,9 +293,18 @@ pub enum ContextOptionsError {
     /// v0 executes inspect-only ARM routes.
     #[error("v0 context ARM tier must be inspect")]
     UnsupportedArmTier,
-    /// v0 has no data-plane capability grants.
-    #[error("v0 context data planes must be empty")]
-    DataPlanesNotSupported,
+    /// Only the first direct Logs Query grant is implemented.
+    #[error("context data plane is not supported")]
+    UnsupportedDataPlane,
+    /// A grant may appear at most once.
+    #[error("context data planes must be unique")]
+    DuplicateDataPlane,
+    /// A Logs scope cannot be present without its data-plane grant.
+    #[error("logs scope requires the logs.query data-plane grant")]
+    LogsScopeWithoutGrant,
+    /// Logs scope keys must match resolved cloud bindings.
+    #[error("context logs scopes must refer to resolved cloud bindings")]
+    LogsScopeCloudMismatch,
     /// Audit records require a policy content hash.
     #[error("context policy hash must not be empty")]
     EmptyPolicyHash,
@@ -385,6 +438,7 @@ pub struct Context {
     resolved_bindings: Vec<ResolvedCloudBinding>,
     binding_sources: BTreeMap<AzureCloud, BindingSource>,
     graph_scopes: BTreeMap<AzureCloud, GraphScope>,
+    logs_scopes: BTreeMap<AzureCloud, LogsScope>,
     policy_hash: String,
     policy_version: String,
     created_at: Instant,
@@ -409,8 +463,7 @@ impl Context {
         self.arm_tier
     }
 
-    /// The data-plane grants fixed at open.  This is empty for every v0
-    /// context.
+    /// The data-plane grants fixed at open.
     pub fn data_planes(&self) -> &[String] {
         &self.data_planes
     }
@@ -428,6 +481,11 @@ impl Context {
     /// The immutable Resource Graph scopes fixed at open.
     pub fn graph_scopes(&self) -> &BTreeMap<AzureCloud, GraphScope> {
         &self.graph_scopes
+    }
+
+    /// Optional per-cloud Logs Query grants fixed at open.
+    pub fn logs_scopes(&self) -> &BTreeMap<AzureCloud, LogsScope> {
+        &self.logs_scopes
     }
 
     /// The policy content hash fixed at open.
@@ -486,6 +544,7 @@ impl fmt::Debug for Context {
             .field("resolved_bindings", &self.resolved_bindings)
             .field("binding_sources", &self.binding_sources)
             .field("graph_scopes", &self.graph_scopes)
+            .field("logs_scopes", &self.logs_scopes)
             .field("policy_hash", &self.policy_hash)
             .field("policy_version", &self.policy_version)
             .field("created_at", &self.created_at)
@@ -570,6 +629,7 @@ impl ContextRegistry {
             resolved_bindings: options.resolved_bindings,
             binding_sources: options.binding_sources,
             graph_scopes: options.graph_scopes,
+            logs_scopes: options.logs_scopes,
             policy_hash: options.policy_hash,
             policy_version: options.policy_version,
             created_at: now,
@@ -1081,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn v0_options_reject_later_identity_tier_and_data_planes() {
+    fn options_reject_later_identity_tier_and_unknown_data_planes() {
         let binding = options().resolved_bindings().to_vec();
         assert_eq!(
             ContextOptions::new(
@@ -1099,13 +1159,13 @@ mod tests {
             ContextOptions::new(
                 Identity::User,
                 ArmTier::Inspect,
-                vec!["logs.query".to_owned()],
+                vec!["metrics.read".to_owned()],
                 binding,
                 "hash",
                 "version",
             )
             .expect_err("data planes are not v0"),
-            ContextOptionsError::DataPlanesNotSupported
+            ContextOptionsError::UnsupportedDataPlane
         );
         assert_eq!(
             ContextOptions::new(
@@ -1119,6 +1179,53 @@ mod tests {
             .expect_err("a context needs a cloud"),
             ContextOptionsError::MissingCloudBinding
         );
+    }
+
+    #[test]
+    fn logs_scope_requires_grant_and_is_per_cloud() {
+        let scope = BTreeMap::from([(AzureCloud::AzureCloud, LogsScope::AllAccessible)]);
+        assert_eq!(
+            options()
+                .with_logs_scopes(scope.clone())
+                .expect_err("scope without grant fails closed"),
+            ContextOptionsError::LogsScopeWithoutGrant
+        );
+
+        let options_with_grant = ContextOptions::new(
+            Identity::User,
+            ArmTier::Inspect,
+            vec!["logs.query".to_owned()],
+            options().resolved_bindings().to_vec(),
+            "hash",
+            "version",
+        )
+        .expect("logs grant")
+        .with_logs_scopes(scope)
+        .expect("allAccessible scope");
+        let registry = registry(1, Duration::from_secs(30), Duration::from_secs(60));
+        let context = registry
+            .open(options_with_grant, Instant::now())
+            .expect("context");
+        assert_eq!(
+            context.logs_scopes().get(&AzureCloud::AzureCloud),
+            Some(&LogsScope::AllAccessible)
+        );
+
+        let wrong_cloud = ContextOptions::new(
+            Identity::User,
+            ArmTier::Inspect,
+            vec!["logs.query".to_owned()],
+            options().resolved_bindings().to_vec(),
+            "hash",
+            "version",
+        )
+        .expect("logs grant")
+        .with_logs_scopes(BTreeMap::from([(
+            AzureCloud::AzureUSGovernment,
+            LogsScope::AllAccessible,
+        )]))
+        .expect_err("scope for an unresolved cloud fails closed");
+        assert_eq!(wrong_cloud, ContextOptionsError::LogsScopeCloudMismatch);
     }
 
     #[test]

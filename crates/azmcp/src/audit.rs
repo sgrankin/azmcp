@@ -318,6 +318,8 @@ mod tests {
             retry_count: 0,
             remaining_subscription_reads: Some(99),
             graph_scope: None,
+            data_plane: None,
+            data_scope: None,
         }
     }
 

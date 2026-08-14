@@ -56,6 +56,7 @@ pub const HOST_METHOD_REQUEST: &str = "az.request";
 pub const HOST_METHOD_GRAPH: &str = "az.graph";
 pub const HOST_METHOD_METRICS_SINGLE: &str = "az.metrics.single";
 pub const HOST_METHOD_METRICS_BATCH: &str = "az.metrics.batch";
+pub const HOST_METHOD_LOGS_QUERY: &str = "az.logs.query";
 
 /// Keep shape diagnostics useful without allowing a pathological object key
 /// set to become a second oversized result.
@@ -1575,6 +1576,9 @@ const WORKER_BOOTSTRAP: &str = r#"
         single: (arguments) => hostCall("az.metrics.single", arguments),
         batch: (arguments) => hostCall("az.metrics.batch", arguments),
       })),
+      logs: Object.freeze(Object.assign(Object.create(null), {
+        query: (arguments) => hostCall("az.logs.query", arguments),
+      })),
     })),
     writable: false,
     configurable: false,
@@ -1730,6 +1734,7 @@ fn validate_host_call_request(request: &HostCallRequest) -> Result<(), String> {
         && request.method != HOST_METHOD_GRAPH
         && request.method != HOST_METHOD_METRICS_SINGLE
         && request.method != HOST_METHOD_METRICS_BATCH
+        && request.method != HOST_METHOD_LOGS_QUERY
     {
         return Err("unknown host-call method".to_owned());
     }
@@ -2057,7 +2062,7 @@ mod tests {
         bridge.begin_execution(11);
         let mut runtime = WorkerRuntime::new_with_host_bridge(bridge.clone()).unwrap();
         let mut execution = Box::pin(runtime.execute(
-            "Promise.all([az.request({n: 1}), az.graph({n: 2})])",
+            "Promise.all([az.request({n: 1}), az.graph({n: 2}), az.logs.query({n: 3})])",
             Duration::from_secs(1),
         ));
         let result = loop {
@@ -2069,7 +2074,9 @@ mod tests {
                     };
                     let request = HostCallRequest { id, call_id, method, arguments };
                     assert_eq!(request.id, 11);
-                    assert!(request.method == HOST_METHOD_REQUEST || request.method == HOST_METHOD_GRAPH);
+                    assert!(request.method == HOST_METHOD_REQUEST
+                        || request.method == HOST_METHOD_GRAPH
+                        || request.method == HOST_METHOD_LOGS_QUERY);
                     request_tx.send(WorkerRequest::HostCallResult {
                         id: request.id,
                         call_id: request.call_id,
@@ -2086,7 +2093,8 @@ mod tests {
             result.value,
             json!([
                 {"method": HOST_METHOD_REQUEST, "n": 1},
-                {"method": HOST_METHOD_GRAPH, "n": 2}
+                {"method": HOST_METHOD_GRAPH, "n": 2},
+                {"method": HOST_METHOD_LOGS_QUERY, "n": 3}
             ])
         );
     }

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
 use reqwest::redirect::Policy as RedirectPolicy;
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ use crate::credential::{
     TokenAudience, TokenRequest,
 };
 use crate::policy::{HttpMethod, PolicyBundle, PolicyDenial, RoutePurpose};
+use crate::routes::LOGS_QUERY_API_VERSION;
 use crate::target::{InvalidRequestTarget, RelativeRequestTarget};
 
 /// The default upper bound for a request body.
@@ -286,6 +287,104 @@ impl ArmOrigin {
 
     fn is_loopback_override(&self) -> bool {
         self.loopback_override
+    }
+}
+
+/// An exact reviewed Log Analytics Query API origin.
+///
+/// It is a separate type from [`ArmOrigin`] so an ARM route can never be
+/// redirected to the Logs audience or accidentally receive ARM's
+/// `api-version` query serialization.
+#[derive(Clone, Eq, PartialEq)]
+pub struct LogsOrigin {
+    cloud: AzureCloud,
+    url: Url,
+    loopback_override: bool,
+}
+
+impl LogsOrigin {
+    /// Construct the exact Logs Query origin from the reviewed cloud manifest.
+    pub fn for_cloud(cloud: AzureCloud) -> Result<Self, HttpError> {
+        let manifest = cloud.manifest();
+        let url = Url::parse(manifest.data_plane().logs_query())
+            .map_err(|_| HttpError::InvalidManifestOrigin)?;
+        if url.as_str() != manifest.data_plane().logs_query()
+            || url.scheme() != "https"
+            || url.host_str().is_none()
+            || url.path() != "/"
+            || url.username() != ""
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.port().is_some()
+        {
+            return Err(HttpError::InvalidManifestOrigin);
+        }
+        Ok(Self {
+            cloud,
+            url,
+            loopback_override: false,
+        })
+    }
+
+    /// Construct a loopback-only origin for a synthetic Logs API simulator.
+    pub fn loopback(cloud: AzureCloud, url: Url) -> Result<Self, HttpError> {
+        let host = url.host_str().unwrap_or_default();
+        let is_loopback = host.eq_ignore_ascii_case("localhost")
+            || host == "127.0.0.1"
+            || host == "[::1]"
+            || host == "::1";
+        if !is_loopback
+            || !matches!(url.scheme(), "http" | "https")
+            || url.path() != "/"
+            || url.username() != ""
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(HttpError::InvalidLoopbackOrigin);
+        }
+        Ok(Self {
+            cloud,
+            url,
+            loopback_override: true,
+        })
+    }
+
+    /// Parse a loopback-only Logs origin from a URL string.
+    pub fn loopback_from_str(cloud: AzureCloud, value: &str) -> Result<Self, HttpError> {
+        let url = Url::parse(value).map_err(|_| HttpError::InvalidLoopbackOrigin)?;
+        Self::loopback(cloud, url)
+    }
+
+    /// The selected cloud.
+    pub const fn cloud(&self) -> AzureCloud {
+        self.cloud
+    }
+
+    /// The exact URL used as the request origin.
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// The origin string, including its required trailing slash.
+    pub fn as_str(&self) -> &str {
+        self.url.as_str()
+    }
+
+    fn is_loopback_override(&self) -> bool {
+        self.loopback_override
+    }
+}
+
+impl fmt::Debug for LogsOrigin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LogsOrigin")
+            .field("cloud", &self.cloud)
+            .field("url", &self.url.as_str())
+            .field("loopback_override", &self.loopback_override)
+            .finish()
     }
 }
 
@@ -616,6 +715,18 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
+    /// Construct a response from bounded parts.
+    ///
+    /// Embedders can use this for deterministic protocol tests; network
+    /// execution still creates responses only after the transport limits run.
+    pub fn from_parts(status: u16, headers: BTreeMap<String, String>, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            headers,
+            body,
+        }
+    }
+
     /// HTTP status code.
     pub const fn status(&self) -> u16 {
         self.status
@@ -734,6 +845,7 @@ impl HttpClientConfig {
                     }
                     RequestOrigin::Arm(_) => return Err(HttpError::InvalidAudience),
                 },
+                TokenAudience::LogAnalytics => return Err(HttpError::InvalidAudience),
             };
             if origin != expected {
                 return Err(HttpError::InvalidManifestOrigin);
@@ -810,6 +922,47 @@ impl HttpClientConfig {
     /// Selected limits.
     pub const fn limits(&self) -> HttpLimits {
         self.limits
+    }
+}
+
+/// A host-owned Logs Query request. It has no caller header or API-version
+/// fields: the route and JSON body are fixed by the semantic host operation.
+#[derive(Clone, Eq, PartialEq)]
+pub struct LogsHttpRequest {
+    target: RelativeRequestTarget,
+    body: Vec<u8>,
+}
+
+impl LogsHttpRequest {
+    /// Construct a Logs Query request from a canonical route target and JSON.
+    pub fn new(target: RelativeRequestTarget, body: impl Into<Vec<u8>>) -> Result<Self, HttpError> {
+        if !target.query().is_empty() {
+            return Err(HttpError::InvalidRequestUrl);
+        }
+        Ok(Self {
+            target,
+            body: body.into(),
+        })
+    }
+
+    /// The canonical relative route target.
+    pub fn target(&self) -> &RelativeRequestTarget {
+        &self.target
+    }
+
+    /// The host-owned JSON body bytes.
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+impl fmt::Debug for LogsHttpRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LogsHttpRequest")
+            .field("target", &self.target.to_string())
+            .field("body_len", &self.body.len())
+            .finish()
     }
 }
 
@@ -1015,6 +1168,284 @@ impl HttpClient {
     }
 }
 
+/// Immutable client configuration for the direct Logs Query data plane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogsHttpClientConfig {
+    cloud: AzureCloud,
+    subscription: SubscriptionId,
+    tenant: TenantId,
+    audience: TokenAudience,
+    origin: LogsOrigin,
+    policy: PolicyBundle,
+    limits: HttpLimits,
+}
+
+impl LogsHttpClientConfig {
+    /// Build a production configuration using the exact Logs origin.
+    pub fn new(
+        cloud: AzureCloud,
+        subscription: SubscriptionId,
+        tenant: TenantId,
+        audience: TokenAudience,
+        policy: PolicyBundle,
+    ) -> Result<Self, HttpError> {
+        let origin = LogsOrigin::for_cloud(cloud)?;
+        Self::with_origin(cloud, subscription, tenant, audience, origin, policy)
+    }
+
+    /// Build a configuration with a manifest origin or explicit loopback seam.
+    pub fn with_origin(
+        cloud: AzureCloud,
+        subscription: SubscriptionId,
+        tenant: TenantId,
+        audience: TokenAudience,
+        origin: LogsOrigin,
+        policy: PolicyBundle,
+    ) -> Result<Self, HttpError> {
+        if audience != TokenAudience::LogAnalytics {
+            return Err(HttpError::InvalidAudience);
+        }
+        if origin.cloud() != cloud {
+            return Err(HttpError::OriginCloudMismatch);
+        }
+        if !origin.is_loopback_override() {
+            let expected = LogsOrigin::for_cloud(cloud)?;
+            if origin != expected {
+                return Err(HttpError::InvalidManifestOrigin);
+            }
+        }
+        let limits = HttpLimits::default();
+        Ok(Self {
+            cloud,
+            subscription,
+            tenant,
+            audience,
+            origin,
+            policy,
+            limits,
+        })
+    }
+
+    /// Build a configuration from a resolved context binding.
+    pub fn from_binding(
+        binding: &ResolvedCloudBinding,
+        policy: PolicyBundle,
+    ) -> Result<Self, HttpError> {
+        Self::new(
+            binding.cloud(),
+            binding.subscription().clone(),
+            binding.tenant().clone(),
+            TokenAudience::LogAnalytics,
+            policy,
+        )
+    }
+
+    /// Replace request/response limits.
+    pub fn with_limits(mut self, limits: HttpLimits) -> Result<Self, HttpError> {
+        self.limits = limits.validate()?;
+        Ok(self)
+    }
+
+    /// Selected cloud.
+    pub const fn cloud(&self) -> AzureCloud {
+        self.cloud
+    }
+
+    /// Selected subscription.
+    pub fn subscription(&self) -> &SubscriptionId {
+        &self.subscription
+    }
+
+    /// Selected tenant.
+    pub fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    /// Selected token audience.
+    pub const fn audience(&self) -> TokenAudience {
+        self.audience
+    }
+
+    /// Exact token resource selected for the cloud.
+    pub fn audience_resource(&self) -> &'static str {
+        self.audience.resource(self.cloud)
+    }
+
+    /// Selected exact Logs origin.
+    pub fn origin(&self) -> &LogsOrigin {
+        &self.origin
+    }
+
+    /// Selected immutable route policy.
+    pub fn policy(&self) -> &PolicyBundle {
+        &self.policy
+    }
+
+    /// Selected limits.
+    pub const fn limits(&self) -> HttpLimits {
+        self.limits
+    }
+}
+
+/// A dedicated direct Logs Query client. It never appends an ARM
+/// `api-version` query parameter and never accepts caller-controlled headers.
+pub struct LogsHttpClient {
+    http: Client,
+    credential_provider: Arc<dyn CredentialProvider>,
+    config: LogsHttpClientConfig,
+}
+
+impl LogsHttpClient {
+    /// Construct a client using the exact reviewed Logs origin.
+    pub fn new(
+        credential_provider: Arc<dyn CredentialProvider>,
+        cloud: AzureCloud,
+        subscription: SubscriptionId,
+        tenant: TenantId,
+        policy: PolicyBundle,
+    ) -> Result<Self, HttpError> {
+        let config = LogsHttpClientConfig::new(
+            cloud,
+            subscription,
+            tenant,
+            TokenAudience::LogAnalytics,
+            policy,
+        )?;
+        Self::from_config(credential_provider, config)
+    }
+
+    /// Construct a client from an immutable Logs configuration.
+    pub fn from_config(
+        credential_provider: Arc<dyn CredentialProvider>,
+        config: LogsHttpClientConfig,
+    ) -> Result<Self, HttpError> {
+        let http = Client::builder()
+            .no_proxy()
+            .redirect(RedirectPolicy::none())
+            .timeout(config.limits.timeout())
+            .build()
+            .map_err(|_| HttpError::ClientBuild)?;
+        Ok(Self {
+            http,
+            credential_provider,
+            config,
+        })
+    }
+
+    /// Construct a client against an explicit loopback-only origin.
+    pub fn with_loopback_origin(
+        credential_provider: Arc<dyn CredentialProvider>,
+        cloud: AzureCloud,
+        subscription: SubscriptionId,
+        tenant: TenantId,
+        origin: LogsOrigin,
+        policy: PolicyBundle,
+    ) -> Result<Self, HttpError> {
+        let config = LogsHttpClientConfig::with_origin(
+            cloud,
+            subscription,
+            tenant,
+            TokenAudience::LogAnalytics,
+            origin,
+            policy,
+        )?;
+        Self::from_config(credential_provider, config)
+    }
+
+    /// The immutable execution configuration.
+    pub fn config(&self) -> &LogsHttpClientConfig {
+        &self.config
+    }
+
+    /// Execute one host-owned Logs Query request.
+    pub async fn execute(&self, request: LogsHttpRequest) -> Result<HttpResponse, HttpError> {
+        self.execute_with_identity_pin(request, None).await
+    }
+
+    /// Execute while pinning the credential identity to a context lifetime.
+    pub async fn execute_with_identity_pin(
+        &self,
+        request: LogsHttpRequest,
+        identity_pin: Option<&CredentialIdentityPin>,
+    ) -> Result<HttpResponse, HttpError> {
+        if request.body.len() > self.config.limits.request_body_bytes() {
+            return Err(HttpError::RequestBodyTooLarge {
+                limit: self.config.limits.request_body_bytes(),
+            });
+        }
+        self.config
+            .policy
+            .classify(
+                self.config.cloud,
+                RoutePurpose::LogsQuery,
+                HttpMethod::Post,
+                &request.target,
+                LOGS_QUERY_API_VERSION,
+            )
+            .map_err(HttpError::PolicyDenied)?;
+        let url = build_logs_request_url(&self.config.origin, &request.target)?;
+
+        let mut token_request = TokenRequest::new(
+            self.config.cloud,
+            self.config.tenant.clone(),
+            self.config.subscription.clone(),
+            self.config.audience,
+        );
+        if let Some(identity_pin) = identity_pin {
+            token_request = token_request.with_identity_pin(identity_pin);
+        }
+        let credential = self
+            .credential_provider
+            .acquire(token_request.clone())
+            .await
+            .map_err(HttpError::Credential)?;
+        if let (Some(identity_pin), Some(identity)) = (identity_pin, credential.identity()) {
+            identity_pin
+                .check(&token_request, identity)
+                .await
+                .map_err(HttpError::Credential)?;
+        }
+
+        let mut auth_bytes = Vec::with_capacity(b"Bearer ".len() + credential.secret().len());
+        auth_bytes.extend_from_slice(b"Bearer ");
+        auth_bytes.extend_from_slice(credential.secret().as_bytes());
+        let authorization = HeaderValue::from_bytes(&auth_bytes)
+            .map_err(|_| HttpError::Credential(CredentialError::EmptyToken));
+        auth_bytes.zeroize();
+        let authorization = authorization?;
+
+        let builder = self
+            .http
+            .post(url)
+            .header(AUTHORIZATION, authorization)
+            .header(CONTENT_TYPE, "application/json")
+            .body(request.body);
+        let body_limit = self.config.limits.response_body_bytes();
+        time::timeout(self.config.limits.timeout(), async move {
+            let response = builder.send().await.map_err(|_| HttpError::RequestSend)?;
+            if response.status().is_redirection() {
+                return Err(HttpError::RedirectDenied);
+            }
+            let status = response.status();
+            let headers = safe_response_headers(response.headers());
+            if response
+                .content_length()
+                .is_some_and(|length| length > body_limit as u64)
+            {
+                return Err(HttpError::ResponseBodyTooLarge { limit: body_limit });
+            }
+            let body = read_response_body(response, body_limit).await?;
+            Ok(HttpResponse {
+                status: status.as_u16(),
+                headers,
+                body,
+            })
+        })
+        .await
+        .map_err(|_| HttpError::Timeout)?
+    }
+}
+
 fn validate_api_version(value: &str) -> Result<(), HttpError> {
     if value.trim().is_empty()
         || value != value.trim()
@@ -1059,6 +1490,25 @@ fn build_request_url(
     url.query_pairs_mut()
         .append_pair("api-version", api_version);
     if !same_origin(&url, origin.url()) || url.username() != "" || url.password().is_some() {
+        return Err(HttpError::OriginMismatch);
+    }
+    Ok(url)
+}
+
+fn build_logs_request_url(
+    origin: &LogsOrigin,
+    target: &RelativeRequestTarget,
+) -> Result<Url, HttpError> {
+    let url = origin
+        .url()
+        .join(&target.to_string())
+        .map_err(|_| HttpError::InvalidRequestUrl)?;
+    if !same_origin(&url, origin.url())
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return Err(HttpError::OriginMismatch);
     }
     Ok(url)
@@ -1185,7 +1635,7 @@ pub enum HttpError {
     /// The separately supplied API version is malformed.
     #[error("invalid api-version")]
     InvalidApiVersion,
-    /// The selected audience is not the reviewed ARM audience for the cloud.
+    /// The selected audience is not the reviewed audience for the selected Azure service.
     #[error("invalid token audience for the selected Azure service")]
     InvalidAudience,
     /// A metrics region is not a valid reviewed regional host label.
@@ -1492,6 +1942,23 @@ mod tests {
         assert_eq!(requests[0].tenant_id.as_str(), TENANT);
         assert_eq!(requests[0].subscription_id.as_str(), SUBSCRIPTION);
         assert_eq!(requests[0].audience, TokenAudience::Arm);
+    }
+
+    #[test]
+    fn logs_manifest_origins_are_exact_and_separate_from_arm() {
+        let commercial = LogsOrigin::for_cloud(AzureCloud::AzureCloud).expect("commercial logs");
+        let government =
+            LogsOrigin::for_cloud(AzureCloud::AzureUSGovernment).expect("government logs");
+        assert_eq!(commercial.as_str(), "https://api.loganalytics.azure.com/");
+        assert_eq!(government.as_str(), "https://api.loganalytics.us/");
+        assert_eq!(
+            TokenAudience::LogAnalytics.resource(AzureCloud::AzureCloud),
+            "https://api.loganalytics.io"
+        );
+        assert_eq!(
+            TokenAudience::LogAnalytics.resource(AzureCloud::AzureUSGovernment),
+            "https://api.loganalytics.us"
+        );
     }
 
     #[tokio::test]

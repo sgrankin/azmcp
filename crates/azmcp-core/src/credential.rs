@@ -90,6 +90,8 @@ pub enum TokenAudience {
     Arm,
     /// The selected cloud's Azure Monitor Metrics data-plane audience.
     Metrics,
+    /// The selected cloud's Log Analytics Query API audience.
+    LogAnalytics,
 }
 
 impl TokenAudience {
@@ -102,6 +104,10 @@ impl TokenAudience {
             (Self::Metrics, AzureCloud::AzureCloud) => crate::cloud::AZURE_CLOUD_METRICS_AUDIENCE,
             (Self::Metrics, AzureCloud::AzureUSGovernment) => {
                 crate::cloud::AZURE_US_GOVERNMENT_METRICS_AUDIENCE
+            }
+            (Self::LogAnalytics, AzureCloud::AzureCloud) => crate::cloud::AZURE_CLOUD_LOGS_AUDIENCE,
+            (Self::LogAnalytics, AzureCloud::AzureUSGovernment) => {
+                crate::cloud::AZURE_US_GOVERNMENT_LOGS_AUDIENCE
             }
         }
     }
@@ -672,7 +678,11 @@ impl AzureCliBroker {
             return Err(CredentialError::EmptyToken);
         }
 
-        let identity = parse_token_identity(token.as_str(), request.tenant_id.as_str())?;
+        let identity = parse_token_identity(
+            token.as_str(),
+            request.tenant_id.as_str(),
+            request.audience.resource(request.cloud),
+        )?;
 
         let tenant_id = response
             .tenant
@@ -896,6 +906,8 @@ fn parse_cli_version(value: &str) -> Option<(u64, u64, u64)> {
 #[derive(Deserialize)]
 struct JwtClaims {
     #[serde(default)]
+    aud: Option<String>,
+    #[serde(default)]
     tid: Option<String>,
     #[serde(default)]
     oid: Option<String>,
@@ -908,6 +920,7 @@ struct JwtClaims {
 fn parse_token_identity(
     token: &str,
     requested_tenant: &str,
+    requested_audience: &str,
 ) -> Result<CredentialIdentity, CredentialError> {
     let mut segments = token.split('.');
     let (Some(header), Some(payload), Some(signature)) =
@@ -926,6 +939,13 @@ fn parse_token_identity(
     let claims = serde_json::from_slice::<JwtClaims>(&decoded);
     decoded.zeroize();
     let claims = claims.map_err(|_| invalid_token_claims())?;
+
+    let audience = required_claim(claims.aud, "accessToken.aud")?;
+    if audience != requested_audience {
+        return Err(CredentialError::InvalidResponse {
+            field: "accessToken.aud",
+        });
+    }
 
     let tenant_id = required_claim(claims.tid, "accessToken.tid")?;
     if !tenant_id.eq_ignore_ascii_case(requested_tenant) {
@@ -1166,6 +1186,7 @@ mod tests {
 
     fn jwt_token(tenant: &str, oid: &str, client_id: &str) -> String {
         jwt_token_with_claims(serde_json::json!({
+            "aud": crate::cloud::AZURE_CLOUD_ARM_AUDIENCE,
             "tid": tenant,
             "oid": oid,
             "appid": client_id,
@@ -1267,6 +1288,15 @@ mod tests {
             TenantId::new(TENANT_A).expect("valid tenant"),
             SubscriptionId::new(subscription_id).expect("valid subscription"),
             TokenAudience::Arm,
+        )
+    }
+
+    fn government_logs_request() -> TokenRequest {
+        TokenRequest::new(
+            AzureCloud::AzureUSGovernment,
+            TenantId::new(TENANT_A).expect("valid tenant"),
+            SubscriptionId::new(SUBSCRIPTION_A).expect("valid subscription"),
+            TokenAudience::LogAnalytics,
         )
     }
 
@@ -1506,6 +1536,7 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("temporary fake directory");
         let access_token = jwt_token_with_claims(serde_json::json!({
+            "aud": crate::cloud::AZURE_CLOUD_ARM_AUDIENCE,
             "tid": TENANT_A,
             "oid": OID_A,
             "azp": CLIENT_A,
@@ -1544,6 +1575,60 @@ mod tests {
                 .expect_err("JWT tenant mismatch fails closed");
         assert_eq!(error.code(), CredentialErrorCode::TenantMismatch);
         assert!(!error.to_string().contains(access_token.as_str()));
+    }
+
+    #[tokio::test]
+    async fn validates_logs_audience_and_government_resource() {
+        let directory = tempfile::tempdir().expect("temporary fake directory");
+        let wrong_audience = jwt_token_with_claims(serde_json::json!({
+            "aud": crate::cloud::AZURE_US_GOVERNMENT_ARM_AUDIENCE,
+            "tid": TENANT_A,
+            "oid": OID_A,
+            "appid": CLIENT_A,
+        }));
+        let executable = fake_az(
+            &directory,
+            &cli_body(&wrong_audience, SUBSCRIPTION_A, TENANT_A, None),
+            "",
+            0,
+            None,
+        );
+        let broker =
+            AzureCliBroker::with_correlation_id(&executable, DEFAULT_TIMEOUT, "logs-audience-test")
+                .expect("valid correlation id");
+        let error = broker
+            .acquire(government_logs_request())
+            .await
+            .expect_err("wrong Logs audience fails closed");
+        assert_eq!(error.code(), CredentialErrorCode::InvalidResponse);
+
+        let good_token = jwt_token_with_claims(serde_json::json!({
+            "aud": crate::cloud::AZURE_US_GOVERNMENT_LOGS_AUDIENCE,
+            "tid": TENANT_A,
+            "oid": OID_A,
+            "appid": CLIENT_A,
+        }));
+        let executable = fake_az(
+            &directory,
+            &cli_body(&good_token, SUBSCRIPTION_A, TENANT_A, None),
+            "",
+            0,
+            None,
+        );
+        let broker = AzureCliBroker::with_correlation_id(
+            &executable,
+            DEFAULT_TIMEOUT,
+            "logs-government-test",
+        )
+        .expect("valid correlation id");
+        broker
+            .acquire(government_logs_request())
+            .await
+            .expect("government Logs token succeeds");
+        let invocation = fs::read_to_string(directory.path().join("argv.log")).expect("fake log");
+        assert!(invocation.contains(
+            "AzureUSGovernment|logs-government-test|||account get-access-token --subscription 11111111-1111-1111-1111-111111111111 --resource https://api.loganalytics.us --output json --only-show-errors"
+        ));
     }
 
     #[tokio::test]

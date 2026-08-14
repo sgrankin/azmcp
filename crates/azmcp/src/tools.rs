@@ -23,6 +23,7 @@ pub const CONTEXT_CLOSE_TOOL: &str = "azure_context_close";
 pub const RUN_TOOL: &str = "azure_run";
 pub const SCHEMA_SEARCH_TOOL: &str = "azure_schema_search";
 pub const SCHEMA_GET_TOOL: &str = "azure_schema_get";
+pub const LOGS_QUERY_DATA_PLANE: &str = "logs.query";
 
 pub const DEFAULT_RUN_TIMEOUT_MS: u64 = 60_000;
 pub const MAX_RUN_TIMEOUT_MS: u64 = 3_600_000;
@@ -155,6 +156,40 @@ impl GraphScopeOverrides {
     }
 }
 
+/// The only Logs Query scope accepted by the first direct data-plane slice.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogsAllAccessibleArgs {
+    pub scope: AllAccessibleScope,
+}
+
+/// Optional per-cloud Logs Query scopes declared at context open.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogsScopeOverrides {
+    #[serde(
+        rename = "AzureCloud",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub commercial: Option<LogsAllAccessibleArgs>,
+    #[serde(
+        rename = "AzureUSGovernment",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub government: Option<LogsAllAccessibleArgs>,
+}
+
+impl LogsScopeOverrides {
+    pub fn get(&self, cloud: AzureCloud) -> Option<&LogsAllAccessibleArgs> {
+        match cloud {
+            AzureCloud::AzureCloud => self.commercial.as_ref(),
+            AzureCloud::AzureUSGovernment => self.government.as_ref(),
+        }
+    }
+}
+
 /// Input for an immutable inspect-only execution context.
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -164,19 +199,37 @@ pub struct ContextOpenArgs {
     #[serde(default)]
     pub arm_tier: Option<InspectTier>,
     #[serde(default)]
-    pub data_planes: Vec<Value>,
+    pub data_planes: Vec<String>,
     #[serde(default)]
     pub bindings: BindingOverrides,
     #[serde(default)]
     pub allowed_subscriptions: AllowedSubscriptionOverrides,
     #[serde(default)]
     pub graph_scopes: GraphScopeOverrides,
+    #[serde(default)]
+    pub logs_scopes: LogsScopeOverrides,
 }
 
 impl ContextOpenArgs {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !self.data_planes.is_empty() {
-            return Err("v0 dataPlanes must be empty");
+        if self
+            .data_planes
+            .iter()
+            .any(|data_plane| data_plane != LOGS_QUERY_DATA_PLANE)
+        {
+            return Err("unsupported data plane");
+        }
+        if self
+            .data_planes
+            .iter()
+            .enumerate()
+            .any(|(index, data_plane)| {
+                self.data_planes[..index]
+                    .iter()
+                    .any(|prior| prior == data_plane)
+            })
+        {
+            return Err("dataPlanes contains a duplicate");
         }
         for cloud in [AzureCloud::AzureCloud, AzureCloud::AzureUSGovernment] {
             let additional = self.allowed_subscriptions.get(cloud);
@@ -334,10 +387,11 @@ fn context_open() -> Tool {
             "properties": {
                 "identity": {"const": "user", "default": "user"},
                 "armTier": {"const": "inspect", "default": "inspect"},
-                "dataPlanes": {"type": "array", "maxItems": 0, "default": []},
+                "dataPlanes": {"type": "array", "maxItems": 1, "uniqueItems": true, "items": {"const": "logs.query"}, "default": []},
                 "bindings": bindings_schema(),
                 "allowedSubscriptions": allowed_subscriptions_schema(),
-                "graphScopes": graph_scopes_schema()
+                "graphScopes": graph_scopes_schema(),
+                "logsScopes": logs_scopes_schema()
             },
             "additionalProperties": false
         }),
@@ -347,13 +401,14 @@ fn context_open() -> Tool {
                 "contextId": context_id_schema(),
                 "identity": {"const": "user"},
                 "armTier": {"const": "inspect"},
-                "dataPlanes": {"type": "array", "maxItems": 0},
+                "dataPlanes": {"type": "array", "maxItems": 1, "items": {"const": "logs.query"}},
                 "resolvedBindings": {"type": "array", "minItems": 1, "items": resolved_binding_schema()},
                 "allowedSubscriptions": allowed_subscriptions_schema(),
                 "graphScopes": graph_scopes_schema(),
+                "logsScopes": logs_scopes_schema(),
                 "expiresAt": {"type": "string", "format": "date-time"}
             },
-            "required": ["contextId", "identity", "armTier", "dataPlanes", "resolvedBindings", "allowedSubscriptions", "graphScopes", "expiresAt"],
+            "required": ["contextId", "identity", "armTier", "dataPlanes", "resolvedBindings", "allowedSubscriptions", "graphScopes", "logsScopes", "expiresAt"],
             "additionalProperties": false
         }),
         annotations(true, false, false),
@@ -383,7 +438,7 @@ fn context_close() -> Tool {
 fn run() -> Tool {
     tool(
         RUN_TOOL,
-        "Execute JavaScript in a retained inspect-only context. Use az.graph for fleet inventory, az.request for reviewed ARM routes, az.metrics.single({cloud, resourceId, metricNames, timespan?, interval?, aggregation?, top?, orderBy?, filter?, resultType?, metricNamespace?, autoAdjustTimegrain?, validateDimensions?, rollupBy?}) for one resource, and az.metrics.batch({cloud, region, resourceIds, metricNamespace, metricNames, startTime?, endTime?, interval?, aggregation?, top?, orderBy?, filter?, rollupBy?}) for up to 50 same-type resources. Both metrics helpers require an explicit cloud; batch also requires an explicit regional endpoint.",
+        "Execute JavaScript in a retained inspect-only context. Use az.graph for fleet inventory, az.request for reviewed ARM routes, az.metrics.single({cloud, resourceId, metricNames, timespan?, interval?, aggregation?, top?, orderBy?, filter?, resultType?, metricNamespace?, autoAdjustTimegrain?, validateDimensions?, rollupBy?}) for one resource, az.metrics.batch({cloud, region, resourceIds, metricNamespace, metricNames, startTime?, endTime?, interval?, aggregation?, top?, orderBy?, filter?, rollupBy?}) for up to 50 same-type resources, and az.logs.query({cloud, subscription?, workspaceId, query, timespan}) for explicitly granted Log Analytics KQL. Every helper requires an explicit cloud; metrics batch also requires an explicit regional endpoint.",
         json!({
             "type": "object",
             "properties": {
@@ -592,6 +647,26 @@ fn graph_scopes_schema() -> Value {
     })
 }
 
+fn logs_scope_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"scope": {"const": "allAccessible"}},
+        "required": ["scope"],
+        "additionalProperties": false
+    })
+}
+
+fn logs_scopes_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "AzureCloud": logs_scope_schema(),
+            "AzureUSGovernment": logs_scope_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
 fn resolved_binding_schema() -> Value {
     json!({
         "type": "object",
@@ -719,7 +794,25 @@ mod tests {
         assert!(serde_json::from_value::<ContextOpenArgs>(json!({"armTier": "read"})).is_err());
         let args: ContextOpenArgs =
             serde_json::from_value(json!({"dataPlanes": ["logs.query"]})).unwrap();
-        assert!(args.validate().is_err());
+        assert!(args.validate().is_ok());
+        let args: ContextOpenArgs = serde_json::from_value(json!({
+            "dataPlanes": ["logs.query"],
+            "logsScopes": {"AzureCloud": {"scope": "allAccessible"}}
+        }))
+        .unwrap();
+        assert!(args.validate().is_ok());
+        assert!(
+            serde_json::from_value::<ContextOpenArgs>(json!({
+                "logsScopes": {"AzureCloud": {"scope": "allAccessible", "workspaceIds": []}}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ContextOpenArgs>(json!({"dataPlanes": ["future.query"]}))
+                .unwrap()
+                .validate()
+                .is_err()
+        );
         assert!(
             serde_json::from_value::<ContextCloseArgs>(json!({"contextId": "x", "force": true}))
                 .is_err()
