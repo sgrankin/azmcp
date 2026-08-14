@@ -34,10 +34,19 @@ use crate::policy::{HttpMethod, PolicyBundle, PolicyDenial, RoutePurpose};
 use crate::routes::LOGS_QUERY_API_VERSION;
 use crate::target::{InvalidRequestTarget, RelativeRequestTarget};
 
+mod paging;
+
+pub use paging::{
+    MAX_PAGING_BYTES, MAX_PAGING_ELAPSED, MAX_PAGING_ITEMS, MAX_PAGING_PAGES, PagedHttpPage,
+    PagedHttpResponse, PagingError, PagingLimits,
+};
+
 /// The default upper bound for a request body.
 pub const DEFAULT_REQUEST_BODY_LIMIT: usize = 1024 * 1024;
 /// The default upper bound for a response body.
 pub const DEFAULT_RESPONSE_BODY_LIMIT: usize = 8 * 1024 * 1024;
+/// Absolute upper bound accepted for one buffered HTTP response body.
+pub const MAX_RESPONSE_BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// The default wall-clock timeout for one ARM HTTP exchange.
 pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// The default total number of HTTP attempts, including the initial request.
@@ -215,7 +224,7 @@ impl HttpLimits {
                 field: "request body limit",
             });
         }
-        if self.response_body_bytes == 0 {
+        if self.response_body_bytes == 0 || self.response_body_bytes > MAX_RESPONSE_BODY_LIMIT {
             return Err(HttpError::InvalidLimits {
                 field: "response body limit",
             });
@@ -1220,6 +1229,32 @@ impl HttpClient {
         request: HttpRequest,
         identity_pin: Option<&CredentialIdentityPin>,
     ) -> Result<HttpResponse, HttpError> {
+        self.execute_with_identity_pin_and_response_limit(
+            request,
+            identity_pin,
+            self.config.limits.response_body_bytes(),
+        )
+        .await
+    }
+
+    /// Execute through the ordinary policy/signing boundary while narrowing
+    /// the response-body cap for one internally owned operation.
+    ///
+    /// This is the paging seam: it can only lower the immutable configured
+    /// limit and therefore cannot widen an ordinary caller's transport budget.
+    async fn execute_with_identity_pin_and_response_limit(
+        &self,
+        request: HttpRequest,
+        identity_pin: Option<&CredentialIdentityPin>,
+        response_body_limit: usize,
+    ) -> Result<HttpResponse, HttpError> {
+        if response_body_limit == 0
+            || response_body_limit > self.config.limits.response_body_bytes()
+        {
+            return Err(HttpError::InvalidLimits {
+                field: "response body limit",
+            });
+        }
         validate_api_version(&request.api_version)?;
         if request.body.len() > self.config.limits.request_body_bytes() {
             return Err(HttpError::RequestBodyTooLarge {
@@ -1300,6 +1335,7 @@ impl HttpClient {
                 retryable: retryable_route,
             },
             self.config.limits,
+            response_body_limit,
         )
         .await
     }
@@ -1567,6 +1603,7 @@ impl LogsHttpClient {
                 retryable: retryable_route,
             },
             self.config.limits,
+            self.config.limits.response_body_bytes(),
         )
         .await
     }
@@ -1770,6 +1807,7 @@ async fn execute_with_retries(
     client: &Client,
     request: PreparedRequest,
     limits: HttpLimits,
+    response_body_limit: usize,
 ) -> Result<HttpResponse, HttpError> {
     let retry_policy = limits.retry_policy();
     let started = std::time::Instant::now();
@@ -1796,7 +1834,7 @@ async fn execute_with_retries(
         let attempt_timeout = limits.timeout().min(remaining);
         let response = time::timeout(
             attempt_timeout,
-            send_once(client, &request, limits.response_body_bytes()),
+            send_once(client, &request, response_body_limit),
         )
         .await
         .map_err(|_| retry_failed(HttpError::Timeout, attempts.saturating_sub(1)))?
@@ -2236,6 +2274,94 @@ mod tests {
         (format!("http://{address}/"), task)
     }
 
+    async fn paging_loopback_server<F>(
+        responses: F,
+    ) -> (String, tokio::task::JoinHandle<Vec<Vec<u8>>>)
+    where
+        F: FnOnce(&str) -> Vec<(String, Duration)>,
+    {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let base = format!("http://{address}/");
+        let responses = responses(&base);
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for (response, delay) in responses {
+                let (mut stream, _) = listener.accept().await.expect("loopback request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let count = stream.read(&mut buffer).await.expect("read request");
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                time::sleep(delay).await;
+                // A paging elapsed-time test can close the client before the
+                // delayed synthetic response is written.
+                let _ = stream.write_all(response.as_bytes()).await;
+                requests.push(request);
+            }
+            requests
+        });
+        (base, task)
+    }
+
+    fn json_http_response(body: &str, remaining_reads: Option<u64>) -> String {
+        let rate_header = remaining_reads
+            .map(|value| format!("X-MS-Ratelimit-Remaining-Subscription-Reads: {value}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{rate_header}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn paging_policy() -> PolicyBundle {
+        PolicyBundle::new(
+            "test-paging-v1",
+            vec![
+                crate::policy::ReviewedRoute::new(
+                    AzureCloud::AzureCloud,
+                    RoutePurpose::Request,
+                    HttpMethod::Get,
+                    "/subscriptions/{subscription}/resourceGroups/{group}",
+                    [API_VERSION],
+                    "Microsoft.Resources/subscriptions/resourceGroups/read",
+                    crate::policy::ArmTier::Inspect,
+                )
+                .expect("valid route")
+                .with_query_parameters(["$skiptoken", "marker"])
+                .expect("continuation query"),
+                crate::policy::ReviewedRoute::new(
+                    AzureCloud::AzureCloud,
+                    RoutePurpose::Request,
+                    HttpMethod::Get,
+                    "/subscriptions/{subscription}/providers/{namespace}",
+                    [API_VERSION],
+                    "Microsoft.Resources/subscriptions/providers/read",
+                    crate::policy::ArmTier::Inspect,
+                )
+                .expect("valid escape route"),
+            ],
+        )
+        .expect("valid paging policy")
+    }
+
+    fn paging_request() -> HttpRequest {
+        HttpRequest::get(
+            &format!("/subscriptions/{SUBSCRIPTION}/resourceGroups/prod"),
+            API_VERSION,
+        )
+        .expect("paging request")
+    }
+
     fn client_for(provider: Arc<FakeCredentials>, origin: &str) -> HttpClient {
         let (subscription, tenant) = ids();
         let origin =
@@ -2587,6 +2713,359 @@ mod tests {
         let _ = server.await.expect("first response server");
         assert_eq!(error.retry_count(), 1);
         assert!(matches!(error, HttpError::RetryFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn bounded_paging_follows_same_route_and_retains_page_transport_facts() {
+        let (base, server) = paging_loopback_server(|base| {
+            let first = serde_json::json!({
+                "value": [{"id": 1}],
+                "nextLink": format!(
+                    "{base}subscriptions/{SUBSCRIPTION}/resourceGroups/prod?%24skiptoken=second&api-version={API_VERSION}"
+                )
+            })
+            .to_string();
+            let second = serde_json::json!({"value": [{"id": 2}]}).to_string();
+            vec![
+                (
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\n\r\n"
+                        .to_owned(),
+                    Duration::ZERO,
+                ),
+                (json_http_response(&first, Some(99)), Duration::ZERO),
+                (json_http_response(&second, Some(98)), Duration::ZERO),
+            ]
+        })
+        .await;
+        let provider = Arc::new(FakeCredentials::default());
+        let client = client_for_with_limits(
+            provider.clone(),
+            &base,
+            paging_policy(),
+            fast_retry_limits(2),
+        );
+
+        let response = client
+            .execute_paged(paging_request(), PagingLimits::default())
+            .await
+            .expect("bounded pages");
+        let requests = server.await.expect("paging server");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            response.items(),
+            &[serde_json::json!({"id": 1}), serde_json::json!({"id": 2})]
+        );
+        assert_eq!(response.pages().len(), 2);
+        assert_eq!(response.retry_count(), 1);
+        assert_eq!(response.pages()[0].retry_count(), 1);
+        assert_eq!(response.pages()[0].remaining_subscription_reads(), Some(99));
+        assert_eq!(response.pages()[1].remaining_subscription_reads(), Some(98));
+        assert_eq!(response.pages()[0].item_count(), 1);
+        assert!(response.response_body_bytes() > 0);
+        let second_request = String::from_utf8_lossy(&requests[2]);
+        assert!(second_request.contains(
+            "GET /subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/prod?%24skiptoken=second&api-version=2024-01-01 HTTP/1.1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn paging_cycle_detection_uses_the_effective_canonical_target() {
+        let (base, server) = paging_loopback_server(|base| {
+            let first = serde_json::json!({
+                "value": [{"id": 1}],
+                "nextLink": format!(
+                    "{base}subscriptions/{SUBSCRIPTION}/resourceGroups/prod?marker=%61&%24skiptoken=second&api-version={API_VERSION}"
+                )
+            })
+            .to_string();
+            let second = serde_json::json!({
+                "value": [{"id": 2}],
+                "nextLink": format!(
+                    "{base}subscriptions/{SUBSCRIPTION}/resourceGroups/prod?%24skiptoken=second&marker=a&api-version={API_VERSION}"
+                )
+            })
+            .to_string();
+            vec![
+                (json_http_response(&first, None), Duration::ZERO),
+                (json_http_response(&second, None), Duration::ZERO),
+            ]
+        })
+        .await;
+        let provider = Arc::new(FakeCredentials::default());
+        let client = client_for_with_limits(
+            provider.clone(),
+            &base,
+            paging_policy(),
+            fast_retry_limits(1),
+        );
+
+        assert!(matches!(
+            client
+                .execute_paged(paging_request(), PagingLimits::default())
+                .await,
+            Err(PagingError::ContinuationCycle)
+        ));
+        assert_eq!(server.await.expect("cycle server").len(), 2);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn paged_upstream_status_preserves_final_retry_count() {
+        let (base, server) = paging_loopback_server(|_| {
+            vec![
+                (
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_owned(),
+                    Duration::ZERO,
+                ),
+                (
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_owned(),
+                    Duration::ZERO,
+                ),
+            ]
+        })
+        .await;
+        let provider = Arc::new(FakeCredentials::default());
+        let client = client_for_with_limits(
+            provider.clone(),
+            &base,
+            paging_policy(),
+            fast_retry_limits(2),
+        );
+
+        let error = client
+            .execute_paged(paging_request(), PagingLimits::default())
+            .await
+            .expect_err("final status is an error");
+        assert_eq!(error.retry_count(), 1);
+        assert!(matches!(
+            error,
+            PagingError::UpstreamStatus {
+                status: 503,
+                retry_count: 1
+            }
+        ));
+        assert_eq!(server.await.expect("status server").len(), 2);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn paging_rejects_cross_origin_continuations_before_a_second_credential() {
+        let (base, server) = paging_loopback_server(|_| {
+            let body = serde_json::json!({
+                "value": [{"id": 1}],
+                "nextLink": format!(
+                    "http://127.0.0.1:9/subscriptions/{SUBSCRIPTION}/resourceGroups/prod?%24skiptoken=second&api-version={API_VERSION}"
+                )
+            })
+            .to_string();
+            vec![(json_http_response(&body, None), Duration::ZERO)]
+        })
+        .await;
+        let provider = Arc::new(FakeCredentials::default());
+        let client = client_for_with_limits(
+            provider.clone(),
+            &base,
+            paging_policy(),
+            fast_retry_limits(1),
+        );
+
+        assert!(matches!(
+            client
+                .execute_paged(paging_request(), PagingLimits::default())
+                .await,
+            Err(PagingError::ContinuationOriginMismatch)
+        ));
+        assert_eq!(server.await.expect("paging server").len(), 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn paging_rejects_a_continuation_into_another_reviewed_route() {
+        let (base, server) = paging_loopback_server(|base| {
+            let body = serde_json::json!({
+                "value": [{"id": 1}],
+                "nextLink": format!(
+                    "{base}subscriptions/{SUBSCRIPTION}/providers/Microsoft.Compute?api-version={API_VERSION}"
+                )
+            })
+            .to_string();
+            vec![(json_http_response(&body, None), Duration::ZERO)]
+        })
+        .await;
+        let provider = Arc::new(FakeCredentials::default());
+        let client = client_for_with_limits(
+            provider.clone(),
+            &base,
+            paging_policy(),
+            fast_retry_limits(1),
+        );
+
+        assert!(matches!(
+            client
+                .execute_paged(paging_request(), PagingLimits::default())
+                .await,
+            Err(PagingError::ContinuationRouteMismatch)
+        ));
+        assert_eq!(server.await.expect("paging server").len(), 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn paging_enforces_page_item_and_aggregate_byte_caps() {
+        let (base, server) = paging_loopback_server(|base| {
+            let body = serde_json::json!({
+                "value": [{"id": 1}],
+                "nextLink": format!(
+                    "{base}subscriptions/{SUBSCRIPTION}/resourceGroups/prod?%24skiptoken=second&api-version={API_VERSION}"
+                )
+            })
+            .to_string();
+            vec![(json_http_response(&body, None), Duration::ZERO)]
+        })
+        .await;
+        let client = client_for_with_limits(
+            Arc::new(FakeCredentials::default()),
+            &base,
+            paging_policy(),
+            fast_retry_limits(1),
+        );
+        let limits = PagingLimits::new(1, 10, 1024, Duration::from_secs(1));
+        assert!(matches!(
+            client.execute_paged(paging_request(), limits).await,
+            Err(PagingError::PageLimitExceeded { limit: 1 })
+        ));
+        assert_eq!(server.await.expect("page-cap server").len(), 1);
+
+        let (base, server) = paging_loopback_server(|_| {
+            let body = serde_json::json!({"value": [{"id": 1}, {"id": 2}]}).to_string();
+            vec![(json_http_response(&body, None), Duration::ZERO)]
+        })
+        .await;
+        let client = client_for_with_limits(
+            Arc::new(FakeCredentials::default()),
+            &base,
+            paging_policy(),
+            fast_retry_limits(1),
+        );
+        let limits = PagingLimits::new(2, 1, 1024, Duration::from_secs(1));
+        assert!(matches!(
+            client.execute_paged(paging_request(), limits).await,
+            Err(PagingError::ItemLimitExceeded { limit: 1 })
+        ));
+        assert_eq!(server.await.expect("item-cap server").len(), 1);
+
+        let body = serde_json::json!({"value": [{"id": 1}]}).to_string();
+        let byte_limit = body.len() - 1;
+        let expected_body = body.clone();
+        let (base, server) = paging_loopback_server(move |_| {
+            vec![(json_http_response(&expected_body, None), Duration::ZERO)]
+        })
+        .await;
+        let client = client_for_with_limits(
+            Arc::new(FakeCredentials::default()),
+            &base,
+            paging_policy(),
+            fast_retry_limits(1),
+        );
+        let limits = PagingLimits::new(2, 10, byte_limit, Duration::from_secs(1));
+        assert!(matches!(
+            client.execute_paged(paging_request(), limits).await,
+            Err(PagingError::ByteLimitExceeded { limit }) if limit == byte_limit
+        ));
+        assert_eq!(server.await.expect("byte-cap server").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn paging_narrows_transport_buffering_to_the_remaining_byte_budget() {
+        let paging_limit = 32;
+        let (base, server) = paging_loopback_server(|_| {
+            let body = serde_json::json!({
+                "value": [],
+                "padding": "x".repeat(256)
+            })
+            .to_string();
+            vec![(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+                ),
+                Duration::ZERO,
+            )]
+        })
+        .await;
+        let provider = Arc::new(FakeCredentials::default());
+        let transport_limits =
+            HttpLimits::new(1024, 1024, Duration::from_secs(1)).with_retry_policy(
+                RetryPolicy::new(1, Duration::from_secs(1), Duration::ZERO, Duration::ZERO),
+            );
+        let client =
+            client_for_with_limits(provider.clone(), &base, paging_policy(), transport_limits);
+        assert!(client.config().limits().response_body_bytes() > paging_limit);
+        let limits = PagingLimits::new(2, 10, paging_limit, Duration::from_secs(1));
+
+        assert!(matches!(
+            client.execute_paged(paging_request(), limits).await,
+            Err(PagingError::ByteLimitExceeded { limit }) if limit == paging_limit
+        ));
+        assert_eq!(server.await.expect("byte-bound server").len(), 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn paging_elapsed_cap_covers_the_initial_exchange() {
+        let (base, server) = paging_loopback_server(|_| {
+            let body = serde_json::json!({"value": []}).to_string();
+            vec![(json_http_response(&body, None), Duration::from_millis(100))]
+        })
+        .await;
+        let provider = Arc::new(FakeCredentials::default());
+        let client = client_for_with_limits(
+            provider.clone(),
+            &base,
+            paging_policy(),
+            fast_retry_limits(1),
+        );
+        let limits = PagingLimits::new(2, 10, 1024, Duration::from_millis(10));
+        assert!(matches!(
+            client.execute_paged(paging_request(), limits).await,
+            Err(PagingError::ElapsedLimitExceeded)
+        ));
+        assert_eq!(server.await.expect("elapsed-cap server").len(), 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn paging_rejects_unbounded_limits_before_credentials_or_network() {
+        let (base, server) = paging_loopback_server(|_| {
+            vec![(json_http_response(r#"{"value":[]}"#, None), Duration::ZERO)]
+        })
+        .await;
+        let provider = Arc::new(FakeCredentials::default());
+        let client = client_for_with_limits(
+            provider.clone(),
+            &base,
+            paging_policy(),
+            fast_retry_limits(1),
+        );
+        let limits = PagingLimits::new(MAX_PAGING_PAGES + 1, 1, 1, Duration::from_millis(1));
+        assert!(matches!(
+            client.execute_paged(paging_request(), limits).await,
+            Err(PagingError::InvalidLimits {
+                field: "page limit"
+            })
+        ));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[test]
+    fn http_limits_reject_response_caps_above_the_absolute_ceiling() {
+        assert!(matches!(
+            HttpLimits::new(1, MAX_RESPONSE_BODY_LIMIT + 1, Duration::from_secs(1)).validate(),
+            Err(HttpError::InvalidLimits {
+                field: "response body limit"
+            })
+        ));
     }
 
     #[tokio::test]
