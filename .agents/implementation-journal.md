@@ -2,9 +2,9 @@
 
 ## Current plan
 
-1. Broaden `az.request` from pinned Azure specifications and provider-operation data.
-2. Add bounded paging and large-result references; keep existing result caps and retries.
-3. Preserve the synthetic-only local test boundary and run the complete modern MCP gate.
+1. Broaden `az.request` with additional independently pinned, read-only Azure operations.
+2. Advertise paging only after a concrete reviewed list route has an end-to-end helper.
+3. Run an official server-conformance gate when one is available for the pinned protocol.
 4. Run authenticated Commercial/Government acceptance only in a separately authorized
    non-production environment.
 
@@ -19,8 +19,10 @@
   `azure_accounts` requests over real stdio using a synthetic temporary home, the standard
   config/profile/state paths, and an explicitly injected fake Azure executable.
 - The core test suite uses only synthetic profiles, fake executables, and loopback HTTP.
-  The latest isolated phase gate is 162 tests plus formatting and warning-free clippy;
-  the final combined-stack gate remains pending.
+  The final combined gate uses a unique Cargo target and passes 202 tests: 74 azmcp unit,
+  one modern observability E2E, one modern stdio, eight worker subprocess, 112 core, and
+  six routegen CLI tests. Formatting, warning-free workspace clippy, default and pinned-input
+  routegen checks, and the complete release build also pass.
 - The six modern tools are now the exact advertised catalog. A modern-protocol lifecycle test
   covers accounts, context open, persistent run, close, and structured domain failure.
 - `azure_schema_search` and `azure_schema_get` are implemented as context-scoped,
@@ -57,6 +59,15 @@
   Logs Query calls against loopback-only clients with a synthetic profile and credentials.
   A response barrier proves both host calls overlap; the test also checks audiences,
   returned and durable audit redaction, retained context state, close, and eviction.
+- Context-owned large-result references are integrated behind `az.ref` and bounded `az.peek`
+  worker capabilities. References are immutable, bearer-random, TTL/capacity bounded, and
+  disposed with their context; the complete MCP response still has a hard payload ceiling.
+- The offline import boundary accepts an immutable seed, a content-pinned normalized OpenAPI
+  catalog, and separately pinned RBAC evidence. Pure generation removes revoked review rows,
+  and policy, manifest, and import validation reject semantically overlapping selectors.
+- Canonical manifest bytes recursively sort embedded JSON Schema objects. Policy identity and
+  routegen output therefore remain stable when the full workspace enables serde_json's
+  insertion-preserving map feature.
 - One current-thread V8 worker process is retained per context. Subprocess tests cover
   persistence, hard close and MCP cancellation, abort poisoning, timeout poisoning, heap/RSS
   pressure, TTL disposal, and an eight-call concurrency bound under `Promise.all`.
@@ -137,6 +148,8 @@
 - The reviewed route bundle currently has one real generic ARM scenario:
   `StorageAccounts_GetProperties` for both supported clouds. Broader ARM coverage still
   needs independently pinned source and golden review rows.
+- Both Storage cloud rows currently use the same generic OpenAPI and RBAC evidence pins;
+  Government-cloud availability still requires the deferred authenticated acceptance gate.
 - Portable process-tree termination for timed-out credential subprocess descendants remains
   unresolved; the direct child is killed and pipe readers are bounded/aborted.
 - Bounded exact-origin continuation handling exists in the core HTTP layer, but no current

@@ -75,7 +75,8 @@ initial non-porous Logs scope:
 uses cross-workspace references or stored functions. The v0 `az.request`
 surface accepts no caller headers or body. The reviewed route bundle contains
 subscription validation, provider metadata, Resource Graph, metrics, and Logs
-Query operations for Azure commercial and US Government clouds.
+Query operations for Azure commercial and US Government clouds, plus the pinned
+`StorageAccounts_GetProperties` ARM GET for both clouds.
 
 ## Build and test
 

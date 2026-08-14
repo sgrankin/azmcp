@@ -422,11 +422,7 @@ pub const fn checked_in_seed_manifest_bytes() -> &'static [u8] {
 
 /// Serialize a manifest using stable field and collection ordering.
 pub fn canonical_manifest_bytes(manifest: &RouteManifest) -> Result<Vec<u8>, ManifestError> {
-    let mut normalized = manifest.clone();
-    normalized.routes.sort_by_key(route_sort_key);
-    normalized
-        .schemas
-        .sort_by(|left, right| left.entry_id.cmp(&right.entry_id));
+    let normalized = normalized_manifest(manifest);
     let mut bytes = serde_json::to_vec_pretty(&normalized)
         .map_err(|error| ManifestError::Serialization(error.to_string()))?;
     bytes.push(b'\n');
@@ -436,12 +432,8 @@ pub fn canonical_manifest_bytes(manifest: &RouteManifest) -> Result<Vec<u8>, Man
 /// Compute the content-bound policy identity over a canonical manifest with
 /// its self-referential `policyHash` field cleared.
 pub fn computed_policy_hash(manifest: &RouteManifest) -> Result<String, ManifestError> {
-    let mut normalized = manifest.clone();
+    let mut normalized = normalized_manifest(manifest);
     normalized.policy_hash.clear();
-    normalized.routes.sort_by_key(route_sort_key);
-    normalized
-        .schemas
-        .sort_by(|left, right| left.entry_id.cmp(&right.entry_id));
     let bytes = serde_json::to_vec(&normalized)
         .map_err(|error| ManifestError::Serialization(error.to_string()))?;
     let digest = Sha256::digest(bytes);
@@ -474,6 +466,30 @@ pub fn schema_count(manifest: &RouteManifest) -> usize {
 /// The manifest's policy version.
 pub fn policy_version(manifest: &RouteManifest) -> &str {
     &manifest.policy_version
+}
+
+fn normalized_manifest(manifest: &RouteManifest) -> RouteManifest {
+    let mut normalized = manifest.clone();
+    normalized.routes.sort_by_key(route_sort_key);
+    normalized
+        .schemas
+        .sort_by(|left, right| left.entry_id.cmp(&right.entry_id));
+
+    // serde_json switches its object representation when another workspace
+    // crate enables `preserve_order`. Canonical policy bytes must not depend on
+    // that feature-unified build graph.
+    for schema in &mut normalized.schemas {
+        for value in [
+            &mut schema.argument_schema,
+            &mut schema.request_body_schema,
+            &mut schema.response_body_schema,
+        ] {
+            if let Some(value) = value.as_mut() {
+                value.sort_all_objects();
+            }
+        }
+    }
+    normalized
 }
 
 /// Return the schema rows for conversion by the offline schema index.
@@ -950,6 +966,31 @@ mod tests {
             Err(ManifestError::SchemaNotDiscoverable { .. })
                 | Err(ManifestError::PolicyHashMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn canonical_bytes_ignore_embedded_schema_map_insertion_order() {
+        let mut manifest = checked_in_manifest().expect("fixture");
+        let properties = manifest
+            .schemas
+            .iter_mut()
+            .find(|schema| schema.entry_id == "AzureCloud.storageAccounts.get")
+            .and_then(|schema| schema.argument_schema.as_mut())
+            .and_then(|schema| schema.get_mut("properties"))
+            .and_then(Value::as_object_mut)
+            .expect("storage argument properties");
+        let mut entries = std::mem::take(properties).into_iter().collect::<Vec<_>>();
+        entries.reverse();
+        properties.extend(entries);
+
+        assert_eq!(
+            canonical_manifest_bytes(&manifest).unwrap(),
+            V1_MANIFEST_BYTES
+        );
+        assert_eq!(
+            computed_policy_hash(&manifest).unwrap(),
+            manifest.policy_hash
+        );
     }
 
     #[test]
