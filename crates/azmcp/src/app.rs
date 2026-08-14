@@ -1034,6 +1034,29 @@ impl WorkerSlot {
         Ok(())
     }
 
+    async fn discard_recorded_artifact_stage(
+        &self,
+        transaction: &mut ArtifactTransaction,
+        stage: ArtifactStage,
+    ) -> Result<(), ArtifactError> {
+        let (Some(store), Some(namespace)) = (
+            self.artifact_store.as_ref(),
+            self.artifact_namespace.as_ref(),
+        ) else {
+            return Err(ArtifactError::Unavailable);
+        };
+        let Some(index) = transaction
+            .stages
+            .iter()
+            .position(|candidate| candidate == &stage)
+        else {
+            return Err(ArtifactError::ReceiptMismatch);
+        };
+        store.discard_staged(namespace.clone(), vec![stage]).await?;
+        transaction.stages.remove(index);
+        Ok(())
+    }
+
     async fn next_ref_expiry(&self) -> Option<Instant> {
         self.refs.lock().await.next_expiry()
     }
@@ -2316,9 +2339,10 @@ async fn handle_artifact_host_call(
             .stage_prepared(namespace.clone(), prepared)
             .await
             .map_err(|error| (map_artifact_error(error), "artifact write was rejected"))?;
+        state.stages.push(stage.clone());
         if *transaction_worker.cancellation.borrow() {
-            store
-                .discard_staged(namespace.clone(), vec![stage])
+            transaction_worker
+                .discard_recorded_artifact_stage(&mut state, stage)
                 .await
                 .map_err(|_| {
                     (
@@ -2340,8 +2364,8 @@ async fn handle_artifact_host_call(
         let value = match value {
             Ok(value) => value,
             Err(error) => {
-                if store
-                    .discard_staged(namespace.clone(), vec![stage])
+                if transaction_worker
+                    .discard_recorded_artifact_stage(&mut state, stage)
                     .await
                     .is_err()
                 {
@@ -2353,7 +2377,6 @@ async fn handle_artifact_host_call(
                 return Err(error);
             }
         };
-        state.stages.push(stage);
         Ok(value)
     });
     match transaction.await {
@@ -2603,9 +2626,10 @@ async fn handle_artifact_stream_host_call(
                     .finish_json_array(namespace.clone(), active.stream)
                     .await
                     .map_err(|error| (map_artifact_error(error), "artifact stream was rejected"))?;
+                state.stages.push(stage.clone());
                 if *transaction_worker.cancellation.borrow() {
-                    store
-                        .discard_staged(namespace.clone(), vec![stage])
+                    transaction_worker
+                        .discard_recorded_artifact_stage(&mut state, stage)
                         .await
                         .map_err(|_| {
                             (
@@ -2628,8 +2652,8 @@ async fn handle_artifact_stream_host_call(
                     receipt.media_type(),
                 );
                 if audit.append_artifact(&audit_record).is_err() {
-                    store
-                        .discard_staged(namespace.clone(), vec![stage])
+                    transaction_worker
+                        .discard_recorded_artifact_stage(&mut state, stage)
                         .await
                         .map_err(|_| {
                             (
@@ -2648,8 +2672,8 @@ async fn handle_artifact_stream_host_call(
                 let value = match value {
                     Ok(value) => value,
                     Err(error) => {
-                        store
-                            .discard_staged(namespace.clone(), vec![stage])
+                        transaction_worker
+                            .discard_recorded_artifact_stage(&mut state, stage)
                             .await
                             .map_err(|_| {
                                 (
@@ -2660,7 +2684,6 @@ async fn handle_artifact_stream_host_call(
                         return Err(error);
                     }
                 };
-                state.stages.push(stage);
                 Ok(value)
             }
             ArtifactWriteJsonStreamArguments::Abort { stream_id } => {
@@ -3255,6 +3278,7 @@ mod tests {
         entered: Notify,
         release: Notify,
         removed: Notify,
+        discard_failures: AtomicUsize,
     }
 
     struct CommitGatedArtifactStore {
@@ -3311,6 +3335,15 @@ mod tests {
             stages: Vec<ArtifactStage>,
         ) -> ArtifactFuture<'a, ()> {
             Box::pin(async move {
+                if self
+                    .discard_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(ArtifactError::Unavailable);
+                }
                 self.delegate.discard_staged(namespace, stages).await?;
                 self.removed.notify_one();
                 Ok(())
@@ -4810,7 +4843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aborted_artifact_write_finishes_fail_closed_and_removes_the_file() {
+    async fn aborted_artifact_write_retries_failed_immediate_cleanup() {
         let temporary = tempfile::tempdir().expect("tempdir");
         let artifact_root = temporary.path().join("artifacts");
         let store = Arc::new(GatedArtifactStore {
@@ -4818,6 +4851,7 @@ mod tests {
             entered: Notify::new(),
             release: Notify::new(),
             removed: Notify::new(),
+            discard_failures: AtomicUsize::new(1),
         });
         let audit = Arc::new(RecordingAudit::default());
         let application = Application::from_arcs(
