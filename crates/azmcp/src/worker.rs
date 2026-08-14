@@ -62,6 +62,9 @@ pub const HOST_METHOD_GRAPH: &str = "az.graph";
 pub const HOST_METHOD_METRICS_SINGLE: &str = "az.metrics.single";
 pub const HOST_METHOD_METRICS_BATCH: &str = "az.metrics.batch";
 pub const HOST_METHOD_LOGS_QUERY: &str = "az.logs.query";
+/// Parent-owned, context-gated JSON artifact output. JavaScript never receives
+/// a filesystem primitive or chooses a directory.
+pub const HOST_METHOD_ARTIFACT_WRITE_JSON: &str = "az.artifacts.writeJson";
 /// Internal worker-to-parent capability used by the JavaScript `az.ref`
 /// global. It is intentionally not an MCP tool.
 pub const HOST_METHOD_REF: &str = "az.ref";
@@ -1934,6 +1937,9 @@ const WORKER_BOOTSTRAP: &str = r#"
       logs: Object.freeze(Object.assign(Object.create(null), {
         query: (arguments) => hostCall("az.logs.query", arguments),
       })),
+      artifacts: Object.freeze(Object.assign(Object.create(null), {
+        writeJson: (arguments) => hostCall("az.artifacts.writeJson", arguments),
+      })),
     })),
     writable: false,
     configurable: false,
@@ -2090,6 +2096,7 @@ fn validate_host_call_request(request: &HostCallRequest) -> Result<(), String> {
         && request.method != HOST_METHOD_METRICS_SINGLE
         && request.method != HOST_METHOD_METRICS_BATCH
         && request.method != HOST_METHOD_LOGS_QUERY
+        && request.method != HOST_METHOD_ARTIFACT_WRITE_JSON
         && request.method != HOST_METHOD_REF
     {
         return Err("unknown host-call method".to_owned());
@@ -2317,6 +2324,12 @@ mod tests {
             ..request.clone()
         };
         assert!(validate_host_call_request(&ref_request).is_ok());
+        let artifact_request = HostCallRequest {
+            method: HOST_METHOD_ARTIFACT_WRITE_JSON.to_owned(),
+            arguments: json!({"name": "metrics.json", "value": {"rows": []}}),
+            ..request.clone()
+        };
+        assert!(validate_host_call_request(&artifact_request).is_ok());
         let sensitive_request = HostCallRequest {
             arguments: json!({
                 "refId": "ref_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -2537,7 +2550,7 @@ mod tests {
         bridge.begin_execution(11);
         let mut runtime = WorkerRuntime::new_with_host_bridge(bridge.clone()).unwrap();
         let mut execution = Box::pin(runtime.execute(
-            "Promise.all([az.request({n: 1}), az.graph({n: 2}), az.logs.query({n: 3})])",
+            "Promise.all([az.request({n: 1}), az.graph({n: 2}), az.logs.query({n: 3}), az.artifacts.writeJson({name: 'metrics.json', value: {n: 4}})])",
             Duration::from_secs(1),
         ));
         let result = loop {
@@ -2551,12 +2564,16 @@ mod tests {
                     assert_eq!(request.id, 11);
                     assert!(request.method == HOST_METHOD_REQUEST
                         || request.method == HOST_METHOD_GRAPH
-                        || request.method == HOST_METHOD_LOGS_QUERY);
+                        || request.method == HOST_METHOD_LOGS_QUERY
+                        || request.method == HOST_METHOD_ARTIFACT_WRITE_JSON);
                     request_tx.send(WorkerRequest::HostCallResult {
                         id: request.id,
                         call_id: request.call_id,
                         ok: true,
-                        value: Some(json!({"method": request.method, "n": request.arguments["n"]})),
+                        value: Some(json!({
+                            "method": request.method,
+                            "n": request.arguments.get("n").unwrap_or(&request.arguments["value"]["n"])
+                        })),
                         error: None,
                     }).await.unwrap();
                 }
@@ -2569,7 +2586,8 @@ mod tests {
             json!([
                 {"method": HOST_METHOD_REQUEST, "n": 1},
                 {"method": HOST_METHOD_GRAPH, "n": 2},
-                {"method": HOST_METHOD_LOGS_QUERY, "n": 3}
+                {"method": HOST_METHOD_LOGS_QUERY, "n": 3},
+                {"method": HOST_METHOD_ARTIFACT_WRITE_JSON, "n": 4}
             ])
         );
     }
