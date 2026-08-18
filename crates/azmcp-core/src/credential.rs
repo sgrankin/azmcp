@@ -440,7 +440,7 @@ pub struct AzureCliProbe {
 }
 
 impl AzureCliProbe {
-    /// The exact `azure-cli` version reported by the startup probe.
+    /// The exact `azure-cli` version reported by the capability probe.
     pub fn version(&self) -> &str {
         &self.version
     }
@@ -464,6 +464,7 @@ pub struct AzureCliBroker {
     executable: PathBuf,
     timeout: Duration,
     correlation_id: String,
+    probe: Arc<Mutex<Option<AzureCliProbe>>>,
     cache: Arc<Mutex<BTreeMap<TokenRequest, AccessToken>>>,
 }
 
@@ -507,6 +508,7 @@ impl AzureCliBroker {
             executable,
             timeout,
             correlation_id,
+            probe: Arc::new(Mutex::new(None)),
             cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -524,10 +526,21 @@ impl AzureCliBroker {
     /// Probe the configured Azure CLI without reading account state or
     /// acquiring a token.
     ///
-    /// The probe validates the exact command shape used by this broker and
-    /// gates production startup on Azure CLI 2.89.0 or newer, which is the
-    /// first reviewed release with agent-session attribution support.
+    /// The first successful probe is cached for this broker. Failures are not
+    /// cached, so a caller can repair or replace the CLI and retry without
+    /// restarting the embedding process. Token acquisition invokes this lazily
+    /// before spawning its first credential request.
     pub async fn probe(&self) -> Result<AzureCliProbe, CredentialError> {
+        let _process_guard = process_mutex().lock().await;
+        self.probe_with_process_lock().await
+    }
+
+    async fn probe_with_process_lock(&self) -> Result<AzureCliProbe, CredentialError> {
+        let mut cached = self.probe.lock().await;
+        if let Some(probe) = cached.as_ref() {
+            return Ok(probe.clone());
+        }
+
         let mut command = self.base_command();
         command
             .args(["version", "--output", "json", "--only-show-errors"])
@@ -559,10 +572,12 @@ impl AzureCliBroker {
             return Err(CredentialError::UnsupportedCli);
         }
 
-        Ok(AzureCliProbe {
+        let probe = AzureCliProbe {
             version,
             agent_session_attribution_active: true,
-        })
+        };
+        *cached = Some(probe.clone());
+        Ok(probe)
     }
 
     /// Acquire a token for an explicit cloud, tenant, subscription, and
@@ -582,6 +597,7 @@ impl AzureCliBroker {
             return Ok(token);
         }
 
+        self.probe_with_process_lock().await?;
         let token = self.spawn_and_parse(&request).await?;
         if token.is_fresh(SystemTime::now()) {
             let mut cache = self.cache.lock().await;
@@ -1225,7 +1241,7 @@ mod tests {
     ) -> PathBuf {
         let executable = directory.path().join("fake-az");
         let script = format!(
-            "#!/bin/sh\n{}{}printf '%s' '{}'\nprintf '%s' '{}' >&2\nexit {}\n",
+            "#!/bin/sh\nif [ \"$1\" = version ]; then printf '%s\\n' version >> \"$(dirname \"$0\")/probe.log\"; printf '%s' '{{\"azure-cli\":\"2.89.0\"}}'; exit 0; fi\n{}{}printf '%s' '{}'\nprintf '%s' '{}' >&2\nexit {}\n",
             sleep_seconds.map_or(String::new(), |seconds| format!("sleep {seconds}\n")),
             "printf '%s\\n' \"$AZURE_CLOUD_NAME|$COPILOT_AGENT_SESSION_ID|$HTTP_PROXY|$AZURE_CLIENT_SECRET|$*\" >> \"$(dirname \"$0\")/argv.log\"\n",
             body.replace('\'', "'\\''"),
@@ -1250,7 +1266,7 @@ mod tests {
     ) -> PathBuf {
         let executable = directory.path().join("fake-az-by-subscription");
         let script = format!(
-            "#!/bin/sh\ncase \"$*\" in\n*{first_subscription}*) printf '%s' '{first_body}' ;;\n*{second_subscription}*) printf '%s' '{second_body}' ;;\n*) exit 1 ;;\nesac\n",
+            "#!/bin/sh\nif [ \"$1\" = version ]; then printf '%s' '{{\"azure-cli\":\"2.89.0\"}}'; exit 0; fi\ncase \"$*\" in\n*{first_subscription}*) printf '%s' '{first_body}' ;;\n*{second_subscription}*) printf '%s' '{second_body}' ;;\n*) exit 1 ;;\nesac\n",
             first_body = first_body.replace('\'', "'\\''"),
             second_body = second_body.replace('\'', "'\\''"),
         );
@@ -1359,6 +1375,14 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&log).expect("fake log").lines().count(),
             1
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("probe.log"))
+                .expect("probe log")
+                .lines()
+                .count(),
+            1,
+            "a successful capability probe is cached"
         );
     }
 
@@ -1704,7 +1728,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_probe_requires_supported_cli_and_never_requests_a_token() {
+    async fn probe_requires_supported_cli_and_never_requests_a_token() {
         let directory = tempfile::tempdir().expect("temporary fake directory");
         let executable = fake_az_version(
             &directory,
@@ -1737,6 +1761,81 @@ mod tests {
         .await
         .expect_err("malformed version is rejected");
         assert_eq!(error.code(), CredentialErrorCode::UnsupportedCli);
+    }
+
+    #[tokio::test]
+    async fn token_acquisition_retries_a_lazy_probe_after_cli_repair() {
+        let directory = tempfile::tempdir().expect("temporary fake directory");
+        let executable = directory.path().join("fake-az");
+        let broker =
+            AzureCliBroker::with_correlation_id(&executable, DEFAULT_TIMEOUT, "repair-test")
+                .expect("valid correlation id");
+
+        let error = broker
+            .acquire(request())
+            .await
+            .expect_err("missing CLI fails at first credential use");
+        assert_eq!(error.code(), CredentialErrorCode::SpawnFailed);
+
+        let access_token = jwt_token(TENANT_A, OID_A, CLIENT_A);
+        fake_az(
+            &directory,
+            &cli_body(&access_token, SUBSCRIPTION_A, TENANT_A, None),
+            "",
+            0,
+            None,
+        );
+        let token = broker
+            .acquire(request())
+            .await
+            .expect("same broker retries after external CLI repair");
+        assert_eq!(token.token(), access_token);
+    }
+
+    #[tokio::test]
+    async fn token_acquisition_retries_after_external_login_without_reprobing() {
+        let directory = tempfile::tempdir().expect("temporary fake directory");
+        let executable = fake_az(
+            &directory,
+            "",
+            "Please run az login before requesting a token",
+            1,
+            None,
+        );
+        let broker =
+            AzureCliBroker::with_correlation_id(&executable, DEFAULT_TIMEOUT, "login-test")
+                .expect("valid correlation id");
+
+        let error = broker
+            .acquire(request())
+            .await
+            .expect_err("unauthenticated CLI fails at first credential use");
+        assert!(matches!(
+            error,
+            CredentialError::AuthenticationRequired { .. }
+        ));
+
+        let access_token = jwt_token(TENANT_A, OID_A, CLIENT_A);
+        fake_az(
+            &directory,
+            &cli_body(&access_token, SUBSCRIPTION_A, TENANT_A, None),
+            "",
+            0,
+            None,
+        );
+        let token = broker
+            .acquire(request())
+            .await
+            .expect("same broker retries after external login repair");
+        assert_eq!(token.token(), access_token);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("probe.log"))
+                .expect("probe log")
+                .lines()
+                .count(),
+            1,
+            "login repair reuses the successful capability probe"
+        );
     }
 
     #[test]

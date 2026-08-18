@@ -317,7 +317,7 @@ fn tool_result<T: Serialize>(result: Result<T, AppError>) -> Result<CallToolResp
             domain_error_result(
                 error.code(),
                 app_error_message(&error).as_ref(),
-                matches!(error.code(), "upstream_error" | "worker_crashed"),
+                error.retryable(),
                 details,
             )
         }
@@ -421,7 +421,9 @@ fn app_error_message(error: &AppError) -> Cow<'static, str> {
     Cow::Borrowed(match error.code() {
         "invalid_request" => "request is outside the implemented v0 contract",
         "account_ambiguous" => "Azure account binding is missing or ambiguous",
-        "authentication_required" => "Azure CLI account discovery is unavailable",
+        "authentication_required" => {
+            "Azure CLI account profile is unavailable; authenticate the intended cloud and tenant with az login, then retry"
+        }
         "subscription_mismatch" => "subscription binding validation failed",
         "context_busy" => "another run is already active in this context",
         "context_evicted" => "the execution context no longer exists",

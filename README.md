@@ -237,10 +237,14 @@ without monopolizing the standard root across Codex processes.
 Profile discovery uses `AZMCP_AZURE_PROFILE`, then
 `$AZURE_CONFIG_DIR/azureProfile.json`, then
 `$HOME/.azure/azureProfile.json`. The credential subprocess is selected with
-`AZMCP_AZ_EXECUTABLE`, defaulting to `az`. Startup runs only the bounded,
-non-authenticating `az version --output json --only-show-errors` probe and
-requires Azure CLI 2.89.0 or newer. The server never performs login or changes
-Azure CLI configuration.
+`AZMCP_AZ_EXECUTABLE`, defaulting to `az`. MCP startup, discovery, tool listing,
+and cached profile discovery do not invoke Azure CLI. The first operation that
+needs a token runs the bounded, non-authenticating
+`az version --output json --only-show-errors` probe and requires Azure CLI
+2.89.0 or newer. A successful probe is cached; a failure is not, so the caller
+can repair the CLI or run the instructed `az login` externally and retry without
+restarting the MCP server. The server never performs login or changes Azure CLI
+configuration.
 
 The durable, redacted JSONL request log defaults to
 `$XDG_STATE_HOME/azmcp/requests.jsonl`, or

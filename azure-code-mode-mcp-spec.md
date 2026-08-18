@@ -425,8 +425,11 @@ its cache format and lock protocol, and preserves its current agent-session toke
 
 Requirements:
 
-- Require a tested Azure CLI version and probe the command shape at startup. Agent-session
-  attribution via `COPILOT_AGENT_SESSION_ID` is version-gated; report whether it is active.
+- Require a tested Azure CLI version and probe the command shape lazily before the first
+  credential acquisition. MCP discovery and tool listing must not depend on Azure CLI or
+  login state. Cache only a successful probe so a caller can repair the CLI environment or
+  login externally and retry without restarting the MCP server. Agent-session attribution
+  via `COPILOT_AGENT_SESSION_ID` is version-gated; report whether it is active.
 - Forward a validated inherited `COPILOT_AGENT_SESSION_ID` when the MCP host supplied one;
   otherwise generate a separate non-secret agent correlation ID. Never expose or reuse the
   bearer `contextId` as telemetry or an environment value passed to another process.
@@ -446,7 +449,8 @@ Requirements:
   mid-context, evict the context rather than switching identity silently.
 - On authentication failure, return a targeted
   `AZURE_CLOUD_NAME=<cloud> az login --tenant <tenant>` instruction. Do not start an
-  interactive login from the MCP server.
+  interactive login from the MCP server. Mark externally repairable CLI and login failures
+  as retryable; retry the original tool call in the same server process after repair.
 
 `azureProfile.json` remains the discovery source. Decode an optional UTF-8 BOM rather than
 requiring one, index the full subscription list by `(environmentName, tenantId,

@@ -30,10 +30,6 @@ pub async fn production_application() -> anyhow::Result<Application> {
     let broker = Arc::new(AzureCliBroker::new(
         std::env::var_os("AZMCP_AZ_EXECUTABLE").unwrap_or_else(|| OsString::from("az")),
     ));
-    let cli_probe = broker.probe().await?;
-    if !cli_probe.agent_session_attribution_active() {
-        anyhow::bail!("Azure CLI agent-session attribution is unavailable");
-    }
     let policy = routes::v0_policy()?;
     let schema_index = Arc::new(azmcp_core::schema::SchemaIndex::v0(&policy)?);
     let clients: Arc<dyn HttpClientFactory> =

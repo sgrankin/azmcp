@@ -1827,6 +1827,23 @@ fn map_http_error(error: HttpError, binding: &ResolvedCloudBinding) -> HostError
             ),
             true,
         ),
+        HttpError::Credential(CredentialError::SpawnFailed { .. }) => HostError::new(
+            HostErrorCode::AuthenticationRequired,
+            "Azure CLI could not be started; make it available to the MCP process or configure AZMCP_AZ_EXECUTABLE, then retry",
+            true,
+        ),
+        HttpError::Credential(CredentialError::UnsupportedCli) => HostError::new(
+            HostErrorCode::AuthenticationRequired,
+            "Azure CLI 2.89.0 or newer is required; upgrade Azure CLI or configure AZMCP_AZ_EXECUTABLE, then retry",
+            true,
+        ),
+        HttpError::Credential(
+            CredentialError::Timeout { .. } | CredentialError::OutputReadFailed { .. },
+        ) => HostError::new(
+            HostErrorCode::AuthenticationRequired,
+            "Azure CLI credential acquisition did not complete; fix the CLI environment, then retry",
+            true,
+        ),
         HttpError::Credential(_) => HostError::new(
             HostErrorCode::AuthenticationRequired,
             "Azure authentication is unavailable",
@@ -2682,6 +2699,34 @@ mod tests {
             decode_logs_query_response(oversized).unwrap_err().code,
             HostErrorCode::ResponseTooLarge
         );
+    }
+
+    #[test]
+    fn unavailable_cli_errors_are_actionable_and_retryable() {
+        let binding = binding(AzureCloud::AzureCloud, false);
+        let cases = [
+            (
+                CredentialError::SpawnFailed {
+                    kind: std::io::ErrorKind::NotFound,
+                },
+                "Azure CLI could not be started",
+            ),
+            (
+                CredentialError::UnsupportedCli,
+                "Azure CLI 2.89.0 or newer is required",
+            ),
+            (
+                CredentialError::Timeout { timeout_ms: 1 },
+                "Azure CLI credential acquisition did not complete",
+            ),
+        ];
+
+        for (credential_error, message) in cases {
+            let error = map_http_error(HttpError::Credential(credential_error), &binding);
+            assert_eq!(error.code, HostErrorCode::AuthenticationRequired);
+            assert!(error.retryable);
+            assert!(error.message.contains(message));
+        }
     }
 
     #[tokio::test]

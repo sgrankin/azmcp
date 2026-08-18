@@ -60,6 +60,14 @@ use crate::{
 /// A boxed, sendable future used instead of an async-trait dependency.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Stable causes for an unavailable local Azure CLI credential boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthenticationUnavailableReason {
+    CliMissing,
+    CliUnsupported,
+    CliIncomplete,
+}
+
 /// Dependency failures are intentionally opaque at the application boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DependencyError {
@@ -75,6 +83,7 @@ pub enum DependencyError {
         cloud_name: String,
         tenant_id: String,
     },
+    AuthenticationUnavailable(AuthenticationUnavailableReason),
     PrincipalMismatch,
 }
 
@@ -351,14 +360,29 @@ impl AppErrorCode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppError {
     code: AppErrorCode,
+    retryable: bool,
     result_too_large: Option<Box<ResultTooLargeSummary>>,
     authentication_message: Option<String>,
 }
 
 impl AppError {
     const fn new(code: AppErrorCode) -> Self {
+        let retryable = matches!(
+            code,
+            AppErrorCode::ProfileUnavailable
+                | AppErrorCode::ProfileInvalid
+                | AppErrorCode::RegistryCapacity
+                | AppErrorCode::WorkerStartFailed
+                | AppErrorCode::WorkerMissing
+                | AppErrorCode::WorkerExecuteFailed
+                | AppErrorCode::WorkerCloseFailed
+                | AppErrorCode::CorrelationUnavailable
+                | AppErrorCode::AuthenticationRequired
+                | AppErrorCode::UpstreamError
+        );
         Self {
             code,
+            retryable,
             result_too_large: None,
             authentication_message: None,
         }
@@ -367,6 +391,7 @@ impl AppError {
     fn result_too_large(summary: Box<ResultTooLargeSummary>) -> Self {
         Self {
             code: AppErrorCode::ResultTooLarge,
+            retryable: false,
             result_too_large: Some(summary),
             authentication_message: None,
         }
@@ -375,6 +400,7 @@ impl AppError {
     fn authentication_required(cloud_name: String, tenant_id: String) -> Self {
         Self {
             code: AppErrorCode::AuthenticationRequired,
+            retryable: true,
             result_too_large: None,
             authentication_message: Some(format!(
                 "Azure CLI authentication is required; run AZURE_CLOUD_NAME={cloud_name} az login --tenant {tenant_id}"
@@ -382,12 +408,28 @@ impl AppError {
         }
     }
 
-    fn authentication_required_message(message: String) -> Self {
+    fn authentication_required_message(message: String, retryable: bool) -> Self {
         Self {
             code: AppErrorCode::AuthenticationRequired,
+            retryable,
             result_too_large: None,
             authentication_message: Some(message),
         }
+    }
+
+    fn authentication_unavailable(reason: AuthenticationUnavailableReason) -> Self {
+        let message = match reason {
+            AuthenticationUnavailableReason::CliMissing => {
+                "Azure CLI could not be started; make it available to the MCP process or configure AZMCP_AZ_EXECUTABLE, then retry context creation"
+            }
+            AuthenticationUnavailableReason::CliUnsupported => {
+                "Azure CLI 2.89.0 or newer is required; upgrade Azure CLI or configure AZMCP_AZ_EXECUTABLE, then retry context creation"
+            }
+            AuthenticationUnavailableReason::CliIncomplete => {
+                "Azure CLI credential validation did not complete; fix the CLI environment, then retry context creation"
+            }
+        };
+        Self::authentication_required_message(message.to_owned(), true)
     }
 
     /// Return the stable machine-readable error code.
@@ -398,6 +440,11 @@ impl AppError {
     /// Return the typed failure category.
     pub const fn kind(&self) -> AppErrorCode {
         self.code
+    }
+
+    /// Whether retrying after an external or transient repair can succeed.
+    pub const fn retryable(&self) -> bool {
+        self.retryable
     }
 
     /// Return the shape-only result summary, when the result exceeded a
@@ -1426,12 +1473,18 @@ impl Application {
                     cloud_name,
                     tenant_id,
                 }) => return Err(AppError::authentication_required(cloud_name, tenant_id)),
+                Err(DependencyError::AuthenticationUnavailable(reason)) => {
+                    return Err(AppError::authentication_unavailable(reason));
+                }
                 Err(DependencyError::PrincipalMismatch) => {
-                    return Err(AppError::authentication_required_message(format!(
-                        "Azure authentication identity changed while validating context bindings; run AZURE_CLOUD_NAME={} az login --tenant {} and retry context creation",
-                        binding.cloud(),
-                        binding.tenant_id(),
-                    )));
+                    return Err(AppError::authentication_required_message(
+                        format!(
+                            "Azure authentication identity changed while validating context bindings; run AZURE_CLOUD_NAME={} az login --tenant {} and retry context creation",
+                            binding.cloud(),
+                            binding.tenant_id(),
+                        ),
+                        false,
+                    ));
                 }
                 Err(_) if validation_error.is_none() => {
                     validation_error = Some(AppErrorCode::BindingValidationFailed);
@@ -1646,6 +1699,7 @@ impl Application {
                 .unwrap_or_else(|| {
                     AppError::authentication_required_message(
                         "Azure authentication identity changed during the context lifetime; authenticate the intended Azure CLI identity and open a new context".to_owned(),
+                        false,
                     )
                 });
             let _ = self.inner.registry.close(id.as_str());
@@ -2177,6 +2231,19 @@ fn map_http_dependency_error(error: HttpError) -> DependencyError {
         HttpError::Credential(CredentialError::PrincipalMismatch) => {
             DependencyError::PrincipalMismatch
         }
+        HttpError::Credential(CredentialError::SpawnFailed { .. }) => {
+            DependencyError::AuthenticationUnavailable(AuthenticationUnavailableReason::CliMissing)
+        }
+        HttpError::Credential(CredentialError::UnsupportedCli) => {
+            DependencyError::AuthenticationUnavailable(
+                AuthenticationUnavailableReason::CliUnsupported,
+            )
+        }
+        HttpError::Credential(
+            CredentialError::Timeout { .. } | CredentialError::OutputReadFailed { .. },
+        ) => DependencyError::AuthenticationUnavailable(
+            AuthenticationUnavailableReason::CliIncomplete,
+        ),
         _ => DependencyError::Failed,
     }
 }
@@ -2228,6 +2295,9 @@ fn map_worker_dependency(error: DependencyError) -> AppError {
             cloud_name,
             tenant_id,
         } => AppError::authentication_required(cloud_name, tenant_id),
+        DependencyError::AuthenticationUnavailable(reason) => {
+            AppError::authentication_unavailable(reason)
+        }
         DependencyError::PrincipalMismatch
         | DependencyError::WorkerCrashed
         | DependencyError::Failed
@@ -2260,7 +2330,7 @@ fn map_host_error(error: crate::host::HostError) -> AppError {
         error.code,
         HostErrorCode::AuthenticationRequired | HostErrorCode::PrincipalMismatch
     ) {
-        AppError::authentication_required_message(error.message)
+        AppError::authentication_required_message(error.message, error.retryable)
     } else {
         AppError::new(code)
     }
@@ -4106,6 +4176,7 @@ mod tests {
             .await
             .expect_err("the second validation token changes identity");
         assert_eq!(error.kind(), AppErrorCode::AuthenticationRequired);
+        assert!(!error.retryable());
         assert!(error.authentication_message().is_some_and(|message| {
             message.contains(
                 "AZURE_CLOUD_NAME=AzureCloud az login --tenant aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
@@ -5428,6 +5499,7 @@ mod tests {
         });
 
         assert_eq!(error.kind(), AppErrorCode::AuthenticationRequired);
+        assert!(!error.retryable());
         assert_eq!(error.authentication_message(), Some(message.as_str()));
     }
 }

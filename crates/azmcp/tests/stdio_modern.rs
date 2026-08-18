@@ -3,7 +3,6 @@
 use std::{
     fs,
     io::Write as _,
-    os::unix::fs::PermissionsExt as _,
     process::{Command, Stdio},
 };
 
@@ -18,14 +17,13 @@ fn metadata() -> Value {
 }
 
 #[test]
-fn built_server_uses_standard_paths_for_modern_synthetic_accounts() {
+fn built_server_starts_without_azure_cli_for_offline_tools() {
     let directory = tempfile::tempdir().expect("tempdir");
     let config = directory.path().join(".config/azmcp/config.toml");
     let profile = directory.path().join(".azure/azureProfile.json");
     let audit = directory.path().join(".local/state/azmcp/requests.jsonl");
     let artifacts = directory.path().join(".local/share/azmcp/artifacts");
-    let az_marker = directory.path().join("fake-az-invoked");
-    let fake_az = directory.path().join("fake-az");
+    let missing_az = directory.path().join("missing-az");
     fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
     fs::create_dir_all(profile.parent().expect("profile parent")).expect("profile directory");
     fs::write(&config, "").expect("config");
@@ -34,24 +32,10 @@ fn built_server_uses_standard_paths_for_modern_synthetic_accounts() {
         br#"{"subscriptions":[{"id":"11111111-1111-1111-1111-111111111111","name":"synthetic","state":"Enabled","tenantId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","environmentName":"AzureCloud","user":{"name":"test@example.invalid"}}]}"#,
     )
     .expect("profile");
-    fs::write(
-        &fake_az,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = version ]; then printf '{{\"azure-cli\":\"2.89.0\"}}'; exit 0; fi\nprintf invoked > '{}'\nexit 97\n",
-            az_marker.display()
-        ),
-    )
-    .expect("fake az");
-    let mut permissions = fs::metadata(&fake_az)
-        .expect("fake az metadata")
-        .permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&fake_az, permissions).expect("fake az permissions");
-
     let mut child = Command::new(env!("CARGO_BIN_EXE_azmcp"))
         .env_clear()
         .env("HOME", directory.path())
-        .env("AZMCP_AZ_EXECUTABLE", &fake_az)
+        .env("AZMCP_AZ_EXECUTABLE", &missing_az)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -123,8 +107,8 @@ fn built_server_uses_standard_paths_for_modern_synthetic_accounts() {
         "11111111-1111-1111-1111-111111111111"
     );
     assert!(
-        !az_marker.exists(),
-        "account discovery must not invoke Azure CLI"
+        !missing_az.exists(),
+        "startup and offline tools must not require Azure CLI"
     );
     assert!(
         !audit.exists(),
@@ -133,5 +117,58 @@ fn built_server_uses_standard_paths_for_modern_synthetic_accounts() {
     assert!(
         !artifacts.exists(),
         "startup and profile-only discovery must not create artifact storage"
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_azmcp"))
+        .env_clear()
+        .env("HOME", directory.path())
+        .env("AZMCP_AZ_EXECUTABLE", &missing_az)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn azmcp for deferred credential failure");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "azure_context_open",
+            "arguments": {},
+            "_meta": metadata()
+        }
+    });
+    serde_json::to_writer(child.stdin.as_mut().expect("child stdin"), &request)
+        .expect("write context-open request");
+    child
+        .stdin
+        .as_mut()
+        .expect("child stdin")
+        .write_all(b"\n")
+        .expect("request delimiter");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("wait for azmcp");
+    assert!(
+        output.status.success(),
+        "azmcp stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = serde_json::from_slice::<Value>(&output.stdout).expect("JSON-RPC response");
+    let result = &response["result"];
+    assert_eq!(result["isError"], true);
+    assert_eq!(
+        result["structuredContent"]["code"],
+        "authentication_required"
+    );
+    assert_eq!(result["structuredContent"]["retryable"], true);
+    assert!(
+        result["structuredContent"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Azure CLI could not be started"))
+    );
+    assert!(
+        !artifacts.exists(),
+        "a deferred credential failure must not create artifact storage"
     );
 }
