@@ -415,7 +415,7 @@ fn result_too_large_details(summary: &ResultTooLargeSummary) -> Value {
 }
 
 fn app_error_message(error: &AppError) -> Cow<'static, str> {
-    if let Some(message) = error.authentication_message() {
+    if let Some(message) = error.message() {
         return Cow::Owned(message.to_owned());
     }
     Cow::Borrowed(match error.code() {

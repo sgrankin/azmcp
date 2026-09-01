@@ -362,7 +362,7 @@ pub struct AppError {
     code: AppErrorCode,
     retryable: bool,
     result_too_large: Option<Box<ResultTooLargeSummary>>,
-    authentication_message: Option<String>,
+    message: Option<String>,
 }
 
 impl AppError {
@@ -384,7 +384,7 @@ impl AppError {
             code,
             retryable,
             result_too_large: None,
-            authentication_message: None,
+            message: None,
         }
     }
 
@@ -393,7 +393,7 @@ impl AppError {
             code: AppErrorCode::ResultTooLarge,
             retryable: false,
             result_too_large: Some(summary),
-            authentication_message: None,
+            message: None,
         }
     }
 
@@ -402,19 +402,23 @@ impl AppError {
             code: AppErrorCode::AuthenticationRequired,
             retryable: true,
             result_too_large: None,
-            authentication_message: Some(format!(
+            message: Some(format!(
                 "Azure CLI authentication is required; run AZURE_CLOUD_NAME={cloud_name} az login --tenant {tenant_id}"
             )),
         }
     }
 
-    fn authentication_required_message(message: String, retryable: bool) -> Self {
+    fn with_message(code: AppErrorCode, message: String, retryable: bool) -> Self {
         Self {
-            code: AppErrorCode::AuthenticationRequired,
+            code,
             retryable,
             result_too_large: None,
-            authentication_message: Some(message),
+            message: Some(message),
         }
+    }
+
+    fn authentication_required_message(message: String, retryable: bool) -> Self {
+        Self::with_message(AppErrorCode::AuthenticationRequired, message, retryable)
     }
 
     fn authentication_unavailable(reason: AuthenticationUnavailableReason) -> Self {
@@ -453,8 +457,8 @@ impl AppError {
         self.result_too_large.as_deref()
     }
 
-    pub(crate) fn authentication_message(&self) -> Option<&str> {
-        self.authentication_message.as_deref()
+    pub(crate) fn message(&self) -> Option<&str> {
+        self.message.as_deref()
     }
 }
 
@@ -2326,14 +2330,7 @@ fn map_host_error(error: crate::host::HostError) -> AppError {
         | HostErrorCode::InvalidResponse
         | HostErrorCode::ProtocolError => AppErrorCode::InvalidInput,
     };
-    if matches!(
-        error.code,
-        HostErrorCode::AuthenticationRequired | HostErrorCode::PrincipalMismatch
-    ) {
-        AppError::authentication_required_message(error.message, error.retryable)
-    } else {
-        AppError::new(code)
-    }
+    AppError::with_message(code, error.message, error.retryable)
 }
 
 #[derive(Deserialize)]
@@ -4177,7 +4174,7 @@ mod tests {
             .expect_err("the second validation token changes identity");
         assert_eq!(error.kind(), AppErrorCode::AuthenticationRequired);
         assert!(!error.retryable());
-        assert!(error.authentication_message().is_some_and(|message| {
+        assert!(error.message().is_some_and(|message| {
             message.contains(
                 "AZURE_CLOUD_NAME=AzureCloud az login --tenant aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             )
@@ -5500,6 +5497,20 @@ mod tests {
 
         assert_eq!(error.kind(), AppErrorCode::AuthenticationRequired);
         assert!(!error.retryable());
-        assert_eq!(error.authentication_message(), Some(message.as_str()));
+        assert_eq!(error.message(), Some(message.as_str()));
+    }
+
+    #[test]
+    fn upstream_host_error_preserves_message_and_retryability() {
+        let message = "Logs Query returned HTTP 400: BadArgumentError: Syntax Error".to_owned();
+        let error = map_host_error(crate::host::HostError {
+            code: crate::host::HostErrorCode::UpstreamError,
+            message: message.clone(),
+            retryable: false,
+        });
+
+        assert_eq!(error.kind(), AppErrorCode::UpstreamError);
+        assert!(!error.retryable());
+        assert_eq!(error.message(), Some(message.as_str()));
     }
 }

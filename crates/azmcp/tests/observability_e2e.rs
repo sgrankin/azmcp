@@ -54,6 +54,8 @@ const CLIENT: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
 const TOKEN: &str = "synthetic-e2e-token";
 const METRIC: &str = "E2E Secret Metric";
 const KQL: &str = "E2E_SECRET_KQL | take 1";
+const INVALID_KQL: &str = "E2E_INVALID_KQL";
+const LOGS_REQUEST_ID: &str = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
 
 #[derive(Default)]
 struct FakeCredentials {
@@ -341,6 +343,35 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
             RUN_TOOL,
             json!({
                 "contextId": context_id,
+                "code": format!(r#"az.logs.query({{
+                    cloud: "AzureCloud",
+                    workspaceId: "{WORKSPACE}",
+                    query: "{INVALID_KQL}",
+                    timespan: "PT1H"
+                }})"#),
+                "timeoutMs": 5_000,
+            }),
+        ))
+        .await
+        .expect("send failing Logs run");
+    let failed = receive_tool_result(&mut client, 3).await;
+    assert_eq!(failed.is_error, Some(true));
+    let failed = failed.structured_content.expect("Logs domain error");
+    assert_eq!(failed["code"], "upstream_error");
+    assert_eq!(failed["retryable"], false);
+    assert_eq!(
+        failed["message"],
+        format!(
+            "Logs Query returned HTTP 400: BadArgumentError: The request had some invalid properties; SyntaxError: Syntax Error at position [1,4] (request ID {LOGS_REQUEST_ID})"
+        )
+    );
+
+    client
+        .send(tool_request(
+            4,
+            RUN_TOOL,
+            json!({
+                "contextId": context_id,
                 "code": r#"az.artifacts.writeJsonArray({
                     name: "large-series.json.lz4",
                     compression: "lz4",
@@ -355,7 +386,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         ))
         .await
         .expect("send large artifact run");
-    let large = receive_tool_result(&mut client, 3).await;
+    let large = receive_tool_result(&mut client, 4).await;
     assert_eq!(large.is_error, Some(false));
     let large = large.structured_content.expect("large artifact result");
     assert!(large["value"]["logicalBytes"].as_u64().unwrap() > 480 * 1024);
@@ -377,13 +408,13 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
 
     client
         .send(tool_request(
-            4,
+            5,
             RUN_TOOL,
             json!({"contextId": context_id, "code": "e2eCounter + 1"}),
         ))
         .await
         .expect("send persistence run");
-    let persisted = receive_tool_result(&mut client, 4).await;
+    let persisted = receive_tool_result(&mut client, 5).await;
     assert_eq!(persisted.is_error, Some(false));
     let persisted = persisted.structured_content.expect("persistence result");
     assert_eq!(persisted["value"], 42);
@@ -391,25 +422,25 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
 
     client
         .send(tool_request(
-            5,
+            6,
             CONTEXT_CLOSE_TOOL,
             json!({"contextId": context_id}),
         ))
         .await
         .expect("send close");
-    let closed = receive_tool_result(&mut client, 5).await;
+    let closed = receive_tool_result(&mut client, 6).await;
     assert_eq!(closed.is_error, Some(false));
     assert_eq!(closed.structured_content, Some(json!({"closed": true})));
 
     client
         .send(tool_request(
-            6,
+            7,
             RUN_TOOL,
             json!({"contextId": context_id, "code": "e2eCounter"}),
         ))
         .await
         .expect("send post-close run");
-    let evicted = receive_tool_result(&mut client, 6).await;
+    let evicted = receive_tool_result(&mut client, 7).await;
     assert_eq!(evicted.is_error, Some(true));
     assert_eq!(
         evicted.structured_content.expect("domain error")["code"],
@@ -433,7 +464,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    assert_eq!(token_requests.len(), 3);
+    assert_eq!(token_requests.len(), 4);
     assert_eq!(
         token_requests
             .iter()
@@ -446,7 +477,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
             .iter()
             .filter(|request| request.audience == TokenAudience::LogAnalytics)
             .count(),
-        1
+        2
     );
     for request in token_requests.iter() {
         assert_eq!(request.cloud, AzureCloud::AzureCloud);
@@ -461,13 +492,13 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         request.audience == TokenAudience::LogAnalytics
             && request.resource() == "https://api.loganalytics.io"
     }));
-    assert_eq!(audit.prepares.load(Ordering::SeqCst), 6);
+    assert_eq!(audit.prepares.load(Ordering::SeqCst), 7);
     let records = audit
         .records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    assert_eq!(records.len(), 3);
+    assert_eq!(records.len(), 4);
     assert!(
         records
             .iter()
@@ -488,8 +519,21 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
             .iter()
             .any(|record| record.operation == "az.logs.query")
     );
+    assert!(records.iter().any(|record| {
+        record.operation == "az.logs.query"
+            && record.status == Some(400)
+            && record.reason.as_deref() == Some("upstream_error")
+    }));
     let encoded_audit = serde_json::to_string(&records).expect("audit JSON");
-    for secret in [TOKEN, METRIC, KQL, WORKSPACE, "e2e-rg", "e2e-vm"] {
+    for secret in [
+        TOKEN,
+        METRIC,
+        KQL,
+        INVALID_KQL,
+        WORKSPACE,
+        "e2e-rg",
+        "e2e-vm",
+    ] {
         assert!(!encoded_audit.contains(secret), "audit disclosed {secret}");
     }
     let artifact_records = audit
@@ -544,7 +588,7 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
         .await
         .expect("all loopback calls reached the simulator")
         .expect("loopback task");
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert!(requests.iter().all(|request| {
         request
             .to_ascii_lowercase()
@@ -564,6 +608,10 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
     assert!(requests.iter().any(|request| {
         request.starts_with(&format!("POST /v1/workspaces/{WORKSPACE}/query HTTP/1.1"))
             && request.contains(KQL)
+    }));
+    assert!(requests.iter().any(|request| {
+        request.starts_with(&format!("POST /v1/workspaces/{WORKSPACE}/query HTTP/1.1"))
+            && request.contains(INVALID_KQL)
     }));
 
     drop(client);
@@ -650,6 +698,8 @@ async fn synthetic_upstream() -> (String, tokio::task::JoinHandle<Vec<String>>) 
         for handler in handlers {
             requests.push(handler.await.expect("upstream handler"));
         }
+        let error_stream = accept_loopback(&listener).await;
+        requests.push(handle_logs_error(error_stream).await);
         requests
     });
     (format!("http://{address}/"), task)
@@ -703,6 +753,36 @@ async fn handle_upstream_request(
         .await
         .expect("write response headers");
     stream.write_all(&body).await.expect("write response body");
+    request
+}
+
+async fn handle_logs_error(mut stream: TcpStream) -> String {
+    let request = read_http_request(&mut stream).await;
+    assert!(request.starts_with(&format!("POST /v1/workspaces/{WORKSPACE}/query HTTP/1.1")));
+    assert!(request.contains(INVALID_KQL));
+    let body = serde_json::to_vec(&json!({
+        "error": {
+            "code": "BadArgumentError",
+            "message": "The request had some invalid properties",
+            "innererror": {
+                "code": "SyntaxError",
+                "message": "Syntax Error\nat position [1,4]"
+            }
+        }
+    }))
+    .expect("error response JSON");
+    let response = format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Ms-Request-Id: {LOGS_REQUEST_ID}\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .expect("write error response headers");
+    stream
+        .write_all(&body)
+        .await
+        .expect("write error response body");
     request
 }
 

@@ -65,6 +65,10 @@ pub const MAX_CALL_RECORDS: usize = 128;
 /// Maximum bytes retained in one sanitized host failure message.
 pub const MAX_HOST_ERROR_BYTES: usize = 512;
 
+const MAX_SERVICE_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_SERVICE_ERROR_FIELD_BYTES: usize = 256;
+const MAX_SERVICE_ERROR_DEPTH: usize = 4;
+
 /// Build a transport client for one fully resolved cloud binding.
 ///
 /// The factory is deliberately supplied by the embedding application.  A
@@ -1621,11 +1625,7 @@ fn remaining_subscription_reads(response: &HttpResponse) -> Option<u64> {
 
 fn decode_http_response(response: HttpResponse) -> Result<Value, HostError> {
     if !(200..300).contains(&response.status()) {
-        return Err(HostError::new(
-            HostErrorCode::UpstreamError,
-            "upstream returned an error status",
-            response.status() == 429 || response.status() >= 500,
-        ));
+        return Err(upstream_status_error(&response, "Azure"));
     }
     if response.body().len() > MAX_DECODED_RESPONSE_BYTES {
         return Err(HostError::new(
@@ -1713,11 +1713,7 @@ fn valid_logs_timespan(value: &str) -> bool {
 
 fn decode_logs_query_response(response: HttpResponse) -> Result<Value, HostError> {
     if !(200..300).contains(&response.status()) {
-        return Err(HostError::new(
-            HostErrorCode::UpstreamError,
-            "upstream returned an error status",
-            response.status() == 429 || response.status() >= 500,
-        ));
+        return Err(upstream_status_error(&response, "Logs Query"));
     }
     if response.body().len() > MAX_LOGS_RESULT_BYTES {
         return Err(HostError::new(
@@ -1796,6 +1792,100 @@ fn decode_logs_query_response(response: HttpResponse) -> Result<Value, HostError
         }
     }
     Ok(body)
+}
+
+fn upstream_status_error(response: &HttpResponse, operation: &str) -> HostError {
+    let mut message = format!("{operation} returned HTTP {}", response.status());
+    if let Some(summary) = service_error_summary(response.body()) {
+        message.push_str(": ");
+        message.push_str(&summary);
+    }
+    if let Some(request_id) = response
+        .headers()
+        .get("x-ms-request-id")
+        .or_else(|| response.headers().get("x-ms-correlation-request-id"))
+        .or_else(|| response.headers().get("request-id"))
+        .and_then(|value| sanitized_error_code(value))
+    {
+        message.push_str(" (request ID ");
+        message.push_str(&request_id);
+        message.push(')');
+    }
+    HostError::with_message(
+        HostErrorCode::UpstreamError,
+        bounded_host_error_message(message),
+        response.status() == 429 || response.status() >= 500,
+    )
+}
+
+fn service_error_summary(body: &[u8]) -> Option<String> {
+    if body.is_empty() || body.len() > MAX_SERVICE_ERROR_BODY_BYTES {
+        return None;
+    }
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let mut error = value.get("error").unwrap_or(&value);
+    let mut segments = Vec::new();
+    for _ in 0..MAX_SERVICE_ERROR_DEPTH {
+        let code = error.get("code").and_then(Value::as_str);
+        let message = error.get("message").and_then(Value::as_str);
+        let code = code.and_then(sanitized_error_code);
+        let message = message.and_then(sanitized_error_message);
+        match (code, message) {
+            (Some(code), Some(message)) => segments.push(format!("{code}: {message}")),
+            (Some(code), None) => segments.push(code),
+            (None, Some(message)) => segments.push(message),
+            (None, None) => {}
+        }
+        let Some(inner) = error.get("innererror").or_else(|| error.get("innerError")) else {
+            break;
+        };
+        error = inner;
+    }
+    (!segments.is_empty()).then(|| segments.join("; "))
+}
+
+fn sanitized_error_code(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= MAX_SERVICE_ERROR_FIELD_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+    .then(|| value.to_owned())
+}
+
+fn sanitized_error_message(value: &str) -> Option<String> {
+    let mut sanitized = String::new();
+    let mut pending_space = false;
+    for character in value.trim().chars() {
+        if character.is_whitespace() || character.is_control() {
+            pending_space = !sanitized.is_empty();
+            continue;
+        }
+        let required = character.len_utf8() + usize::from(pending_space);
+        if sanitized.len().saturating_add(required) > MAX_SERVICE_ERROR_FIELD_BYTES {
+            break;
+        }
+        if pending_space {
+            sanitized.push(' ');
+            pending_space = false;
+        }
+        sanitized.push(character);
+    }
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn bounded_host_error_message(mut message: String) -> String {
+    if message.len() <= MAX_HOST_ERROR_BYTES {
+        return message;
+    }
+    let mut end = MAX_HOST_ERROR_BYTES.saturating_sub(3);
+    while !message.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    message.truncate(end);
+    message.push_str("...");
+    message
 }
 
 fn map_http_error(error: HttpError, binding: &ResolvedCloudBinding) -> HostError {
@@ -2699,6 +2789,52 @@ mod tests {
             decode_logs_query_response(oversized).unwrap_err().code,
             HostErrorCode::ResponseTooLarge
         );
+    }
+
+    #[test]
+    fn upstream_status_errors_include_bounded_service_diagnostics() {
+        let headers = [(
+            "x-ms-request-id".to_owned(),
+            "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee".to_owned(),
+        )]
+        .into_iter()
+        .collect();
+        let response = HttpResponse::from_parts(
+            400,
+            headers,
+            serde_json::to_vec(&json!({
+                "error": {
+                    "code": "BadArgumentError",
+                    "message": "The request had some invalid properties",
+                    "innererror": {
+                        "code": "SyntaxError",
+                        "message": "Syntax Error\nat position [1,4]"
+                    }
+                }
+            }))
+            .unwrap(),
+        );
+        let error = decode_logs_query_response(response).expect_err("HTTP 400 must fail");
+        assert_eq!(error.code, HostErrorCode::UpstreamError);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.message,
+            "Logs Query returned HTTP 400: BadArgumentError: The request had some invalid properties; SyntaxError: Syntax Error at position [1,4] (request ID eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee)"
+        );
+
+        let oversized_message = format!("first line\n{}", "x".repeat(MAX_HOST_ERROR_BYTES * 2));
+        let response = HttpResponse::from_parts(
+            503,
+            BTreeMap::new(),
+            serde_json::to_vec(&json!({
+                "error": {"code": "ServiceUnavailable", "message": oversized_message}
+            }))
+            .unwrap(),
+        );
+        let error = decode_logs_query_response(response).expect_err("HTTP 503 must fail");
+        assert!(error.retryable);
+        assert!(error.message.len() <= MAX_HOST_ERROR_BYTES);
+        assert!(!error.message.contains('\n'));
     }
 
     #[test]
