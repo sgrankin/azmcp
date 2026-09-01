@@ -404,7 +404,10 @@ fn accounts() -> Tool {
 fn context_open() -> Tool {
     tool(
         CONTEXT_OPEN_TOOL,
-        "Open a persistent, Azure-inspect-only JavaScript context with immutable cloud bindings and optional managed local capabilities. Cloud is never defaulted inside a run.",
+        concat!(
+            "Open a persistent, Azure-inspect-only JavaScript context with immutable cloud bindings and optional managed local capabilities. ",
+            "Cloud is never inferred from `az cloud set`: every helper call must pass exactly `AzureCloud` for commercial Azure or `AzureUSGovernment` for US Government."
+        ),
         json!({
             "type": "object",
             "properties": {
@@ -463,7 +466,21 @@ fn context_close() -> Tool {
 fn run() -> Tool {
     tool(
         RUN_TOOL,
-        "Execute JavaScript in a retained Azure-inspect-only context. Use az.graph for fleet inventory, az.request for reviewed ARM routes, az.metrics.single({cloud, resourceId, metricNames, timespan?, interval?, aggregation?, top?, orderBy?, filter?, resultType?, metricNamespace?, autoAdjustTimegrain?, validateDimensions?, rollupBy?}) for one resource, az.metrics.batch({cloud, region, resourceIds, metricNamespace, metricNames, startTime?, endTime?, interval?, aggregation?, top?, orderBy?, filter?, rollupBy?}) for up to 50 same-type resources, and az.logs.query({cloud, subscription?, workspaceId, query, timespan}) for explicitly granted Log Analytics KQL. Every Azure helper requires an explicit cloud; metrics batch also requires an explicit regional endpoint. With localCapabilities: [\"artifacts.write\"], az.artifacts.writeJson({name, value}) creates one compact JSON file up to 480 KiB. For larger iterable or async-iterable results, use az.artifacts.writeJsonArray({name, values, compression?}) for a top-level JSON array or az.artifacts.writeJsonLines({name, values, compression?}) for JSON Lines; compression may be \"lz4\", filenames must end in .json/.jsonl with an additional .lz4 suffix when compressed, and logical output is bounded at 64 MiB. All artifact helpers return a private local receipt. Oversized serializable results expose a context-scoped ref envelope; use await az.ref(refId) in the same context to rehydrate it or az.peek(value) for a bounded shape summary.",
+        concat!(
+            "Execute JavaScript in a retained Azure-inspect-only context. ",
+            "Use az.graph for fleet inventory, az.request for reviewed ARM routes, ",
+            "az.metrics.single({cloud, resourceId, metricNames, timespan?, interval?, aggregation?, top?, orderBy?, filter?, resultType?, metricNamespace?, autoAdjustTimegrain?, validateDimensions?, rollupBy?}) for one resource, ",
+            "az.metrics.batch({cloud, region, resourceIds, metricNamespace, metricNames, startTime?, endTime?, interval?, aggregation?, top?, orderBy?, filter?, rollupBy?}) for up to 50 same-type resources, ",
+            "and az.logs.query({cloud, subscription?, workspaceId, query, timespan}) for explicitly granted Log Analytics KQL. ",
+            "Cloud is never inferred from `az cloud set`: pass exactly `AzureCloud` for commercial Azure or `AzureUSGovernment` for US Government on every helper call. ",
+            "For example, replace the zero-GUID placeholder in az.logs.query({cloud: \"AzureUSGovernment\", workspaceId: \"00000000-0000-0000-0000-000000000000\", query: \"AppRequests | take 10\", timespan: \"PT1H\"}). ",
+            "workspaceId is the Log Analytics Workspace ID GUID, exposed as `properties.customerId` on a `Microsoft.OperationalInsights/workspaces` resource; it is not the workspace name or ARM resource ID, and it is not an Application Insights appId. When starting from an Application Insights component, use az.graph to follow its `properties.WorkspaceResourceId` to the workspace, then use that workspace resource's `properties.customerId`. ",
+            "Metrics batch also requires an explicit regional endpoint. ",
+            "With localCapabilities: [\"artifacts.write\"], az.artifacts.writeJson({name, value}) creates one compact JSON file up to 480 KiB. ",
+            "For larger iterable or async-iterable results, use az.artifacts.writeJsonArray({name, values, compression?}) for a top-level JSON array or az.artifacts.writeJsonLines({name, values, compression?}) for JSON Lines; ",
+            "compression may be \"lz4\", filenames must end in .json/.jsonl with an additional .lz4 suffix when compressed, and logical output is bounded at 64 MiB. ",
+            "All artifact helpers return a private local receipt. Oversized serializable results expose a context-scoped ref envelope; use await az.ref(refId) in the same context to rehydrate it or az.peek(value) for a bounded shape summary."
+        ),
         json!({
             "type": "object",
             "properties": {
@@ -913,5 +930,31 @@ mod tests {
                 .and_then(|annotations| annotations.read_only_hint),
             Some(false)
         );
+    }
+
+    #[test]
+    fn tool_descriptions_disambiguate_cloud_and_logs_workspace_id() {
+        let tools = catalog();
+        let context = tools
+            .iter()
+            .find(|tool| tool.name == CONTEXT_OPEN_TOOL)
+            .expect("context tool");
+        let run = tools
+            .iter()
+            .find(|tool| tool.name == RUN_TOOL)
+            .expect("run tool");
+        let context_description = context.description.as_deref().expect("context description");
+        let run_description = run.description.as_deref().expect("run description");
+
+        for description in [context_description, run_description] {
+            assert!(description.contains("AzureCloud"));
+            assert!(description.contains("AzureUSGovernment"));
+            assert!(description.contains("az cloud set"));
+        }
+        assert!(run_description.contains("00000000-0000-0000-0000-000000000000"));
+        assert!(run_description.contains("Log Analytics Workspace ID"));
+        assert!(run_description.contains("properties.customerId"));
+        assert!(run_description.contains("not the workspace name or ARM resource ID"));
+        assert!(run_description.contains("not an Application Insights appId"));
     }
 }

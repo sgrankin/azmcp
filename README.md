@@ -52,13 +52,25 @@ Direct Log Analytics and workspace-backed Application Insights queries use:
 
 ```js
 await az.logs.query({
-  cloud,
-  subscription?,
-  workspaceId,
-  query,
-  timespan
-})
+  cloud: "AzureUSGovernment",
+  workspaceId: "00000000-0000-0000-0000-000000000000",
+  query: "AppRequests | take 10",
+  timespan: "PT1H",
+});
 ```
+
+The zero GUID is a placeholder for a Log Analytics Workspace ID.
+Resource Graph exposes that GUID as `properties.customerId` on a
+`Microsoft.OperationalInsights/workspaces` resource.
+It is not the workspace name or ARM resource ID, and it is not an Application
+Insights `appId`.
+If starting from an Application Insights component, use Resource Graph to
+follow its `properties.WorkspaceResourceId` to the workspace, then use that
+workspace resource's `properties.customerId`.
+
+Every helper call must pass exactly `"AzureCloud"` for commercial Azure or
+`"AzureUSGovernment"` for US Government.
+azmcp does not infer cloud from `az cloud set` or other mutable CLI state.
 
 The context must explicitly grant `logs.query` and opt each cloud into the
 initial non-porous Logs scope:
@@ -67,7 +79,7 @@ initial non-porous Logs scope:
 {
   "dataPlanes": ["logs.query"],
   "logsScopes": {
-    "AzureCloud": {"scope": "allAccessible"}
+    "AzureUSGovernment": {"scope": "allAccessible"}
   }
 }
 ```
