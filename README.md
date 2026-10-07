@@ -1,9 +1,10 @@
 # azmcp
 
-`azmcp` is a modern, stateless MCP `2026-07-28` server for bounded Azure
+`azmcp` is an MCP stdio server for bounded Azure
 inspection from persistent JavaScript contexts.
 
-The MCP transport has no session lifecycle. Application state is explicit: a
+The MCP transport detects initialize-based and stateless clients.
+Application state is explicit: a
 caller opens an opaque context, runs one serialized JavaScript turn at a time,
 and closes the context. Each context fixes its identity, cloud bindings,
 subscription allowlist, Resource Graph scope, Azure-inspect-only capability,
@@ -273,37 +274,44 @@ console output, context handles, subprocess output, or bearer tokens. An
 unavailable audit sink fails an Azure request before credential acquisition or
 network I/O.
 
-## Codex
+## MCP clients
 
-Codex CLI 0.147.0 has source-verified support for MCP `2026-07-28` behind the
-`mcp_2026_07_28` feature. A stdio server also needs Codex's out-of-band protocol
-selection marker:
+Register the built binary as a regular stdio server:
 
 ```toml
-[features]
-mcp_2026_07_28 = true
-
 [mcp_servers.azmcp]
 command = "/absolute/path/to/azmcp"
-
-[mcp_servers.azmcp.env]
-CODEX_MCP_PROTOCOL_VERSION = "2026-07-28"
 ```
 
-The feature can instead be enabled for one invocation with
-`codex --enable mcp_2026_07_28`. Codex consumes
-`CODEX_MCP_PROTOCOL_VERSION` before it launches the child; `azmcp` neither
-expects nor receives that variable. The server finds its configuration, Azure
-CLI profile, `az` executable, and audit destination through the standard paths
-described above. Legacy `initialize` is intentionally not implemented.
-
-With the feature enabled, the equivalent CLI registration is:
+Or use the Codex CLI:
 
 ```sh
-codex mcp add azmcp \
-  --env CODEX_MCP_PROTOCOL_VERSION=2026-07-28 \
-  -- /absolute/path/to/azmcp
+codex mcp add azmcp -- /absolute/path/to/azmcp
 ```
+
+The server supports these protocol revisions:
+
+| Revision | Lifecycle | Tool results |
+| --- | --- | --- |
+| `2025-06-18` | `initialize` / `notifications/initialized` | Structured content plus JSON text |
+| `2025-11-25` | `initialize` / `notifications/initialized` | Structured content plus JSON text |
+| `2026-07-28` | `server/discover` and per-request metadata | Structured content, JSON text, and caching metadata |
+
+Codex and pi can use the ordinary stdio configuration above without experimental flags.
+Remove any old `CODEX_MCP_PROTOCOL_VERSION` entry to use Codex's default handshake.
+Configure pi with the same stdio command using its MCP integration.
+The server echoes each supported initialize revision and rejects unsupported revisions.
+Modern clients must supply the required protocol and client-capability metadata on every
+request; older clients use their negotiated session information.
+Earlier revisions are unsupported.
+March 2025 requires receiving JSON-RPC batches, which the pinned SDK does not implement.
+Application context handles work the same way for every revision.
+
+For Codex's optional `2026-07-28` client, retain the `mcp_2026_07_28` feature
+and set `CODEX_MCP_PROTOCOL_VERSION = "2026-07-28"` in this server's configured
+`env` table.
+Codex consumes that selection marker before launching the child.
+Application config and Azure profile discovery use the standard paths described above.
 
 ## Safety model
 

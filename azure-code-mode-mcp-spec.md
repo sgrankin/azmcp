@@ -221,12 +221,11 @@ own worker process behind the MCP front end in v0. This is intentionally the sim
 honest crash boundary. Measure its startup and memory cost before considering a pooled
 worker that lets one V8 failure evict multiple contexts.
 
-Use the official `rmcp` 3.0 line for the `2026-07-28` JSON-RPC types, stdio transport,
-per-request metadata, discovery, caching fields, and MRTR plumbing. The first reviewed
-baseline is `rmcp` 3.0.1; pin the exact crate and Rust toolchain in the implementation.
-The SDK is currently Tier 2, so its abstraction is not the conformance boundary: run the
-official MCP server suite against the built binary and keep Azure policy and V8 lifecycle
-outside SDK handler state.
+Use the official `rmcp` 3.0.1 SDK for JSON-RPC types, stdio transport,
+lifecycle detection, version negotiation, and structured tool results.
+Pin the exact crate and Rust toolchain in the implementation.
+The SDK is not the conformance boundary: test the built binary's handshake and wire
+results, and keep Azure policy and V8 lifecycle outside SDK handler state.
 
 Rationale:
 
@@ -705,42 +704,44 @@ State this in the README. Do not let it read as a security boundary.
 
 ### 6.1 MCP and deployment contract
 
-Target the stable MCP protocol revision `2026-07-28` as a modern-only server. This revision
-has no `initialize` handshake, protocol session, or `Mcp-Session-Id`. Every request is
-self-describing: it carries `io.modelcontextprotocol/protocolVersion` and
-`io.modelcontextprotocol/clientCapabilities` in `_meta`. Reject missing metadata with
-`-32602`, unsupported revisions with `-32022`, and missing required client capabilities
-with `-32021` as specified by MCP. `clientInfo` is diagnostic input, not identity or an
-authorization fact.
+Support MCP revisions `2025-06-18`, `2025-11-25`, and `2026-07-28`,
+with `2025-06-18` as the default server revision.
+Route the opening message to the SDK handshake or concurrent stateless service loop:
 
-Implement `server/discover` and advertise only `2026-07-28`, the `tools` capability, server
-identity, `cacheScope: "public"`, and a positive `ttlMs`. A legacy `initialize` request
-receives an actionable error that names the supported modern revision; v0 does not carry a
-second legacy protocol stack.
-`tools/list` is deterministic, identical for all v0 callers, and returned with
-`cacheScope: "public"` and a positive `ttlMs`. The list does not vary with an execution
-context, and v0 does not advertise `listChanged`. Every result includes
-`io.modelcontextprotocol/serverInfo` in `_meta`.
+- Older clients send `initialize` with protocol version, capabilities, and implementation
+  identity, then `notifications/initialized` after a successful response.
+  Echo each supported initialize revision and reject other revisions with an actionable
+  error listing supported versions.
+- `2026-07-28` clients use `server/discover` and self-describing requests carrying
+  `io.modelcontextprotocol/protocolVersion` and
+  `io.modelcontextprotocol/clientCapabilities` in `_meta`.
+  Reject missing metadata and unsupported revisions before tool execution.
 
-v0 serves stdio only and assumes one local OS user. The stdio process is a transport, not a
-conversation boundary: unrelated calls may be interleaved on it and no request inherits
-metadata or application state from an earlier request. Every tool has JSON Schema 2020-12
-`inputSchema` and `outputSchema` definitions and a structured result. Schemas are bounded
-for validator cost and never cause automatic network dereferencing of `$ref` URIs.
+Client identity and capabilities are diagnostic/protocol input, not Azure authority.
+Advertise only the `tools` capability and server identity.
+`tools/list` is deterministic and identical for callers of a given protocol revision.
+It does not vary with an execution context, and v0 does not advertise `listChanged`.
+Discovery advertises all supported versions and modern public caching metadata.
+Only `2026-07-28` tool lists include `cacheScope`, `ttlMs`, and `resultType`.
+Earlier revisions are outside the implemented contract because March 2025 requires
+receiving JSON-RPC batches, which the pinned SDK does not implement.
+Every result includes `io.modelcontextprotocol/serverInfo` in `_meta`.
+
+v0 serves stdio only and assumes one local OS user.
+Legacy protocol version and capabilities belong to the initialized transport session;
+modern requests provide their own protocol metadata.
+Application state belongs to explicit context handles, so unrelated calls may be
+interleaved without an ambient current execution context.
+Every tool has bounded JSON Schema 2020-12 definitions and a result mirrored in text.
+Schemas never cause automatic network dereferencing of `$ref` URIs.
 Domain failures are returned as stable error codes rather than prose parsing.
 
-**Codex host compatibility.** The first source-verified host baseline is Codex CLI
-`0.147.0`. Its MCP `2026-07-28` client is present but under development and disabled by
-default. The tagged source contains discovery commit `be2e4afcd739`, MRTR commit
-`f2bee854a736`, and the `rmcp` 3.0 upgrade `a05bcda3dbd6`. Integration runs must start
-Codex with `--enable mcp_2026_07_28`. For a stdio server, the Codex MCP configuration must
-also contain
-`CODEX_MCP_PROTOCOL_VERSION=2026-07-28` in that server's configured environment. This is a
-Codex-only out-of-band selection marker, not part of MCP and not an `azmcp` configuration
-API: Codex consumes and removes it before launching the child, so `azmcp` must not expect
-to observe it. HTTP discovery does not use this marker. Default/unflagged Codex remains a
-legacy client; supporting it would require the deliberately deferred second protocol
-stack.
+**Host compatibility.** Codex's default MCP client proposes `2025-06-18`.
+The installed pi MCP client proposes `2025-11-25` and also accepts `2025-06-18`.
+Both can register azmcp as a regular stdio server without experimental features.
+Codex's optional modern client uses `mcp_2026_07_28` and its out-of-band
+`CODEX_MCP_PROTOCOL_VERSION=2026-07-28` environment marker, which Codex consumes before
+launching azmcp.
 
 Tool annotations are descriptive hints, not authorization. Mark discovery and inspect-only
 tools `readOnlyHint: true`; mark `azure_apply` with `destructiveHint: true` and
@@ -910,6 +911,10 @@ The model never holds the write capability.
    them. Read dependencies may execute normally.
 2. The plan is returned as a rendered diff (scope, action, target, body delta) with a
    `planId`.
+The approval exchange in steps 3–5 is a future `2026-07-28` proposal.
+It is not implemented or advertised by v0 and requires a separate approval design review,
+including behavior for initialize-based clients, before adoption.
+
 3. On the first `azure_apply({ planId })` call, inspect that request's declared client
    capabilities. If form elicitation is supported, return MCP
    `resultType: "input_required"` with an `elicitation/create` entry in `inputRequests`.
@@ -996,13 +1001,13 @@ still explicit (§2.2.2). L1 is the fallback for what ARG does not index.
 
 ### 6.7 v0 result and error contract
 
-Completed tool calls return `resultType: "complete"` and `structuredContent` conforming to
-their declared output schema. For client compatibility, they also include a bounded text
+Completed tool calls on `2025-06-18` and newer return `structuredContent` conforming to
+their declared output schema. Modern results additionally include `resultType: "complete"`.
+Every revision includes a bounded text
 content block containing the same JSON. `azure_run` returns:
 
 ```text
 {
-  resultType: "complete",
   _meta: {
     "io.modelcontextprotocol/serverInfo": { name: "azmcp", version: "<build version>" }
   },
@@ -1023,16 +1028,15 @@ secret-sensitive run is labeled even when its final value is innocuous; labels a
 conservative and never treated as proof that an unlabeled arbitrary JS string is safe.
 
 Expected domain failures return an MCP tool result with `isError: true` and structured
-`{ code, message, retryable, details?, correlationId }`; the enclosing result is still
-`resultType: "complete"`. v0 reserves at least:
+`{ code, message, retryable, details?, correlationId }`. v0 reserves at least:
 `invalid_request`, `account_ambiguous`, `authentication_required`,
 `subscription_mismatch`, `route_denied`, `capability_denied`, `context_busy`,
 `context_evicted`, `approval_declined`, `execution_timeout`, `worker_crashed`,
 `result_too_large`, and `upstream_error`.
 
-`azure_apply` alone may first return `resultType: "input_required"` (§6.5). JSON-RPC errors
-are reserved for malformed protocol messages, unsupported protocol versions, missing
-required per-request capabilities, and server failures outside the tool's domain contract.
+The future `azure_apply` approval proposal (§6.5) requires a separate protocol review.
+JSON-RPC errors are reserved for malformed protocol messages, unsupported protocol
+versions, and server failures outside the tool's domain contract.
 
 ---
 
@@ -1309,7 +1313,7 @@ unrecognized method/path/version is denied — the same fail-closed rule as §5.
 | Redirect/continuation credential theft | Exact-origin allowlists and revalidation for every service-provided URL (§8.1) |
 | Wrong cloud assumed | Cloud is never defaulted; an omitted cloud is an error, not a fallback |
 | Wrong subscription assumed | Immutable per-cloud binding, live validation, and provenance in every request (§2.2.1) |
-| Protocol state leaks across calls | Require modern per-request metadata; treat stdio as a multiplexed transport (§6.1) |
+| Application state leaks across calls | Require explicit context handles; keep protocol negotiation session-scoped (§6.1) |
 | Context handle is reused by another conversation | v0 treats it honestly as a bearer: fixed authority, bounded lifetime, explicit close; remote mode must bind an authenticated caller (§6.3) |
 | Forged or replayed apply retry | Random MRTR state bound to a server-side, one-shot approval record (§6.5) |
 | Late principal or capability switch | Resolved principal mapping and capabilities are fixed per isolate/context (§6.3) |
@@ -1325,9 +1329,8 @@ unrecognized method/path/version is denied — the same fail-closed rule as §5.
 
 **v0 — prove the core**
 
-- Modern-only local stdio MCP server targeting protocol revision `2026-07-28`, with
-  `server/discover`, per-request metadata validation, deterministic cacheable `tools/list`,
-  and no `initialize` or protocol session.
+- Local stdio MCP server supporting all three reviewed revisions through initialize-based
+  and stateless SDK lifecycles, with deterministic version-appropriate `tools/list`.
 - `azure_accounts`, `azure_context_open`, `azure_context_close`, and `azure_run` with
   explicit persistent execution contexts; no refs yet.
 - Reviewed `AzureCloud` and `AzureUSGovernment` manifests.
@@ -1347,9 +1350,9 @@ unrecognized method/path/version is denied — the same fail-closed rule as §5.
 
 Keep the first executable slices narrow enough that each proves a separate boundary:
 
-1. Build a no-Azure stdio server with `server/discover`, deterministic `tools/list`, and a
-   trivial structured tool. Run the pinned MCP server conformance gate and the Codex
-   `0.147.0` modern-mode smoke test before introducing application state.
+1. Build a no-Azure stdio server with `initialize`, deterministic `tools/list`, and a
+   trivial structured tool. Verify its built binary with ordinary Codex and pi MCP clients
+   before introducing application state.
 2. Add config parsing, `azure_accounts`, immutable context records, and the credential
    broker behind a fake `az` executable. No V8 or network calls yet.
 3. Add the reviewed v0 route rows, URL canonicalization, signing boundary, and HTTP client
@@ -1378,19 +1381,15 @@ Keep the first executable slices narrow enough that each proves a separate bound
    worker and leave the MCP front end responsive.
 8. A real inventory scenario returns a correct small result from a much larger ARM/ARG
    response without truncating JSON.
-9. The official MCP `2026-07-28` server conformance suite passes at an exact, checked-in
-   upstream revision, and the resulting report is retained as a build artifact. Focused
-   regression tests additionally cover `server/discover`, required request `_meta`,
-   `resultType`, JSON Schema 2020-12, deterministic `tools/list` caching fields, stdio
-   cancellation, and rejection of `initialize` with an actionable supported-version
-   error.
+9. Focused protocol regression tests cover all three supported revisions,
+   unsupported-version errors, JSON Schema 2020-12, deterministic `tools/list`, structured
+   results mirrored in text, version-specific wire fields, required modern metadata,
+   and cancellation through both lifecycles.
+   Run an official server conformance suite when available and retain its report.
 10. Interleaved calls from unrelated logical conversations prove that no ambient current
-    context, client capabilities, protocol version, or identity leaks across requests.
-11. Codex CLI `0.147.0`, started with `--enable mcp_2026_07_28` and the stdio selection
-    marker described in §6.1, completes `server/discover`, `tools/list`, context open, and
-    a run using `2026-07-28`. The test also proves that `azmcp` does not receive the
-    Codex-only marker. A legacy-host failure is expected; dual-era compatibility is a
-    separate explicit scope decision rather than hidden fallback behavior in the core.
+    application context or Azure authority leaks across requests.
+11. Ordinary Codex and pi MCP clients complete initialization, `tools/list`, context open,
+    and a run against synthetic dependencies without experimental protocol flags.
 
 **v1 — usable**
 
@@ -1487,10 +1486,9 @@ formats is not that API.
 - [Azure CLI 2.89 agent-session handling](https://github.com/Azure/azure-cli/blob/azure-cli-2.89.0/src/azure-cli-core/azure/cli/core/auth/agentic_session.py)
 - [Azure CLI 2.89 user credential flow](https://github.com/Azure/azure-cli/blob/azure-cli-2.89.0/src/azure-cli-core/azure/cli/core/auth/msal_credentials.py)
 - [Official Rust MCP SDK releases](https://github.com/modelcontextprotocol/rust-sdk/releases)
-- [MCP 2026-07-28 base protocol and statelessness](https://modelcontextprotocol.io/specification/2026-07-28/basic)
-- [MCP versioning and compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)
-- [MCP server discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)
-- [MCP tools and explicit state handles](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
+- [MCP initialize lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
+- [MCP versioning and compatibility](https://modelcontextprotocol.io/specification/2025-11-25/basic/versioning)
+- [MCP tools and explicit state handles](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
 - [MCP multi round-trip requests](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr)
 - [MCP elicitation](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation)
 - [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http)

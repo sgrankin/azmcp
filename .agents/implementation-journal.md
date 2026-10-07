@@ -2,13 +2,45 @@
 
 ## Current plan
 
-1. Broaden `az.request` with additional independently pinned, read-only Azure operations.
-2. Advertise paging only after a concrete reviewed list route has an end-to-end helper.
-3. Run an official server-conformance gate when one is available for the pinned protocol.
-4. Run authenticated Commercial/Government acceptance only in a separately authorized
-   non-production environment.
+1. Add protocol revisions only with wire and lifecycle regression coverage.
+2. Run official conformance and authenticated acceptance in their separately scoped environments.
 
-## Verified facts
+## Validation (2026-10-07)
+
+- 121 azmcp library tests passed, plus built-binary three-version stdio and synthetic
+  observability end-to-end tests (123 total).
+- First-request cancellation and context-open rollback pass through both lifecycles.
+- Formatting and focused library/binary Clippy with warnings denied passed.
+- Installed pi MCP client completed initialization, listed six tools, and returned synthetic
+  accounts on `2025-06-18` and `2025-11-25`; the fake Azure executable was never invoked.
+- Independent adversarial review found no remaining functional findings.
+- Release build passed. The optimized binary passed the same installed pi initialization,
+  tool listing, and synthetic-account smoke on both supported initialize revisions.
+- No Azure profile, real CLI, or Azure/Entra endpoint was accessed.
+
+## Compatibility findings (2026-10-07)
+
+- Codex defaults to `2025-06-18`; installed pi proposes `2025-11-25` and supports older revisions.
+- Reproduced the original built-binary initialize failure with a synthetic temporary home.
+- `rmcp` 3.0.1 detects legacy initialization or stateless metadata and echoes SDK-known
+  initialize revisions. Accept the two tested initialize revisions; keep `2026-07-28`
+  on the stateless path and reject unknown revisions.
+- Omit modern caching/resultType fields for the initialize-based revisions.
+  Preserve structured results and the JSON text mirror for every supported revision.
+- March 2025 requires receiving JSON-RPC batches; the pinned SDK does not implement batches.
+  The user selected the June 2025-and-newer range. Do not advertise the oldest revisions
+  based only on single-message smoke tests.
+- Tests use synthetic homes/profiles, an injected fake executable, and loopback simulators.
+- Automatic SDK detection blocked cancellation while executing the first modern context-open
+  request. The shared rollback regression failed, then passed after routing modern openers
+  to the direct concurrent service loop through a buffered opening message.
+- Available local Rust is Homebrew `1.99.0`; pinned `1.97.1`/rustup is not installed.
+  Local checks therefore use `1.99.0`; CI remains responsible for the pinned toolchain.
+
+## Earlier implementation facts
+
+These entries record the previous implementation baseline.
+The compatibility findings and validation above describe the current change.
 
 - The repository uses JJ. The reviewed spec is change `osxsoxzm`.
 - Codex CLI `0.147.0` contains modern discovery and MRTR support behind
@@ -111,8 +143,9 @@
 
 ## Decisions
 
-- v0 is modern-only. Legacy MCP is deferred until a concrete host requirement justifies a
-  second lifecycle.
+- Support the two reviewed initialize revisions and `2026-07-28` stateless clients.
+  The transport routes the opening message to the SDK handshake or direct service loop.
+  Direct modern dispatch preserves cancellation of the first tool request.
 - Schema discovery covers `az.request`, `az.metrics.single`, `az.metrics.batch`, and
   `az.logs.query` under their exact execution surfaces. It leases the caller's context
   without starting a worker, acquiring a credential, or making an HTTP request. Search

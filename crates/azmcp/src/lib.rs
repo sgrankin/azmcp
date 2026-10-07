@@ -1,6 +1,6 @@
-//! The modern-only MCP front end for `azmcp`.
+//! The version-negotiating MCP front end for `azmcp`.
 //!
-//! MCP requests are stateless; explicit application context handles retain the
+//! Explicit application context handles retain the
 //! isolated JavaScript workers and immutable Azure authority records.
 
 pub mod app;
@@ -17,12 +17,15 @@ use std::{borrow::Cow, future::Future};
 use rmcp::{
     ServerHandler, Service,
     model::{
-        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ClientRequest,
-        DiscoverResult, ErrorCode, ErrorData, Implementation, JsonObject, ListToolsResult,
-        MetaObject, PaginatedRequestParams, ProtocolVersion, RequestMetaObject, ServerCapabilities,
-        ServerInfo, ServerResult, Tool,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ClientJsonRpcMessage,
+        ClientRequest, DiscoverResult, ErrorCode, ErrorData, GetMeta, Implementation, JsonObject,
+        ListToolsResult, MetaObject, PaginatedRequestParams, ProtocolVersion, RequestMetaObject,
+        ServerCapabilities, ServerInfo, ServerResult, Tool,
     },
-    service::{NotificationContext, RequestContext, RoleServer},
+    service::{
+        NotificationContext, RequestContext, RoleServer, RunningService, ServerInitializeError,
+    },
+    transport::{IntoTransport, Transport},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -37,8 +40,18 @@ use crate::{
     worker::ResultTooLargeSummary,
 };
 
-/// The only protocol revision implemented by this server.
-pub const PROTOCOL_VERSION: &str = "2026-07-28";
+/// The default protocol revision implemented by this server.
+pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Protocol revisions covered by the server's wire compatibility tests.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+    ProtocolVersion::V_2026_07_28,
+];
+
+/// Cache lifetime for modern discovery and the deterministic tool catalog.
+pub const CACHE_TTL_MS: u64 = 60_000;
 
 /// Stable server identity advertised in discovery and every result envelope.
 pub const SERVER_NAME: &str = "azmcp";
@@ -46,13 +59,10 @@ pub const SERVER_NAME: &str = "azmcp";
 /// Build version used as the server identity version.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Cache lifetime for discovery and the deterministic tool catalog.
-pub const CACHE_TTL_MS: u64 = 60_000;
-
 const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 const MAX_TOOL_RESULT_BYTES: usize = 1024 * 1024;
 
-/// The modern protocol front end over the stateful application.
+/// The protocol front end over the stateful application.
 #[derive(Clone)]
 pub struct AzmcpServer {
     application: Application,
@@ -75,21 +85,16 @@ impl AzmcpServer {
         Implementation::new(SERVER_NAME, SERVER_VERSION)
     }
 
-    /// Return the server information used by discovery and diagnostics.
+    /// Return the server information used by initialization and diagnostics.
     pub fn server_info() -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(ProtocolVersion::V_2026_07_28)
+            .with_protocol_version(ProtocolVersion::V_2025_06_18)
             .with_server_info(Self::implementation())
     }
 
     /// Return the deterministic catalog of tools implemented in this release.
     pub fn tools() -> Vec<Tool> {
         tools::catalog()
-    }
-
-    /// Wrap the handler with the modern per-request lifecycle boundary.
-    pub fn modern_service(self) -> ModernService {
-        ModernService { server: self }
     }
 }
 
@@ -101,41 +106,62 @@ pub struct ServerConfigurationError;
 
 impl ServerHandler for AzmcpServer {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Borrowed(&[ProtocolVersion::V_2026_07_28])
+        Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
     fn initialize(
         &self,
-        _request: rmcp::model::InitializeRequestParams,
+        request: rmcp::model::InitializeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ServerInfo, ErrorData>> + rmcp::service::MaybeSendFuture + '_
     {
-        std::future::ready(Err(legacy_initialize_error()))
+        // rmcp echoes every SDK-known revision, independently of the handler's
+        // supported list. Reject revisions outside our tested wire contract.
+        let result = if SUPPORTED_PROTOCOL_VERSIONS.contains(&request.protocol_version)
+            && request.protocol_version < ProtocolVersion::V_2026_07_28
+        {
+            Ok(Self::server_info().with_protocol_version(request.protocol_version))
+        } else {
+            Err(ErrorData::invalid_params(
+                "unsupported initialize protocol version; use an initialize-based revision or server/discover for 2026-07-28",
+                Some(json!({"supportedVersions": SUPPORTED_PROTOCOL_VERSIONS})),
+            ))
+        };
+        std::future::ready(result)
     }
 
     fn discover(
         &self,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<DiscoverResult, ErrorData>> + rmcp::service::MaybeSendFuture + '_
     {
-        let result = DiscoverResult::from_server_info(
-            vec![ProtocolVersion::V_2026_07_28],
+        if context.protocol_version() != Some(ProtocolVersion::V_2026_07_28) {
+            return std::future::ready(Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                "server/discover requires protocol version 2026-07-28",
+                None,
+            )));
+        }
+        std::future::ready(Ok(DiscoverResult::from_server_info(
+            SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
             Self::server_info(),
         )
         .with_ttl_ms(CACHE_TTL_MS)
-        .with_cache_scope(CacheScope::Public);
-        std::future::ready(Ok(result))
+        .with_cache_scope(CacheScope::Public)))
     }
 
     fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + rmcp::service::MaybeSendFuture + '_
     {
-        let mut result = ListToolsResult::with_all_items(Self::tools())
-            .with_ttl_ms(CACHE_TTL_MS)
-            .with_cache_scope(CacheScope::Public);
+        let mut result = ListToolsResult::with_all_items(Self::tools());
+        if context.protocol_version() == Some(ProtocolVersion::V_2026_07_28) {
+            result = result
+                .with_ttl_ms(CACHE_TTL_MS)
+                .with_cache_scope(CacheScope::Public);
+        }
         result.meta = Some(server_info_meta());
         std::future::ready(Ok(result))
     }
@@ -220,35 +246,28 @@ impl ServerHandler for AzmcpServer {
     }
 }
 
-/// Service wrapper that makes rmcp's direct transport explicitly modern-only.
-///
-/// `rmcp::serve_server` has a useful compatibility path that detects the first
-/// request and then switches into stateless mode.  The executable server uses
-/// `serve_directly` instead, so there is no implicit initialize lifecycle and
-/// every request is checked here before rmcp dispatches it.
+/// Enforce per-request metadata on the stateless lifecycle.
 #[derive(Clone)]
-pub struct ModernService {
+pub struct ProtocolService {
     server: AzmcpServer,
+    stateless: bool,
 }
 
-impl ModernService {
-    /// Construct a modern-only service around an `AzmcpServer`.
-    pub fn new(server: AzmcpServer) -> Self {
-        Self { server }
-    }
-}
-
-impl Service<RoleServer> for ModernService {
+impl Service<RoleServer> for ProtocolService {
     async fn handle_request(
         &self,
         request: ClientRequest,
         context: RequestContext<RoleServer>,
     ) -> Result<ServerResult, ErrorData> {
-        if matches!(request, ClientRequest::InitializeRequest(_)) {
-            return Err(legacy_initialize_error());
+        if self.stateless {
+            if matches!(request, ClientRequest::InitializeRequest(_)) {
+                return Err(ErrorData::invalid_request(
+                    "stateless clients must use server/discover",
+                    None,
+                ));
+            }
+            validate_stateless_metadata(&context.meta)?;
         }
-
-        validate_modern_metadata(&context.meta)?;
         <AzmcpServer as Service<RoleServer>>::handle_request(&self.server, request, context).await
     }
 
@@ -270,15 +289,107 @@ impl Service<RoleServer> for ModernService {
     }
 }
 
-/// Run the modern-only server over stdio.
+/// Start a server using the lifecycle selected by its opening message.
+pub async fn serve<T, E, A>(
+    server: AzmcpServer,
+    transport: T,
+) -> anyhow::Result<RunningService<RoleServer, ProtocolService>>
+where
+    T: IntoTransport<RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut transport = transport.into_transport();
+    let first = transport.receive().await.ok_or_else(|| {
+        ServerInitializeError::ConnectionClosed("waiting for the opening message".to_owned())
+    })?;
+    let legacy = match &first {
+        ClientJsonRpcMessage::Request(request) => {
+            matches!(request.request, ClientRequest::InitializeRequest(_))
+                || (matches!(request.request, ClientRequest::PingRequest(_))
+                    && request.request.get_meta().protocol_version().is_none())
+        }
+        _ => true,
+    };
+    let transport = OpeningTransport {
+        first: Some(first),
+        transport,
+    };
+    let service = ProtocolService {
+        server,
+        stateless: !legacy,
+    };
+    if legacy {
+        Ok(rmcp::service::serve_server(service, transport).await?)
+    } else {
+        // rmcp's automatic detection awaits the first stateless handler before
+        // reading more messages. Direct serving lets that first call receive
+        // cancellation and keeps independent requests concurrent.
+        Ok(rmcp::service::serve_directly(
+            service,
+            transport,
+            None::<rmcp::model::ClientInfo>,
+        ))
+    }
+}
+
+struct OpeningTransport<T> {
+    first: Option<ClientJsonRpcMessage>,
+    transport: T,
+}
+
+impl<T: Transport<RoleServer>> Transport<RoleServer> for OpeningTransport<T> {
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        message: rmcp::model::ServerJsonRpcMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.transport.send(message)
+    }
+
+    async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
+        if let Some(first) = self.first.take() {
+            Some(first)
+        } else {
+            self.transport.receive().await
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.transport.close().await
+    }
+}
+
+fn validate_stateless_metadata(meta: &RequestMetaObject) -> Result<(), ErrorData> {
+    if let Some(requested) = meta.protocol_version()
+        && !SUPPORTED_PROTOCOL_VERSIONS.contains(&requested)
+    {
+        return Err(ErrorData::unsupported_protocol_version(
+            requested,
+            SUPPORTED_PROTOCOL_VERSIONS,
+        ));
+    }
+    let missing = meta.missing_required_keys(&ProtocolVersion::V_2026_07_28);
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(ErrorData::invalid_params(
+            format!(
+                "request _meta is missing or malformed: {}",
+                missing.join(", ")
+            ),
+            Some(json!({"missing": missing})),
+        ))
+    }
+}
+
+/// Run the version-negotiating server over stdio.
 pub async fn run_stdio() -> anyhow::Result<()> {
     let application = runtime::production_application().await?;
-    let service = rmcp::service::serve_directly(
-        AzmcpServer::new(application)?.modern_service(),
-        rmcp::transport::stdio(),
-        None::<rmcp::model::ClientInfo>,
-    );
-    service.waiting().await?;
+    serve(AzmcpServer::new(application)?, rmcp::transport::stdio())
+        .await?
+        .waiting()
+        .await?;
     Ok(())
 }
 
@@ -452,40 +563,6 @@ fn server_info_meta() -> MetaObject {
     meta
 }
 
-fn legacy_initialize_error() -> ErrorData {
-    ErrorData::invalid_request(
-        "legacy initialize is unsupported; use server/discover with protocol version 2026-07-28",
-        Some(json!({
-            "supportedVersions": [PROTOCOL_VERSION],
-            "next": "server/discover"
-        })),
-    )
-}
-
-fn validate_modern_metadata(meta: &RequestMetaObject) -> Result<(), ErrorData> {
-    if let Some(requested) = meta.protocol_version()
-        && requested != ProtocolVersion::V_2026_07_28
-    {
-        return Err(ErrorData::unsupported_protocol_version(
-            requested,
-            &[ProtocolVersion::V_2026_07_28],
-        ));
-    }
-
-    let missing = meta.missing_required_keys(&ProtocolVersion::V_2026_07_28);
-    if missing.is_empty() {
-        return Ok(());
-    }
-
-    Err(ErrorData::invalid_params(
-        format!(
-            "request _meta is missing or malformed: {}",
-            missing.join(", ")
-        ),
-        Some(json!({"missing": missing})),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -500,13 +577,10 @@ mod tests {
         config::{Config, ResolvedCloudBinding},
         context::Context,
     };
-    use rmcp::{
-        model::{
-            CallToolRequest, CallToolRequestParams, ClientCapabilities, ClientJsonRpcMessage,
-            ClientRequest, DiscoverRequest, DiscoverRequestParams, ErrorCode, Implementation,
-            ListToolsRequest, RequestId, ResultType, ServerJsonRpcMessage, ServerResult,
-        },
-        transport::{IntoTransport, Transport},
+    use rmcp::model::{
+        CallToolRequest, CallToolRequestParams, ClientCapabilities, ClientJsonRpcMessage,
+        ClientRequest, ErrorCode, GetExtensions, Implementation, ListToolsRequest, RequestId,
+        RequestMetaObject, ServerJsonRpcMessage, ServerResult,
     };
     use tokio::sync::Notify;
 
@@ -659,20 +733,12 @@ mod tests {
         test_server_with(default_registry().unwrap(), Arc::new(TestWorkerFactory))
     }
 
-    fn modern_meta() -> RequestMetaObject {
-        RequestMetaObject::with_client_context(
-            ProtocolVersion::V_2026_07_28,
-            Implementation::new("test-client", "0.1.0"),
-            ClientCapabilities::default(),
-        )
-    }
-
     #[test]
     fn server_identity_and_capabilities_are_deterministic() {
         let first = AzmcpServer::server_info();
         let second = AzmcpServer::server_info();
         assert_eq!(first, second);
-        assert_eq!(first.protocol_version, ProtocolVersion::V_2026_07_28);
+        assert_eq!(first.protocol_version, ProtocolVersion::V_2025_06_18);
         assert_eq!(first.server_info, AzmcpServer::implementation());
         assert_eq!(first.capabilities.tools.unwrap().list_changed, None);
         assert!(first.capabilities.prompts.is_none());
@@ -727,23 +793,21 @@ mod tests {
         server: AzmcpServer,
         transport: tokio::io::DuplexStream,
     ) -> Result<rmcp::service::QuitReason, tokio::task::JoinError> {
-        rmcp::service::serve_directly(
-            server.modern_service(),
-            transport,
-            None::<rmcp::model::ClientInfo>,
-        )
-        .waiting()
-        .await
+        serve(server, transport)
+            .await
+            .expect("initialize server")
+            .waiting()
+            .await
     }
 
-    async fn modern_client() -> (
+    async fn session_client() -> (
         impl Transport<rmcp::RoleClient>,
         tokio::task::JoinHandle<Result<rmcp::service::QuitReason, tokio::task::JoinError>>,
     ) {
-        modern_client_with(test_server()).await
+        session_client_with(test_server()).await
     }
 
-    async fn modern_client_with(
+    async fn session_client_with(
         server: AzmcpServer,
     ) -> (
         impl Transport<rmcp::RoleClient>,
@@ -751,8 +815,39 @@ mod tests {
     ) {
         let (server_transport, client_transport) = tokio::io::duplex(16_384);
         let server_task = tokio::spawn(run_server(server, server_transport));
-        let client = IntoTransport::<rmcp::RoleClient, _, _>::into_transport(client_transport);
+        let mut client = IntoTransport::<rmcp::RoleClient, _, _>::into_transport(client_transport);
+        initialize_client(&mut client, PROTOCOL_VERSION).await;
         (client, server_task)
+    }
+
+    async fn initialize_client(client: &mut impl Transport<rmcp::RoleClient>, version: &str) {
+        client
+            .send(
+                serde_json::from_value(json!({
+                    "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                    "params": {"protocolVersion": version, "capabilities": {},
+                        "clientInfo": {"name": "test-client", "version": "0.1.0"}}
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ServerJsonRpcMessage::Response(response) = receive(client).await else {
+            panic!("expected initialize response")
+        };
+        let ServerResult::InitializeResult(info) = response.result else {
+            panic!("expected initialize result")
+        };
+        assert_eq!(info.protocol_version.as_str(), version);
+        client
+            .send(
+                serde_json::from_value(json!({
+                    "jsonrpc": "2.0", "method": "notifications/initialized"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
     }
 
     fn list_tools_request(id: i64, meta: Option<RequestMetaObject>) -> ClientJsonRpcMessage {
@@ -772,9 +867,8 @@ mod tests {
 
     fn call_tool_request(id: i64, name: &'static str, arguments: Value) -> ClientJsonRpcMessage {
         let arguments = arguments.as_object().cloned().expect("object arguments");
-        let mut request =
+        let request =
             CallToolRequest::new(CallToolRequestParams::new(name).with_arguments(arguments));
-        request.extensions.insert(modern_meta());
         ClientJsonRpcMessage::request(
             ClientRequest::CallToolRequest(request),
             RequestId::Number(id),
@@ -792,48 +886,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_list_and_accounts_are_modern_structured_results() {
-        let (mut client, server_task) = modern_client().await;
+    async fn list_and_accounts_are_structured_results() {
+        let (mut client, server_task) = session_client().await;
 
-        let mut discover = DiscoverRequest::new(DiscoverRequestParams {});
-        discover.extensions.insert(modern_meta());
-        client
-            .send(ClientJsonRpcMessage::request(
-                ClientRequest::DiscoverRequest(discover),
-                RequestId::Number(1),
-            ))
-            .await
-            .unwrap();
-        let ServerJsonRpcMessage::Response(response) = receive(&mut client).await else {
-            panic!("expected discovery response")
-        };
-        let ServerResult::DiscoverResult(discovered) = response.result else {
-            panic!("expected typed discovery result")
-        };
-        assert_eq!(
-            discovered.supported_versions,
-            vec![ProtocolVersion::V_2026_07_28]
-        );
-        assert_eq!(discovered.ttl_ms, CACHE_TTL_MS);
-        assert_eq!(discovered.cache_scope, CacheScope::Public);
-        assert_eq!(
-            discovered.server_info(),
-            Some(AzmcpServer::implementation())
-        );
-
-        client
-            .send(list_tools_request(2, Some(modern_meta())))
-            .await
-            .unwrap();
+        client.send(list_tools_request(2, None)).await.unwrap();
         let ServerJsonRpcMessage::Response(response) = receive(&mut client).await else {
             panic!("expected tools response")
         };
         let ServerResult::ListToolsResult(listed) = response.result else {
             panic!("expected typed tools result")
         };
-        assert_eq!(listed.result_type, Some(ResultType::COMPLETE));
-        assert_eq!(listed.ttl_ms, Some(CACHE_TTL_MS));
-        assert_eq!(listed.cache_scope, Some(CacheScope::Public));
+        assert_eq!(listed.result_type, None);
+        assert_eq!(listed.ttl_ms, None);
+        assert_eq!(listed.cache_scope, None);
         assert_eq!(listed.tools, AzmcpServer::tools());
         assert_eq!(
             listed.meta.unwrap()[SERVER_INFO_META_KEY],
@@ -843,8 +908,7 @@ mod tests {
             })
         );
 
-        let mut call = CallToolRequest::new(CallToolRequestParams::new(ACCOUNTS_TOOL));
-        call.extensions.insert(modern_meta());
+        let call = CallToolRequest::new(CallToolRequestParams::new(ACCOUNTS_TOOL));
         client
             .send(ClientJsonRpcMessage::request(
                 ClientRequest::CallToolRequest(call),
@@ -858,7 +922,7 @@ mod tests {
         let ServerResult::CallToolResult(result) = response.result else {
             panic!("expected typed call result")
         };
-        assert_eq!(result.result_type, Some(ResultType::COMPLETE));
+        assert_eq!(result.result_type, None);
         assert_eq!(result.is_error, Some(false));
         let structured = result.structured_content.expect("structured content");
         assert_eq!(structured["accounts"].as_array().unwrap().len(), 1);
@@ -880,55 +944,282 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn modern_service_rejects_legacy_and_bad_request_metadata() {
-        let (mut client, server_task) = modern_client().await;
-
-        let initialize: ClientJsonRpcMessage = serde_json::from_value(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "clientInfo": {"name": "legacy", "version": "1.0.0"}
-            }
-        }))
-        .unwrap();
-        client.send(initialize).await.unwrap();
-        let ServerJsonRpcMessage::Error(error) = receive(&mut client).await else {
-            panic!("expected initialize error")
+    async fn november_client_initializes_and_lists_tools_without_metadata() {
+        let (server_transport, client_transport) = tokio::io::duplex(16_384);
+        let server_task = tokio::spawn(run_server(test_server(), server_transport));
+        let mut client = IntoTransport::<rmcp::RoleClient, _, _>::into_transport(client_transport);
+        initialize_client(&mut client, "2025-11-25").await;
+        client.send(list_tools_request(1, None)).await.unwrap();
+        let ServerJsonRpcMessage::Response(response) = receive(&mut client).await else {
+            panic!("expected tools response")
         };
-        assert_eq!(error.error.code, ErrorCode::INVALID_REQUEST);
-        assert!(error.error.message.contains(PROTOCOL_VERSION));
-
-        client.send(list_tools_request(2, None)).await.unwrap();
-        let ServerJsonRpcMessage::Error(error) = receive(&mut client).await else {
-            panic!("expected missing metadata error")
+        let ServerResult::ListToolsResult(list) = response.result else {
+            panic!("expected tools result")
         };
-        assert_eq!(error.error.code, ErrorCode::INVALID_PARAMS);
-
-        let mut unsupported = RequestMetaObject::new();
-        unsupported.insert(
-            "io.modelcontextprotocol/protocolVersion".to_owned(),
-            json!("2099-01-01"),
-        );
-        unsupported.set_client_capabilities(ClientCapabilities::default());
-        client
-            .send(list_tools_request(3, Some(unsupported)))
-            .await
-            .unwrap();
-        let ServerJsonRpcMessage::Error(error) = receive(&mut client).await else {
-            panic!("expected unsupported metadata error")
-        };
-        assert_eq!(error.error.code, ErrorCode::UNSUPPORTED_PROTOCOL_VERSION);
-
+        assert_eq!(list.tools, AzmcpServer::tools());
+        assert_eq!(list.result_type, None);
         drop(client);
         server_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
+    async fn initialize_rejects_untested_revisions() {
+        for version in ["2024-11-05", "2025-03-26", "2026-07-28", "2099-01-01"] {
+            let (server_transport, client_transport) = tokio::io::duplex(16_384);
+            let task =
+                tokio::spawn(async move { serve(test_server(), server_transport).await.is_err() });
+            let mut client =
+                IntoTransport::<rmcp::RoleClient, _, _>::into_transport(client_transport);
+            client
+                .send(
+                    serde_json::from_value(json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": version, "capabilities": {},
+                            "clientInfo": {"name": "unsupported-client", "version": "0.1.0"}}
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let ServerJsonRpcMessage::Error(error) = receive(&mut client).await else {
+                panic!("expected unsupported version error for {version}")
+            };
+            assert_eq!(error.error.code, ErrorCode::INVALID_PARAMS);
+            assert_eq!(
+                error.error.data.unwrap()["supportedVersions"],
+                serde_json::to_value(SUPPORTED_PROTOCOL_VERSIONS).unwrap()
+            );
+            assert!(task.await.unwrap());
+        }
+    }
+
+    async fn client_with_protocol(
+        server: AzmcpServer,
+        version: &ProtocolVersion,
+    ) -> (
+        impl Transport<rmcp::RoleClient>,
+        tokio::task::JoinHandle<Result<rmcp::service::QuitReason, tokio::task::JoinError>>,
+    ) {
+        let (server_transport, client_transport) = tokio::io::duplex(16_384);
+        let task = tokio::spawn(run_server(server, server_transport));
+        let mut client = IntoTransport::<rmcp::RoleClient, _, _>::into_transport(client_transport);
+        if version < &ProtocolVersion::V_2026_07_28 {
+            initialize_client(&mut client, version.as_str()).await;
+        }
+        (client, task)
+    }
+
+    fn call_tool_for_version(
+        version: &ProtocolVersion,
+        id: i64,
+        name: &'static str,
+        arguments: Value,
+    ) -> ClientJsonRpcMessage {
+        let mut message = call_tool_request(id, name, arguments);
+        if version == &ProtocolVersion::V_2026_07_28 {
+            let ClientJsonRpcMessage::Request(request) = &mut message else {
+                unreachable!()
+            };
+            request.request.extensions_mut().insert(modern_meta());
+        }
+        message
+    }
+
+    fn modern_meta() -> RequestMetaObject {
+        RequestMetaObject::with_client_context(
+            ProtocolVersion::V_2026_07_28,
+            Implementation::new("stateless-client", "0.1.0"),
+            ClientCapabilities::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn modern_discovery_and_results_retain_the_stateless_contract() {
+        let (server_transport, client_transport) = tokio::io::duplex(16_384);
+        let task = tokio::spawn(run_server(test_server(), server_transport));
+        let mut client = IntoTransport::<rmcp::RoleClient, _, _>::into_transport(client_transport);
+        client
+            .send(
+                serde_json::from_value(json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+                    "params": {"_meta": modern_meta()}
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ServerJsonRpcMessage::Response(response) = receive(&mut client).await else {
+            panic!("expected discovery response")
+        };
+        let ServerResult::DiscoverResult(discovered) = response.result else {
+            panic!("expected discovery result")
+        };
+        assert_eq!(discovered.supported_versions, SUPPORTED_PROTOCOL_VERSIONS);
+        assert_eq!(discovered.ttl_ms, CACHE_TTL_MS);
+        assert_eq!(discovered.cache_scope, CacheScope::Public);
+        client
+            .send(list_tools_request(2, Some(modern_meta())))
+            .await
+            .unwrap();
+        let ServerJsonRpcMessage::Response(response) = receive(&mut client).await else {
+            panic!("expected tools response")
+        };
+        let ServerResult::ListToolsResult(list) = response.result else {
+            panic!("expected tools result")
+        };
+        assert_eq!(list.tools, AzmcpServer::tools());
+        assert_eq!(list.result_type, Some(rmcp::model::ResultType::COMPLETE));
+        assert_eq!(list.ttl_ms, Some(CACHE_TTL_MS));
+        let mut call = match call_tool_request(3, ACCOUNTS_TOOL, json!({})) {
+            ClientJsonRpcMessage::Request(request) => request,
+            _ => unreachable!(),
+        };
+        call.request.extensions_mut().insert(modern_meta());
+        client
+            .send(ClientJsonRpcMessage::Request(call))
+            .await
+            .unwrap();
+        let result = receive_tool_result(&mut client).await;
+        assert!(result.structured_content.is_some());
+        assert_eq!(result.result_type, Some(rmcp::model::ResultType::COMPLETE));
+        client.send(list_tools_request(4, None)).await.unwrap();
+        let ServerJsonRpcMessage::Error(error) = receive(&mut client).await else {
+            panic!("expected missing metadata error")
+        };
+        assert_eq!(error.error.code, ErrorCode::INVALID_PARAMS);
+        let mut unsupported = modern_meta();
+        unsupported.insert(
+            "io.modelcontextprotocol/protocolVersion".to_owned(),
+            json!("2099-01-01"),
+        );
+        client
+            .send(list_tools_request(5, Some(unsupported)))
+            .await
+            .unwrap();
+        let ServerJsonRpcMessage::Error(error) = receive(&mut client).await else {
+            panic!("expected unsupported version error")
+        };
+        assert_eq!(error.error.code, ErrorCode::UNSUPPORTED_PROTOCOL_VERSION);
+        drop(client);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stateless_requests_can_select_an_advertised_older_revision() {
+        let (server_transport, client_transport) = tokio::io::duplex(16_384);
+        let task = tokio::spawn(run_server(test_server(), server_transport));
+        let mut client = IntoTransport::<rmcp::RoleClient, _, _>::into_transport(client_transport);
+        let meta = RequestMetaObject::with_client_context(
+            ProtocolVersion::V_2025_06_18,
+            Implementation::new("inline-client", "0.1.0"),
+            ClientCapabilities::default(),
+        );
+        client
+            .send(list_tools_request(1, Some(meta)))
+            .await
+            .unwrap();
+        let ServerJsonRpcMessage::Response(response) = receive(&mut client).await else {
+            panic!("expected inline tools response")
+        };
+        let ServerResult::ListToolsResult(list) = response.result else {
+            panic!("expected tools result")
+        };
+        assert_eq!(list.tools, AzmcpServer::tools());
+        assert_eq!(list.result_type, None);
+        assert_eq!(list.ttl_ms, None);
+        assert_eq!(list.cache_scope, None);
+        client.send(list_tools_request(2, None)).await.unwrap();
+        let ServerJsonRpcMessage::Error(error) = receive(&mut client).await else {
+            panic!("expected missing per-request metadata error")
+        };
+        assert_eq!(error.error.code, ErrorCode::INVALID_PARAMS);
+        drop(client);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_stateless_openers_return_errors_without_switching_lifecycles() {
+        for meta in [
+            None,
+            Some(json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": "invalid"
+            })),
+        ] {
+            let (server_transport, client_transport) = tokio::io::duplex(16_384);
+            let task = tokio::spawn(run_server(test_server(), server_transport));
+            let mut client =
+                IntoTransport::<rmcp::RoleClient, _, _>::into_transport(client_transport);
+            let mut opener =
+                json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {}});
+            if let Some(meta) = meta {
+                opener["params"]["_meta"] = meta;
+            }
+            client
+                .send(serde_json::from_value(opener).unwrap())
+                .await
+                .unwrap();
+            let ServerJsonRpcMessage::Error(error) = receive(&mut client).await else {
+                panic!("expected invalid opener error")
+            };
+            assert_eq!(error.error.code, ErrorCode::INVALID_PARAMS);
+            client
+                .send(list_tools_request(2, Some(modern_meta())))
+                .await
+                .unwrap();
+            assert!(matches!(
+                receive(&mut client).await,
+                ServerJsonRpcMessage::Response(_)
+            ));
+            client
+                .send(
+                    serde_json::from_value(json!({
+                        "jsonrpc": "2.0", "id": 3, "method": "initialize",
+                        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                            "clientInfo": {"name": "switch-client", "version": "0.1.0"}}
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let ServerJsonRpcMessage::Error(error) = receive(&mut client).await else {
+                panic!("expected lifecycle switch rejection")
+            };
+            assert_eq!(error.error.code, ErrorCode::INVALID_REQUEST);
+            drop(client);
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_ping_before_initialize_preserves_the_handshake() {
+        let (server_transport, client_transport) = tokio::io::duplex(16_384);
+        let task = tokio::spawn(run_server(test_server(), server_transport));
+        let mut client = IntoTransport::<rmcp::RoleClient, _, _>::into_transport(client_transport);
+        client
+            .send(
+                serde_json::from_value(json!({"jsonrpc": "2.0", "id": 9, "method": "ping"}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            receive(&mut client).await,
+            ServerJsonRpcMessage::Response(_)
+        ));
+        initialize_client(&mut client, PROTOCOL_VERSION).await;
+        client.send(list_tools_request(1, None)).await.unwrap();
+        assert!(matches!(
+            receive(&mut client).await,
+            ServerJsonRpcMessage::Response(_)
+        ));
+        drop(client);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn tool_lifecycle_is_explicit_and_structured() {
-        let (mut client, server_task) = modern_client().await;
+        let (mut client, server_task) = session_client().await;
         client
             .send(call_tool_request(1, CONTEXT_OPEN_TOOL, json!({})))
             .await
@@ -985,8 +1276,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_tools_return_modern_structured_results_and_domain_errors() {
-        let (mut client, server_task) = modern_client().await;
+    async fn schema_tools_return_structured_results_and_domain_errors() {
+        let (mut client, server_task) = session_client().await;
         client
             .send(call_tool_request(1, CONTEXT_OPEN_TOOL, json!({})))
             .await
@@ -1131,7 +1422,7 @@ mod tests {
 
     #[tokio::test]
     async fn result_too_large_is_a_shape_only_domain_error_with_reduction_guidance() {
-        let (mut client, server_task) = modern_client().await;
+        let (mut client, server_task) = session_client().await;
         client
             .send(call_tool_request(1, CONTEXT_OPEN_TOOL, json!({})))
             .await
@@ -1183,118 +1474,142 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn modern_cancellation_disposes_the_execution_context() {
-        let (mut client, server_task) = modern_client().await;
-        client
-            .send(call_tool_request(1, CONTEXT_OPEN_TOOL, json!({})))
-            .await
-            .unwrap();
-        let opened = receive_tool_result(&mut client).await;
-        let context_id = opened.structured_content.unwrap()["contextId"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+    async fn cancellation_disposes_the_execution_context() {
+        for version in [ProtocolVersion::V_2025_06_18, ProtocolVersion::V_2026_07_28] {
+            let (mut client, server_task) = client_with_protocol(test_server(), &version).await;
+            client
+                .send(call_tool_for_version(
+                    &version,
+                    1,
+                    CONTEXT_OPEN_TOOL,
+                    json!({}),
+                ))
+                .await
+                .unwrap();
+            let opened = receive_tool_result(&mut client).await;
+            let context_id = opened.structured_content.unwrap()["contextId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
 
-        client
-            .send(call_tool_request(
-                2,
-                RUN_TOOL,
-                json!({
-                    "contextId": context_id,
-                    "code": "__wait_for_cancellation__",
-                    "timeoutMs": 60_000
-                }),
-            ))
-            .await
+            client
+                .send(call_tool_for_version(
+                    &version,
+                    2,
+                    RUN_TOOL,
+                    json!({
+                        "contextId": context_id,
+                        "code": "__wait_for_cancellation__",
+                        "timeoutMs": 60_000
+                    }),
+                ))
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            let cancelled: ClientJsonRpcMessage = serde_json::from_value(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 2, "reason": "synthetic test cancellation"}
+            }))
             .unwrap();
-        tokio::task::yield_now().await;
-        let cancelled: ClientJsonRpcMessage = serde_json::from_value(json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/cancelled",
-            "params": {"requestId": 2, "reason": "synthetic test cancellation"}
-        }))
-        .unwrap();
-        client.send(cancelled).await.unwrap();
+            client.send(cancelled).await.unwrap();
 
-        client
-            .send(call_tool_request(
-                3,
-                RUN_TOOL,
-                json!({"contextId": context_id, "code": "must-not-run"}),
-            ))
-            .await
-            .unwrap();
-        let response = receive_tool_result(&mut client).await;
-        assert_eq!(response.is_error, Some(true));
-        assert_eq!(
-            response.structured_content.unwrap()["code"],
-            "context_evicted"
-        );
+            client
+                .send(call_tool_for_version(
+                    &version,
+                    3,
+                    RUN_TOOL,
+                    json!({"contextId": context_id, "code": "must-not-run"}),
+                ))
+                .await
+                .unwrap();
+            let response = receive_tool_result(&mut client).await;
+            assert_eq!(response.is_error, Some(true));
+            assert_eq!(
+                response.structured_content.unwrap()["code"],
+                "context_evicted"
+            );
 
-        drop(client);
-        server_task.await.unwrap().unwrap();
+            drop(client);
+            server_task.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
-    async fn modern_cancellation_rolls_back_context_open() {
-        let entered = Arc::new(Notify::new());
-        let registry =
-            azmcp_core::context::ContextRegistry::new(azmcp_core::context::RegistryConfig::new(
-                1,
-                Duration::from_secs(60),
-                Duration::from_secs(600),
-            ))
+    async fn cancellation_rolls_back_context_open() {
+        for version in [ProtocolVersion::V_2025_06_18, ProtocolVersion::V_2026_07_28] {
+            let entered = Arc::new(Notify::new());
+            let registry = azmcp_core::context::ContextRegistry::new(
+                azmcp_core::context::RegistryConfig::new(
+                    1,
+                    Duration::from_secs(60),
+                    Duration::from_secs(600),
+                ),
+            )
             .unwrap();
-        let server = test_server_with(
-            registry,
-            Arc::new(CancelOpenWorkerFactory {
-                calls: AtomicUsize::new(0),
-                entered: Arc::clone(&entered),
-            }),
-        );
-        let (mut client, server_task) = modern_client_with(server).await;
+            let server = test_server_with(
+                registry,
+                Arc::new(CancelOpenWorkerFactory {
+                    calls: AtomicUsize::new(0),
+                    entered: Arc::clone(&entered),
+                }),
+            );
+            let (mut client, server_task) = client_with_protocol(server, &version).await;
 
-        client
-            .send(call_tool_request(1, CONTEXT_OPEN_TOOL, json!({})))
-            .await
+            client
+                .send(call_tool_for_version(
+                    &version,
+                    1,
+                    CONTEXT_OPEN_TOOL,
+                    json!({}),
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                .await
+                .expect("context open entered worker startup");
+            let cancelled: ClientJsonRpcMessage = serde_json::from_value(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 1, "reason": "synthetic open cancellation"}
+            }))
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), entered.notified())
-            .await
-            .expect("context open entered worker startup");
-        let cancelled: ClientJsonRpcMessage = serde_json::from_value(json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/cancelled",
-            "params": {"requestId": 1, "reason": "synthetic open cancellation"}
-        }))
-        .unwrap();
-        client.send(cancelled).await.unwrap();
+            client.send(cancelled).await.unwrap();
 
-        client
-            .send(call_tool_request(2, CONTEXT_OPEN_TOOL, json!({})))
-            .await
-            .unwrap();
-        let opened = tokio::time::timeout(Duration::from_secs(1), receive_tool_result(&mut client))
-            .await
-            .expect("cancelled open released registry capacity");
-        assert_eq!(opened.is_error, Some(false));
-        let context_id = opened.structured_content.unwrap()["contextId"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+            client
+                .send(call_tool_for_version(
+                    &version,
+                    2,
+                    CONTEXT_OPEN_TOOL,
+                    json!({}),
+                ))
+                .await
+                .unwrap();
+            let opened =
+                tokio::time::timeout(Duration::from_secs(1), receive_tool_result(&mut client))
+                    .await
+                    .expect("cancelled open released registry capacity");
+            assert_eq!(opened.is_error, Some(false));
+            let context_id = opened.structured_content.unwrap()["contextId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
 
-        client
-            .send(call_tool_request(
-                3,
-                CONTEXT_CLOSE_TOOL,
-                json!({"contextId": context_id}),
-            ))
-            .await
-            .unwrap();
-        let closed = receive_tool_result(&mut client).await;
-        assert_eq!(closed.structured_content.unwrap(), json!({"closed": true}));
+            client
+                .send(call_tool_for_version(
+                    &version,
+                    3,
+                    CONTEXT_CLOSE_TOOL,
+                    json!({"contextId": context_id}),
+                ))
+                .await
+                .unwrap();
+            let closed = receive_tool_result(&mut client).await;
+            assert_eq!(closed.structured_content.unwrap(), json!({"closed": true}));
 
-        drop(client);
-        server_task.await.unwrap().unwrap();
+            drop(client);
+            server_task.await.unwrap().unwrap();
+        }
     }
 
     #[test]
@@ -1339,23 +1654,19 @@ mod tests {
     }
 
     #[test]
-    fn request_message_round_trip_uses_rmcp_modern_types() {
-        let mut request = rmcp::model::ListToolsRequest {
+    fn request_message_round_trip_needs_no_protocol_metadata() {
+        let request = rmcp::model::ListToolsRequest {
             method: Default::default(),
             params: None,
             extensions: Default::default(),
         };
-        request.extensions.insert(modern_meta());
         let message = ClientJsonRpcMessage::request(
             ClientRequest::ListToolsRequest(request),
             RequestId::Number(1),
         );
         let json = serde_json::to_value(&message).unwrap();
         assert_eq!(json["method"], "tools/list");
-        assert_eq!(
-            json["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
-            PROTOCOL_VERSION
-        );
+        assert!(json["params"]["_meta"].is_null());
         let _: ClientJsonRpcMessage = serde_json::from_value(json).unwrap();
     }
 }

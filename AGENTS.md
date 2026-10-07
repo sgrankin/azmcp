@@ -18,6 +18,6 @@ Treat all ambient Azure state and credentials as out of scope for development an
 ## Workflow
 
 - This repository uses JJ. Never run Git commands here.
-- Keep the MCP implementation modern-only until a concrete compatibility requirement
-  justifies a separately reviewed legacy lifecycle.
+- Support the reviewed MCP revisions through shared lifecycle detection and version-specific
+  wire results. Add revisions only with protocol regression coverage.
 - Do not advertise tools, input values, or capabilities that are not implemented.

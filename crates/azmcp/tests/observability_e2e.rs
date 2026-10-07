@@ -202,13 +202,11 @@ async fn modern_service_executes_synthetic_observability_end_to_end() {
     let server = AzmcpServer::new(application).expect("executable server");
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
-        rmcp::service::serve_directly(
-            server.modern_service(),
-            server_transport,
-            None::<rmcp::model::ClientInfo>,
-        )
-        .waiting()
-        .await
+        azmcp::serve(server, server_transport)
+            .await
+            .expect("start MCP service")
+            .waiting()
+            .await
     });
     let mut client = IntoTransport::<rmcp::RoleClient, _, _>::into_transport(client_transport);
 
