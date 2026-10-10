@@ -8,7 +8,7 @@ Application state is explicit: a
 caller opens an opaque context, runs one serialized JavaScript turn at a time,
 and closes the context. Each context fixes its identity, cloud bindings,
 subscription allowlist, Resource Graph scope, Azure-inspect-only capability,
-optional managed local capabilities, policy bundle, and isolated V8 worker.
+optional managed local capabilities, policy bundle, and isolated QuickJS worker.
 
 v0 is deliberately small. It exposes:
 
@@ -31,6 +31,10 @@ the reviewed `az.metrics` and `az.logs` helpers, the context-scoped
 writer described below. There is no general filesystem access, `fetch`,
 `Deno`, token access, ambient cloud, or ambient subscription.
 
+The JavaScript surface is synchronous.
+A helper waits for its host operation and returns the result directly.
+Use ordinary loops and functions; promises and async functions are unsupported.
+
 The metrics signatures are explicit and closed:
 
 ```js
@@ -52,7 +56,7 @@ most 20 metric names.
 Direct Log Analytics and workspace-backed Application Insights queries use:
 
 ```js
-await az.logs.query({
+az.logs.query({
   cloud: "AzureUSGovernment",
   workspaceId: "00000000-0000-0000-0000-000000000000",
   query: "AppRequests | take 10",
@@ -69,7 +73,7 @@ If starting from an Application Insights component, use Resource Graph to
 follow its `properties.WorkspaceResourceId` to the workspace, then use that
 workspace resource's `properties.customerId`.
 
-Every helper call must pass exactly `"AzureCloud"` for commercial Azure or
+Every Azure helper call must pass exactly `"AzureCloud"` for commercial Azure or
 `"AzureUSGovernment"` for US Government.
 azmcp does not infer cloud from `az cloud set` or other mutable CLI state.
 
@@ -105,28 +109,28 @@ MCP:
 ```
 
 ```js
-const receipt = await az.artifacts.writeJson({
+const receipt = az.artifacts.writeJson({
   name: "metrics.json",
   value: result
 })
 // {path, bytes, sha256, logicalBytes, mediaType, sensitivity}
 
-const arrayReceipt = await az.artifacts.writeJsonArray({
+const arrayReceipt = az.artifacts.writeJsonArray({
   name: "metrics.json.lz4",
   compression: "lz4",
-  values: asyncMetricBatches
+  values: metricBatches
 })
 
-const linesReceipt = await az.artifacts.writeJsonLines({
+const linesReceipt = az.artifacts.writeJsonLines({
   name: "metrics.jsonl",
   values: metricRows
 })
 ```
 
 `name` is one conservative ASCII filename ending in `.json`, never a path.
-The streamed helpers also accept `.jsonl`; compressed names add a `.lz4`
-suffix, producing `.json.lz4` or `.jsonl.lz4`.
-`values` may be an iterable or async iterable and is transferred in bounded,
+`writeJsonArray` requires `.json`; `writeJsonLines` requires `.jsonl`.
+Compressed names add a `.lz4` suffix, producing `.json.lz4` or `.jsonl.lz4`.
+`values` is a synchronous iterable and is transferred in bounded,
 acknowledged chunks rather than one giant worker message.
 `writeJsonArray` produces one conventional top-level JSON array;
 `writeJsonLines` writes one compact JSON value per line.
@@ -149,9 +153,10 @@ Receipt `bytes` and `sha256` describe the file actually stored at `path`.
 The media type is `application/json` for arrays and
 `application/x-ndjson` for JSON Lines.
 
-The managed artifact store currently requires Unix file identities and private
-mode semantics (macOS or Linux). Other platforms fail server startup until an
-equivalent exact file-identity and private-ACL implementation is reviewed.
+The managed artifact store requires Unix file identities and private mode
+semantics on macOS or Linux.
+Other platforms require an equivalent reviewed file-identity and private-ACL
+implementation before they can be supported.
 The boundary isolates JavaScript/MCP callers and other OS users; it does not
 treat another hostile process running as the same OS user as a separate
 principal. Do not share or concurrently rewrite the artifact root from an
@@ -179,14 +184,18 @@ path, filename, or JSON content.
 
 ## Build and test
 
-The workspace pins Rust 1.97.1 and `rmcp` 3.0.1.
+Go 1.26 or newer is required.
+The pinned `modernc.org/quickjs` runtime builds without a C compiler.
 
 ```sh
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --release
-cargo run -p azmcp-routegen -- --check
+CGO_ENABLED=0 go build -o target/go/azmcp ./cmd/azmcp
+go test ./internal/... ./cmd/...
+go vet ./internal/... ./cmd/...
+go run ./cmd/azmcp-routegen --check
 ```
+
+The managed artifact implementation supports macOS and Linux.
+Worker performance measurements are described in [benchmarks/worker](benchmarks/worker/README.md).
 
 The reviewed runtime manifest at
 `fixtures/reviewed-routes/v1-observability-1.json` is regenerated from the
@@ -304,7 +313,7 @@ The server echoes each supported initialize revision and rejects unsupported rev
 Modern clients must supply the required protocol and client-capability metadata on every
 request; older clients use their negotiated session information.
 Earlier revisions are unsupported.
-March 2025 requires receiving JSON-RPC batches, which the pinned SDK does not implement.
+JSON-RPC batches are unsupported.
 Application context handles work the same way for every revision.
 
 For Codex's optional `2026-07-28` client, retain the `mcp_2026_07_28` feature
@@ -324,29 +333,51 @@ during a context lifetime fails authentication and evicts the context. Token
 cache entries are context-scoped, so a newly opened context establishes its
 own current CLI principal.
 
-One worker process is retained per context. JavaScript turns default to 60
-seconds, the V8 heap is capped at 64 MiB, and the parent enforces a 256 MiB
-resident-set ceiling by sampling the child every 50 ms and hard-killing it on
-breach. Synthetic local workers measured roughly 28–32 MiB RSS after startup
-and roughly 67–80 MiB under heap pressure across recent runs on this macOS
-arm64 host, so the process ceiling leaves room for the configured V8 heap and
-runtime overhead. These are diagnostic samples, not a portability guarantee.
-Inline serialized results are capped at 64 KiB. Larger serializable values up
-to the bounded 480 KiB worker-reference ceiling become immutable, context-scoped
-refs with a structural preview; JavaScript can rehydrate one with
-`await az.ref(refId)` only in that context, and `az.peek(value)` returns a
-shape-only summary. Large object previews stop after bounded key sampling and
-iteration, then report `keyCountAtLeast`, `keysSampled`, and `hasMore` instead
-of claiming an exact count or omitted-key total. Cyclic, non-serializable, or over-hard-cap
-values fail closed with shape-only diagnostics, never truncated JSON. Reference IDs and
-stored values are disposed with context close, expiry, or capacity eviction;
-previews contain no value samples. Key names and string lengths are
-`customerData` metadata; this slice does not infer or propagate secret labels.
-At most eight host calls run concurrently.
-Cancellation, timeout, heap pressure, RSS pressure, worker death, close, TTL
-expiry, or credential-identity change dispose the affected context. The RSS
-sampler uses OS process APIs through `sysinfo`; it does not invoke `ps` or
-another shell command.
+One QuickJS worker process is retained per context.
+JavaScript turns default to 60 seconds, QuickJS allocations are capped at
+64 MiB, and the parent samples child RSS every 50 ms with a 256 MiB ceiling.
+The sampler uses native OS interfaces and hard-kills a worker on breach.
+A timeout, cancellation, worker failure, context close or expiry, or credential
+identity change disposes the affected context.
+An allocation error caught inside JavaScript can leave the context usable;
+the process RSS limit provides a separate bound on native memory.
+
+Host helpers return ordinary values synchronously:
+
+```js
+const response = az.request({
+  cloud: "AzureCloud",
+  method: "GET",
+  path: "/providers/Microsoft.Storage",
+  apiVersion: "2021-04-01"
+});
+response.body
+```
+
+Calls within a turn run in order.
+Returning a promise or thenable, or executing queued promise jobs, rejects the
+turn and evicts the context.
+There is no implicit promise-resolution transformation.
+Persistent lexical bindings and ordinary synchronous functions remain available
+across turns.
+Values use JavaScript `JSON.stringify` semantics, including `toJSON` methods.
+
+Inline serialized results are capped at 64 KiB.
+Larger serializable values up to 480 KiB become immutable, context-scoped refs
+with a structural preview; `az.ref(refId)` rehydrates one in that context.
+`az.peek(value)` returns a shape-only summary.
+For large objects, `az.peek` stops after bounded key sampling and iteration, then
+reports `keyCountAtLeast`, `keysSampled`, and `hasMore`.
+Reference and size-error previews describe the bounded serialized JSON value.
+Size errors include structural diagnostics; cycles and BigInt produce a generic
+`invalid_request` error.
+Top-level undefined and functions serialize as null.
+References last up to five minutes, with at most 32 entries and 4 MiB per context;
+capacity pressure evicts the oldest entries sooner.
+They are removed on context close or expiry.
+Previews contain no value samples.
+Key names and string lengths are `customerData` metadata; this version does not
+infer or propagate secret labels.
 
 Do not point development tests at a real Azure profile, credential cache, or
 subscription. Authenticated acceptance testing belongs in a separately

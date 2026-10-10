@@ -1,0 +1,1225 @@
+[
+  {
+    "name": "azure_accounts",
+    "description": "Enumerate cached Azure CLI subscription candidates across reviewed clouds without acquiring tokens or selecting a current account.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "accounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "cloud": {
+                "enum": [
+                  "AzureCloud",
+                  "AzureUSGovernment"
+                ]
+              },
+              "tenantId": {
+                "type": "string",
+                "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+              },
+              "subscriptionId": {
+                "type": "string",
+                "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+              },
+              "name": {
+                "type": "string"
+              },
+              "user": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string"
+              },
+              "tokenStatus": {
+                "const": "unknown"
+              }
+            },
+            "required": [
+              "cloud",
+              "tenantId",
+              "subscriptionId",
+              "name",
+              "user",
+              "state",
+              "tokenStatus"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "accounts"
+      ],
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "azure_context_open",
+    "description": "Open a persistent, Azure-inspect-only JavaScript context with immutable cloud bindings and optional managed local capabilities. Cloud is never inferred from `az cloud set`: every helper call must pass exactly `AzureCloud` for commercial Azure or `AzureUSGovernment` for US Government.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "identity": {
+          "const": "user",
+          "default": "user"
+        },
+        "armTier": {
+          "const": "inspect",
+          "default": "inspect"
+        },
+        "dataPlanes": {
+          "type": "array",
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "const": "logs.query"
+          },
+          "default": []
+        },
+        "localCapabilities": {
+          "type": "array",
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "const": "artifacts.write"
+          },
+          "default": []
+        },
+        "bindings": {
+          "type": "object",
+          "properties": {
+            "AzureCloud": {
+              "type": "object",
+              "properties": {
+                "subscription": {
+                  "type": "string",
+                  "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                },
+                "tenant": {
+                  "type": "string",
+                  "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                }
+              },
+              "required": [
+                "subscription"
+              ],
+              "additionalProperties": false
+            },
+            "AzureUSGovernment": {
+              "type": "object",
+              "properties": {
+                "subscription": {
+                  "type": "string",
+                  "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                },
+                "tenant": {
+                  "type": "string",
+                  "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                }
+              },
+              "required": [
+                "subscription"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "allowedSubscriptions": {
+          "type": "object",
+          "properties": {
+            "AzureCloud": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "subscription": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                  },
+                  "tenant": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                  }
+                },
+                "required": [
+                  "subscription",
+                  "tenant"
+                ],
+                "additionalProperties": false
+              },
+              "uniqueItems": true
+            },
+            "AzureUSGovernment": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "subscription": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                  },
+                  "tenant": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                  }
+                },
+                "required": [
+                  "subscription",
+                  "tenant"
+                ],
+                "additionalProperties": false
+              },
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        },
+        "graphScopes": {
+          "type": "object",
+          "properties": {
+            "AzureCloud": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "subscriptions": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                      }
+                    }
+                  },
+                  "required": [
+                    "subscriptions"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "scope": {
+                      "const": "allAccessible"
+                    }
+                  },
+                  "required": [
+                    "scope"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "AzureUSGovernment": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "subscriptions": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                      }
+                    }
+                  },
+                  "required": [
+                    "subscriptions"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "scope": {
+                      "const": "allAccessible"
+                    }
+                  },
+                  "required": [
+                    "scope"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "logsScopes": {
+          "type": "object",
+          "properties": {
+            "AzureCloud": {
+              "type": "object",
+              "properties": {
+                "scope": {
+                  "const": "allAccessible"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "additionalProperties": false
+            },
+            "AzureUSGovernment": {
+              "type": "object",
+              "properties": {
+                "scope": {
+                  "const": "allAccessible"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "contextId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "identity": {
+          "const": "user"
+        },
+        "armTier": {
+          "const": "inspect"
+        },
+        "dataPlanes": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "const": "logs.query"
+          }
+        },
+        "localCapabilities": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "const": "artifacts.write"
+          }
+        },
+        "resolvedBindings": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "properties": {
+              "cloud": {
+                "enum": [
+                  "AzureCloud",
+                  "AzureUSGovernment"
+                ]
+              },
+              "subscription": {
+                "type": "string",
+                "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+              },
+              "tenant": {
+                "type": "string",
+                "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+              }
+            },
+            "required": [
+              "cloud",
+              "subscription",
+              "tenant"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "allowedSubscriptions": {
+          "type": "object",
+          "properties": {
+            "AzureCloud": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "subscription": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                  },
+                  "tenant": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                  }
+                },
+                "required": [
+                  "subscription",
+                  "tenant"
+                ],
+                "additionalProperties": false
+              },
+              "uniqueItems": true
+            },
+            "AzureUSGovernment": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "subscription": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                  },
+                  "tenant": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                  }
+                },
+                "required": [
+                  "subscription",
+                  "tenant"
+                ],
+                "additionalProperties": false
+              },
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        },
+        "graphScopes": {
+          "type": "object",
+          "properties": {
+            "AzureCloud": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "subscriptions": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                      }
+                    }
+                  },
+                  "required": [
+                    "subscriptions"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "scope": {
+                      "const": "allAccessible"
+                    }
+                  },
+                  "required": [
+                    "scope"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "AzureUSGovernment": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "subscriptions": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+                      }
+                    }
+                  },
+                  "required": [
+                    "subscriptions"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "scope": {
+                      "const": "allAccessible"
+                    }
+                  },
+                  "required": [
+                    "scope"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "logsScopes": {
+          "type": "object",
+          "properties": {
+            "AzureCloud": {
+              "type": "object",
+              "properties": {
+                "scope": {
+                  "const": "allAccessible"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "additionalProperties": false
+            },
+            "AzureUSGovernment": {
+              "type": "object",
+              "properties": {
+                "scope": {
+                  "const": "allAccessible"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "contextId",
+        "identity",
+        "armTier",
+        "dataPlanes",
+        "localCapabilities",
+        "resolvedBindings",
+        "allowedSubscriptions",
+        "graphScopes",
+        "logsScopes",
+        "expiresAt"
+      ],
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "azure_context_close",
+    "description": "Immediately dispose a retained Azure JavaScript context and its worker process.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "contextId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        }
+      },
+      "required": [
+        "contextId"
+      ],
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "closed": {
+          "const": true
+        }
+      },
+      "required": [
+        "closed"
+      ],
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "azure_run",
+    "description": "Execute synchronous JavaScript in a retained QuickJS context. Azure host calls wait internally and return ordinary values; promises and async functions are unsupported. Use az.graph for fleet inventory, az.request for reviewed ARM routes, az.metrics.single({cloud, resourceId, metricNames, timespan?, interval?, aggregation?, top?, orderBy?, filter?, resultType?, metricNamespace?, autoAdjustTimegrain?, validateDimensions?, rollupBy?}) for one resource, az.metrics.batch({cloud, region, resourceIds, metricNamespace, metricNames, startTime?, endTime?, interval?, aggregation?, top?, orderBy?, filter?, rollupBy?}) for up to 50 same-type resources, and az.logs.query({cloud, subscription?, workspaceId, query, timespan}) for explicitly granted Log Analytics KQL. Cloud is never inferred from `az cloud set`: pass exactly `AzureCloud` for commercial Azure or `AzureUSGovernment` for US Government on every helper call. For example, replace the zero-GUID placeholder in az.logs.query({cloud: \"AzureUSGovernment\", workspaceId: \"00000000-0000-0000-0000-000000000000\", query: \"AppRequests | take 10\", timespan: \"PT1H\"}). workspaceId is the Log Analytics Workspace ID GUID, exposed as `properties.customerId` on a `Microsoft.OperationalInsights/workspaces` resource; it is not the workspace name or ARM resource ID, and it is not an Application Insights appId. When starting from an Application Insights component, use az.graph to follow its `properties.WorkspaceResourceId` to the workspace, then use that workspace resource's `properties.customerId`. Metrics batch also requires an explicit regional endpoint. With localCapabilities: [\"artifacts.write\"], az.artifacts.writeJson({name, value}) creates one compact JSON file up to 480 KiB. For larger iterable results, use az.artifacts.writeJsonArray({name, values, compression?}) for a top-level JSON array or az.artifacts.writeJsonLines({name, values, compression?}) for JSON Lines; compression may be \"lz4\", filenames must end in .json/.jsonl with an additional .lz4 suffix when compressed, and logical output is bounded at 64 MiB. All artifact helpers return a private local receipt. Oversized serializable results expose a context-scoped ref envelope; use az.ref(refId) in the same context to rehydrate it or az.peek(value) for a bounded shape summary.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "contextId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 262144
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600000,
+          "default": 60000
+        }
+      },
+      "required": [
+        "contextId",
+        "code"
+      ],
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "value": {},
+        "console": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "consoleOmitted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "calls": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "callsOmitted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "context": {
+          "type": "object"
+        },
+        "sensitivity": {
+          "enum": [
+            "public",
+            "customerData",
+            "secret"
+          ]
+        },
+        "correlationId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "console",
+        "consoleOmitted",
+        "calls",
+        "callsOmitted",
+        "context",
+        "sensitivity",
+        "correlationId"
+      ],
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "azure_schema_search",
+    "description": "Search the offline reviewed route and helper catalog for a retained context. Results include the exact execution surface (az.request, az.metrics.single, az.metrics.batch, or az.logs.query), audiences, scope requirements, reviewed versions, and context executability; use azure_schema_get for closed helper arguments.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "contextId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "cloud": {
+          "enum": [
+            "AzureCloud",
+            "AzureUSGovernment"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "default": 20
+        }
+      },
+      "required": [
+        "contextId",
+        "query"
+      ],
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "policyHash": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "policyVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "results": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "properties": {
+              "entryId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "resourceType": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "operation": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "executionSurface": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "displayName": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2048
+              },
+              "cliEquivalent": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "maxLength": 512
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "cloud": {
+                "enum": [
+                  "AzureCloud",
+                  "AzureUSGovernment"
+                ]
+              },
+              "audience": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "method": {
+                "enum": [
+                  "GET",
+                  "POST",
+                  "PUT",
+                  "PATCH",
+                  "DELETE"
+                ]
+              },
+              "pathTemplate": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              "canonicalPathTemplate": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              "apiVersions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 32,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64
+                }
+              },
+              "rbacAction": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "armTier": {
+                "enum": [
+                  "inspect",
+                  "read",
+                  "write"
+                ]
+              },
+              "dataPlaneGrant": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "dataPlane": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "dataScope": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "allowedQueryParameters": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                }
+              },
+              "access": {
+                "type": "object",
+                "properties": {
+                  "executable": {
+                    "type": "boolean"
+                  },
+                  "denialReason": {
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "maxLength": 64
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "executable",
+                  "denialReason"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "entryId",
+              "resourceType",
+              "operation",
+              "executionSurface",
+              "displayName",
+              "description",
+              "cliEquivalent",
+              "cloud",
+              "audience",
+              "method",
+              "pathTemplate",
+              "canonicalPathTemplate",
+              "apiVersions",
+              "rbacAction",
+              "armTier",
+              "dataPlaneGrant",
+              "dataPlane",
+              "dataScope",
+              "allowedQueryParameters",
+              "access"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "omitted": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "policyHash",
+        "policyVersion",
+        "query",
+        "results",
+        "omitted"
+      ],
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "azure_schema_get",
+    "description": "Get one offline reviewed route or helper entry at an exact API version. Helper argument schemas are closed and separate from host-owned HTTP body schemas; response schemas are metadataOnly unless a checked-in fixture exists.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "contextId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "entryId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "apiVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      },
+      "required": [
+        "contextId",
+        "entryId",
+        "apiVersion"
+      ],
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "policyHash": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "policyVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "schema": {
+          "type": "object",
+          "properties": {
+            "entryId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "resourceType": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "operation": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "executionSurface": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "displayName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "description": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            "cliEquivalent": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "maxLength": 512
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cloud": {
+              "enum": [
+                "AzureCloud",
+                "AzureUSGovernment"
+              ]
+            },
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "method": {
+              "enum": [
+                "GET",
+                "POST",
+                "PUT",
+                "PATCH",
+                "DELETE"
+              ]
+            },
+            "pathTemplate": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "canonicalPathTemplate": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "apiVersion": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "apiVersions": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 32,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            },
+            "rbacAction": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "armTier": {
+              "enum": [
+                "inspect",
+                "read",
+                "write"
+              ]
+            },
+            "dataPlaneGrant": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "maxLength": 128
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "dataPlane": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "maxLength": 128
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "dataScope": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "maxLength": 128
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "allowedQueryParameters": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              }
+            },
+            "argumentSchema": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "description": "A bounded, embedded JSON Schema 2020-12 document.",
+                  "additionalProperties": true
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "requestBodySchema": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "description": "A bounded, embedded JSON Schema 2020-12 document.",
+                  "additionalProperties": true
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "responseBodySchema": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "description": "A bounded, embedded JSON Schema 2020-12 document.",
+                  "additionalProperties": true
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "schemaAvailability": {
+              "enum": [
+                "metadataOnly",
+                "full"
+              ]
+            },
+            "access": {
+              "type": "object",
+              "properties": {
+                "executable": {
+                  "type": "boolean"
+                },
+                "denialReason": {
+                  "oneOf": [
+                    {
+                      "type": "string",
+                      "maxLength": 64
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "executable",
+                "denialReason"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "entryId",
+            "resourceType",
+            "operation",
+            "executionSurface",
+            "displayName",
+            "description",
+            "cliEquivalent",
+            "cloud",
+            "audience",
+            "method",
+            "pathTemplate",
+            "canonicalPathTemplate",
+            "apiVersion",
+            "apiVersions",
+            "rbacAction",
+            "armTier",
+            "dataPlaneGrant",
+            "dataPlane",
+            "dataScope",
+            "allowedQueryParameters",
+            "argumentSchema",
+            "requestBodySchema",
+            "responseBodySchema",
+            "schemaAvailability",
+            "access"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "policyHash",
+        "policyVersion",
+        "schema"
+      ],
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  }
+]
