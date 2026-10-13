@@ -62,6 +62,7 @@ type CallRecords struct {
 type HostConfig struct {
 	Context       core.ContextOptions
 	Client        *Client
+	ResponseBytes int
 	IdentityPin   *IdentityPin
 	CorrelationID string
 	Audit         func(CallRecord) error
@@ -80,6 +81,12 @@ func NewHost(config HostConfig) (*Host, error) {
 	if config.Client == nil {
 		return nil, hostError("client_unavailable", "HTTP client unavailable", true)
 	}
+	if config.ResponseBytes == 0 {
+		config.ResponseBytes = 1024 * 1024
+	}
+	if config.ResponseBytes < 1 || config.ResponseBytes > 8*1024*1024 || config.ResponseBytes > config.Client.limits.ResponseBytes {
+		return nil, invalidHost()
+	}
 	if err := config.Context.Validate(); err != nil {
 		return nil, err
 	}
@@ -89,14 +96,16 @@ func NewHost(config HostConfig) (*Host, error) {
 	if config.CorrelationID == "" || len(config.CorrelationID) > 128 || strings.IndexFunc(config.CorrelationID, unicode.IsControl) != -1 {
 		return nil, invalidHost()
 	}
-	// Each run captures the immutable option snapshot, including its maps.
+	// Concurrent operations must not share mutable grant storage.
 	raw, err := json.Marshal(config.Context)
 	if err != nil {
 		return nil, err
 	}
-	if err = json.Unmarshal(raw, &config.Context); err != nil {
+	var captured core.ContextOptions
+	if err = json.Unmarshal(raw, &captured); err != nil {
 		return nil, err
 	}
+	config.Context = captured
 	return &Host{config: config, records: []CallRecord{}}, nil
 }
 func (h *Host) Records() CallRecords {
@@ -151,7 +160,12 @@ func (h *Host) audited(ctx context.Context, record CallRecord, execute func(*Cal
 	}
 	record.DurationMS = uint64(time.Since(started).Milliseconds())
 	if h.config.Audit != nil && h.config.Audit(record) != nil {
-		err = hostError("audit_unavailable", "durable request audit log is unavailable", true)
+		failure := hostError("audit_unavailable", "durable request audit log is unavailable", true)
+		var original *HostError
+		if errors.As(err, &original) {
+			failure.IdentityMismatch = original.IdentityMismatch
+		}
+		err = failure
 	}
 	h.mu.Lock()
 	if len(h.records) < 128 {
@@ -242,7 +256,7 @@ func cloudRequired(cloud *core.Cloud) (core.Cloud, error) {
 }
 func (h *Host) call(ctx context.Context, method string, raw json.RawMessage) (json.RawMessage, error) {
 	switch method {
-	case "az.request":
+	case "azure_request":
 		var args RequestArgs
 		if err := closedDecode(raw, &args, "method", "path", "apiVersion"); err != nil {
 			return nil, err
@@ -284,7 +298,7 @@ func (h *Host) call(ctx context.Context, method string, raw json.RawMessage) (js
 			}
 			return h.execute(ctx, Request{Binding: binding, Purpose: "request", Method: args.Method, Target: target, APIVersion: args.APIVersion, Pin: h.config.IdentityPin}, record, false)
 		})
-	case "az.graph":
+	case "azure_graph":
 		var args GraphArgs
 		if err := closedDecode(raw, &args, "query"); err != nil {
 			return nil, err
@@ -353,7 +367,7 @@ func (h *Host) call(ctx context.Context, method string, raw json.RawMessage) (js
 			encoded, _ := json.Marshal(body)
 			return h.execute(ctx, Request{Binding: binding, Purpose: "resourceGraph", Method: "POST", Target: target, APIVersion: core.GraphAPIVersion, Body: encoded, Headers: map[string]string{"Content-Type": "application/json"}, Pin: h.config.IdentityPin}, record, false)
 		})
-	case "az.metrics.single":
+	case "azure_metrics_single":
 		var args MetricsArgs
 		if err := closedDecode(raw, &args, "resourceId", "metricNames"); err != nil {
 			return nil, err
@@ -385,7 +399,7 @@ func (h *Host) call(ctx context.Context, method string, raw json.RawMessage) (js
 			}
 			return h.execute(ctx, Request{Binding: binding, Purpose: "metricsSingle", Method: "GET", Target: target, APIVersion: core.MetricsAPIVersion, Pin: h.config.IdentityPin}, record, false)
 		})
-	case "az.metrics.batch":
+	case "azure_metrics_batch":
 		var args BatchArgs
 		if err := closedDecode(raw, &args, "region", "resourceIds", "metricNamespace", "metricNames"); err != nil {
 			return nil, err
@@ -435,7 +449,7 @@ func (h *Host) call(ctx context.Context, method string, raw json.RawMessage) (js
 			body, _ := json.Marshal(map[string]any{"resourceids": paths})
 			return h.execute(ctx, Request{Binding: binding, Purpose: "metricsBatch", Method: "POST", Target: target, APIVersion: core.MetricsAPIVersion, Region: args.Region, Body: body, Headers: map[string]string{"Content-Type": "application/json"}, Pin: h.config.IdentityPin}, record, false)
 		})
-	case "az.logs.query":
+	case "azure_logs_query":
 		var args LogsArgs
 		if err := closedDecode(raw, &args, "workspaceId", "query", "timespan"); err != nil {
 			return nil, err
@@ -500,7 +514,7 @@ func (h *Host) execute(ctx context.Context, request Request, record *CallRecord,
 		return nil, hostError("route_denied", "request denied by route policy", false)
 	}
 	record.PathTemplate, record.RBACAction, record.Decision = route.PathTemplate, ptr(route.RBACAction), "allowed"
-	response, err := h.config.Client.Execute(ctx, request)
+	response, err := h.config.Client.execute(ctx, request, h.config.ResponseBytes)
 	if err != nil {
 		var httpFailure *HTTPError
 		if errors.As(err, &httpFailure) {
@@ -512,7 +526,7 @@ func (h *Host) execute(ctx context.Context, request Request, record *CallRecord,
 	if remaining, err := strconv.ParseUint(response.Headers["x-ms-ratelimit-remaining-subscription-reads"], 10, 64); err == nil {
 		record.RemainingSubscriptionReads = &remaining
 	}
-	return decodeResponse(response, logs)
+	return decodeResponse(response, logs, h.config.ResponseBytes)
 }
 func (h *Host) ValidateBinding(ctx context.Context, binding core.ResolvedBinding) error {
 	record := h.record("context.validate", binding.Cloud)
@@ -601,11 +615,11 @@ func mapHTTPError(err error, binding core.ResolvedBinding) *HostError {
 	}
 	return hostError("upstream_error", "upstream request failed", true)
 }
-func decodeResponse(response Response, logs bool) (json.RawMessage, error) {
+func decodeResponse(response Response, logs bool, limit int) (json.RawMessage, error) {
 	if response.Status < 200 || response.Status >= 300 {
 		return nil, upstreamError(response, logs)
 	}
-	if len(response.Body) > 1024*1024 {
+	if len(response.Body) > limit {
 		return nil, hostError("response_too_large", "response exceeds the host JSON limit", false)
 	}
 	if !json.Valid(response.Body) {
@@ -617,11 +631,13 @@ func decodeResponse(response Response, logs bool) (json.RawMessage, error) {
 		}
 		return response.Body, nil
 	}
-	result, err := json.Marshal(map[string]any{"status": response.Status, "headers": response.Headers, "body": json.RawMessage(response.Body)})
-	if err != nil {
+	var result bytes.Buffer
+	encoder := json.NewEncoder(&result)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(map[string]any{"status": response.Status, "headers": response.Headers, "body": json.RawMessage(response.Body)}); err != nil {
 		return nil, hostError("invalid_response", "upstream response was not valid JSON", false)
 	}
-	return result, nil
+	return bytes.TrimSuffix(result.Bytes(), []byte{'\n'}), nil
 }
 func upstreamError(response Response, logs bool) *HostError {
 	operation := "Azure"

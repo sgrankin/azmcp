@@ -41,11 +41,7 @@ func TestProductionAssemblyAndToolDiscoveryAreInert(t *testing.T) {
 	for name, value := range map[string]string{"HOME": home, "AZMCP_CONFIG": filepath.Join(root, "absent.toml"), "AZURE_CONFIG_DIR": profileDir, "AZMCP_AZURE_PROFILE": profile, "AZMCP_AZ_EXECUTABLE": fakeCLI, "XDG_CONFIG_HOME": filepath.Join(home, "config"), "XDG_DATA_HOME": filepath.Join(home, "data"), "XDG_STATE_HOME": filepath.Join(home, "state"), "AZMCP_AUDIT_LOG": filepath.Join(home, "state", "audit.jsonl")} {
 		t.Setenv(name, value)
 	}
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime, err := Production(executable)
+	runtime, err := Production()
 	if err != nil {
 		t.Fatal(err)
 	}

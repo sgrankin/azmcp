@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"unicode/utf8"
 
 	"github.com/pierrec/lz4/v4"
 	"golang.org/x/sys/unix"
@@ -19,26 +20,12 @@ type stage struct {
 	id         identity
 	receipt    Receipt
 }
-type stream struct {
-	stage               *stage
-	file                *os.File
-	writer              io.Writer
-	compressor          *lz4.Writer
-	compression, format string
-	logical             int64
-	chunks              uint16
-	items               uint64
-	hasValues           bool
-	stored              *boundedWriter
-}
-
 type Turn struct {
 	store                            *Store
 	namespace                        Namespace
 	directory                        *os.File
 	ctx                              context.Context
 	stages                           []*stage
-	streams                          map[string]*stream
 	committed, rolledBack, finalized bool
 }
 
@@ -87,12 +74,8 @@ func (t *Turn) prepare() error {
 	return nil
 }
 
-func (t *Turn) create(name, compression, format string) (*stage, *os.File, error) {
-	actualCompression, actualFormat, err := fileFormat(name)
-	if err != nil || actualCompression != compression || actualFormat != format {
-		return nil, nil, ErrInvalidName
-	}
-	if _, err = statAt(t.directory, name); err == nil {
+func (t *Turn) create(name string) (*stage, *os.File, error) {
+	if _, err := statAt(t.directory, name); err == nil {
 		return nil, nil, ErrExists
 	} else if !errors.Is(err, unix.ENOENT) {
 		return nil, nil, ErrUnsafe
@@ -106,13 +89,8 @@ func (t *Turn) create(name, compression, format string) (*stage, *os.File, error
 				return nil, nil, ErrExists
 			}
 		}
-		for _, stream := range other.streams {
-			if stream.stage.name == name {
-				return nil, nil, ErrExists
-			}
-		}
 	}
-	if err = t.store.capacity(t.namespace, 1, 0); err != nil {
+	if err := t.store.capacity(t.namespace, 1, 0); err != nil {
 		return nil, nil, err
 	}
 	temporary, err := randomName(".tmp_")
@@ -154,46 +132,67 @@ func (w *boundedWriter) Write(data []byte) (int, error) {
 	return n, err
 }
 
-func (t *Turn) Put(name string, value any) (Receipt, error) {
-	compression, format, nameErr := fileFormat(name)
-	if nameErr != nil || compression != "identity" || format != "jsonArray" {
+// PutJSON stages a complete JSON response without translating its values.
+func (t *Turn) PutJSON(name string, value json.RawMessage, compression string) (result Receipt, resultErr error) {
+	actualCompression, format, err := fileFormat(name)
+	if err != nil || actualCompression != compression || format != "json" {
 		return Receipt{}, ErrInvalidName
 	}
-	var buffer bytes.Buffer
-	encoder := json.NewEncoder(&buffer)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(value); err != nil {
-		return Receipt{}, err
+	value = bytes.Trim(value, " \t\r\n")
+	logicalBytes := int64(len(value)) + 1
+	if logicalBytes > t.store.limits.StreamLogicalBytes || (compression == "identity" && logicalBytes > t.store.limits.StreamStoredBytes) {
+		return Receipt{}, ErrValueTooLarge
+	}
+	if !utf8.Valid(value) || !json.Valid(value) {
+		return Receipt{}, errors.New("artifact value is not JSON")
 	}
 	t.store.mu.Lock()
 	defer t.store.mu.Unlock()
-	defer t.store.releaseIdle()
-	if err := t.check(); err != nil {
+	defer func() { resultErr = errors.Join(resultErr, t.store.releaseIdle()) }()
+	if err = t.prepare(); err != nil {
 		return Receipt{}, err
 	}
-	if int64(buffer.Len()) > t.store.limits.ArtifactBytes {
-		return Receipt{}, ErrValueTooLarge
-	}
-	if err := t.prepare(); err != nil {
-		return Receipt{}, err
-	}
-	stage, file, err := t.create(name, "identity", "jsonArray")
+	stage, file, err := t.create(name)
 	if err != nil {
 		return Receipt{}, err
 	}
 	t.stages = append(t.stages, stage)
-	writer := boundedWriter{t, file, t.store.limits.ArtifactBytes, 0}
-	_, err = writer.Write(buffer.Bytes())
-	if err == nil {
-		err = file.Sync()
+	defer func() {
+		resultErr = errors.Join(resultErr, file.Close())
+		if resultErr != nil {
+			result = Receipt{}
+			resultErr = errors.Join(resultErr, t.removeStage(stage))
+		}
+	}()
+	stored := boundedWriter{t, file, t.store.limits.StreamStoredBytes, 0}
+	hash := sha256.New()
+	var writer io.Writer = io.MultiWriter(&stored, hash)
+	var compressor *lz4.Writer
+	if compression == "lz4" {
+		compressor = lz4.NewWriter(writer)
+		if err = compressor.Apply(lz4.BlockSizeOption(lz4.Block256Kb), lz4.ChecksumOption(true), lz4.BlockChecksumOption(false), lz4.ConcurrencyOption(1)); err != nil {
+			return Receipt{}, err
+		}
+		writer = compressor
 	}
-	closeErr := file.Close()
-	err = errors.Join(err, closeErr)
-	if err != nil {
-		return Receipt{}, errors.Join(err, t.removeStage(stage))
+	if _, err = writer.Write(value); err != nil {
+		return Receipt{}, err
 	}
-	digest := sha256.Sum256(buffer.Bytes())
-	stage.receipt = receipt(t.store.root, t.namespace.name, name, int64(buffer.Len()), int64(buffer.Len()), hex.EncodeToString(digest[:]), "identity", "jsonArray")
+	if _, err = writer.Write([]byte{'\n'}); err != nil {
+		return Receipt{}, err
+	}
+	if compressor != nil {
+		if err = compressor.Close(); err != nil {
+			return Receipt{}, err
+		}
+	}
+	if err = file.Sync(); err != nil {
+		return Receipt{}, err
+	}
+	if err = t.ctx.Err(); err != nil {
+		return Receipt{}, err
+	}
+	stage.receipt = receipt(t.store.root, t.namespace.name, name, stored.count, logicalBytes, hex.EncodeToString(hash.Sum(nil)), compression, "json")
 	return stage.receipt, nil
 }
 
@@ -213,197 +212,6 @@ func (t *Turn) Discard(receipt Receipt) error {
 	return ErrMismatch
 }
 
-func (t *Turn) Begin(name, compression, format string) (string, error) {
-	actualCompression, actualFormat, err := fileFormat(name)
-	if err != nil || actualCompression != compression || actualFormat != format {
-		return "", ErrInvalidName
-	}
-	t.store.mu.Lock()
-	defer t.store.mu.Unlock()
-	defer t.store.releaseIdle()
-	if err := t.prepare(); err != nil {
-		return "", err
-	}
-	stage, file, err := t.create(name, compression, format)
-	if err != nil {
-		return "", err
-	}
-	id, err := randomName("stream_")
-	if err != nil {
-		file.Close()
-		unix.Unlinkat(int(t.directory.Fd()), stage.temp, 0)
-		return "", err
-	}
-	str := &stream{stage: stage, file: file, compression: compression, format: format}
-	str.stored = &boundedWriter{t, file, t.store.limits.StreamStoredBytes, 0}
-	str.writer = str.stored
-	if compression == "lz4" {
-		str.compressor = lz4.NewWriter(str.stored)
-		if err = str.compressor.Apply(lz4.BlockSizeOption(lz4.Block256Kb), lz4.ChecksumOption(true), lz4.BlockChecksumOption(false), lz4.ConcurrencyOption(1)); err != nil {
-			file.Close()
-			unix.Unlinkat(int(t.directory.Fd()), stage.temp, 0)
-			return "", err
-		}
-		str.writer = str.compressor
-	}
-	t.streams[id] = str
-	if format == "jsonArray" {
-		if t.store.limits.StreamLogicalBytes < 3 {
-			err = ErrValueTooLarge
-		} else {
-			_, err = str.writer.Write([]byte("["))
-			str.logical = 1
-		}
-		if err == nil {
-			err = str.flush()
-		}
-		if err != nil {
-			return "", errors.Join(err, t.abort(id))
-		}
-	}
-	return id, nil
-}
-
-func (s *stream) flush() error {
-	if s.compressor != nil {
-		if err := s.compressor.Flush(); err != nil {
-			return err
-		}
-	}
-	return s.file.Sync()
-}
-
-func (t *Turn) CheckStreamFormat(id, format string) error {
-	t.store.mu.Lock()
-	defer t.store.mu.Unlock()
-	if err := t.check(); err != nil {
-		return err
-	}
-	str, ok := t.streams[id]
-	if !ok || str.format != format {
-		return ErrMismatch
-	}
-	return nil
-}
-
-func (t *Turn) Append(id string, sequence uint16, values []json.RawMessage) (result error) {
-	t.store.mu.Lock()
-	defer t.store.mu.Unlock()
-	defer t.store.releaseIdle()
-	if err := t.check(); err != nil {
-		return err
-	}
-	str, ok := t.streams[id]
-	if !ok {
-		return ErrMismatch
-	}
-	if err := t.prepare(); err != nil {
-		return err
-	}
-	defer func() {
-		if result != nil {
-			result = errors.Join(result, t.abort(id))
-		}
-	}()
-	if sequence != str.chunks || sequence >= 192 || len(values) == 0 {
-		return ErrMismatch
-	}
-	var encoded bytes.Buffer
-	for index, value := range values {
-		if !json.Valid(value) {
-			return errors.New("artifact item is not JSON")
-		}
-		if str.format == "jsonArray" && (str.hasValues || index != 0) {
-			encoded.WriteByte(',')
-		}
-		if err := json.Compact(&encoded, value); err != nil {
-			return err
-		}
-		if str.format == "jsonLines" {
-			encoded.WriteByte('\n')
-		}
-		if encoded.Len() > MaxAppendBytes {
-			return ErrValueTooLarge
-		}
-	}
-	suffix := int64(0)
-	if str.format == "jsonArray" {
-		suffix = 2
-	}
-	if str.logical+int64(encoded.Len())+suffix > t.store.limits.StreamLogicalBytes {
-		return ErrValueTooLarge
-	}
-	if _, err := str.writer.Write(encoded.Bytes()); err != nil {
-		return err
-	}
-	if err := str.flush(); err != nil {
-		return err
-	}
-	str.logical += int64(encoded.Len())
-	str.items += uint64(len(values))
-	str.chunks++
-	str.hasValues = true
-	return nil
-}
-
-func (t *Turn) Finish(id string, chunks uint16, items uint64) (result Receipt, resultErr error) {
-	t.store.mu.Lock()
-	defer t.store.mu.Unlock()
-	defer t.store.releaseIdle()
-	if err := t.check(); err != nil {
-		return Receipt{}, err
-	}
-	str, ok := t.streams[id]
-	if !ok {
-		return Receipt{}, ErrMismatch
-	}
-	if err := t.prepare(); err != nil {
-		return Receipt{}, err
-	}
-	defer func() {
-		if resultErr != nil {
-			resultErr = errors.Join(resultErr, t.abort(id))
-		}
-	}()
-	if chunks != str.chunks || items != str.items {
-		return Receipt{}, ErrMismatch
-	}
-	suffix := []byte{}
-	if str.format == "jsonArray" {
-		suffix = []byte("]\n")
-	}
-	if str.logical+int64(len(suffix)) > t.store.limits.StreamLogicalBytes {
-		return Receipt{}, ErrValueTooLarge
-	}
-	if _, err := str.writer.Write(suffix); err != nil {
-		return Receipt{}, err
-	}
-	if str.compressor != nil {
-		if err := str.compressor.Close(); err != nil {
-			return Receipt{}, err
-		}
-		str.compressor = nil
-	}
-	if err := str.file.Sync(); err != nil {
-		return Receipt{}, err
-	}
-	if _, err := str.file.Seek(0, io.SeekStart); err != nil {
-		return Receipt{}, err
-	}
-	hash := sha256.New()
-	if _, err := io.Copy(hash, contextReader{t.ctx, str.file}); err != nil {
-		return Receipt{}, err
-	}
-	if err := str.file.Close(); err != nil {
-		return Receipt{}, err
-	}
-	str.file = nil
-	str.stage.receipt = receipt(t.store.root, t.namespace.name, str.stage.name, str.stored.count, str.logical+int64(len(suffix)), hex.EncodeToString(hash.Sum(nil)), str.compression, str.format)
-	t.stages = append(t.stages, str.stage)
-	delete(t.streams, id)
-	return str.stage.receipt, nil
-}
-
 type contextReader struct {
 	ctx    context.Context
 	reader io.Reader
@@ -414,30 +222,6 @@ func (r contextReader) Read(data []byte) (int, error) {
 		return 0, err
 	}
 	return r.reader.Read(data)
-}
-
-func (t *Turn) Abort(id string) error {
-	t.store.mu.Lock()
-	defer t.store.mu.Unlock()
-	defer t.store.releaseIdle()
-	return t.abort(id)
-}
-func (t *Turn) abort(id string) error {
-	str, ok := t.streams[id]
-	if !ok {
-		return nil
-	}
-	if str.file != nil {
-		str.file.Close()
-		str.file = nil
-	}
-	// An aborted compressor is discarded without flushing any unpublished bytes.
-	str.compressor = nil
-	err := removeExact(t.directory, str.stage.temp, str.stage.id)
-	if err == nil {
-		delete(t.streams, id)
-	}
-	return err
 }
 
 func removeExact(directory *os.File, name string, id identity) error {
@@ -501,8 +285,7 @@ func (t *Turn) validateStage(stage *stage) error {
 	return nil
 }
 
-// Commit publishes all stages together at the host's commit point.
-// The turn retains its ownership tickets so a close race can still roll them back.
+// Retain exact publication ownership so cancellation can undo a commit before acceptance.
 func (t *Turn) Commit() (result error) {
 	t.store.mu.Lock()
 	defer t.store.mu.Unlock()
@@ -518,9 +301,6 @@ func (t *Turn) Commit() (result error) {
 			result = errors.Join(result, t.rollback())
 		}
 	}()
-	if len(t.streams) != 0 {
-		return errors.New("unfinished artifact streams")
-	}
 	if len(t.stages) == 0 {
 		t.committed = true
 		return nil
@@ -615,9 +395,6 @@ func (t *Turn) rollback() error {
 		return ErrClosed
 	}
 	var result error
-	for id := range t.streams {
-		result = errors.Join(result, t.abort(id))
-	}
 	owned := append([]*stage(nil), t.stages...)
 	for _, stage := range owned {
 		result = errors.Join(result, t.removeStage(stage))

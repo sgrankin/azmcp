@@ -42,6 +42,14 @@ func testTurn(t *testing.T, s *Store, ns Namespace) *Turn {
 	return turn
 }
 
+func put(turn *Turn, name string, value any) (Receipt, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return Receipt{}, err
+	}
+	return turn.PutJSON(name, raw, "identity")
+}
+
 func TestCreateOnlyPrivatePublicationAndPersistence(t *testing.T) {
 	root := testRoot(t)
 	s, err := NewStore(root, DefaultLimits())
@@ -53,7 +61,7 @@ func TestCreateOnlyPrivatePublicationAndPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	turn := testTurn(t, s, ns)
-	receipt, err := turn.Put("rows.json", map[string]any{"answer": 42})
+	receipt, err := put(turn, "rows.json", map[string]any{"answer": 42})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +82,7 @@ func TestCreateOnlyPrivatePublicationAndPersistence(t *testing.T) {
 		t.Fatalf("private root: %v %v", stat, err)
 	}
 	other := testTurn(t, s, ns)
-	if _, err = other.Put("rows.json", 42); !errors.Is(err, ErrExists) {
+	if _, err = put(other, "rows.json", 42); !errors.Is(err, ErrExists) {
 		t.Fatal(err)
 	}
 	other.Rollback()
@@ -85,7 +93,7 @@ func TestCreateOnlyPrivatePublicationAndPersistence(t *testing.T) {
 	defer second.Close()
 	secondNS, _ := second.AllocateNamespace()
 	secondTurn := testTurn(t, second, secondNS)
-	if _, err = secondTurn.Put("rows.json", 0); !errors.Is(err, ErrInUse) {
+	if _, err = put(secondTurn, "rows.json", 0); !errors.Is(err, ErrInUse) {
 		t.Fatalf("pending commit allowed a second writer: %v", err)
 	}
 	if err = turn.Finalize(); err != nil {
@@ -112,7 +120,7 @@ func TestRollbackCancellationAndDiscard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := turn.Put("first.json", 42)
+	receipt, err := put(turn, "first.json", 42)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,14 +135,14 @@ func TestRollbackCancellationAndDiscard(t *testing.T) {
 		t.Fatal(err)
 	}
 	turn = testTurn(t, s, ns)
-	receipt, err = turn.Put("first.json", 42)
+	receipt, err = put(turn, "first.json", 42)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = turn.Discard(receipt); err != nil {
 		t.Fatal(err)
 	}
-	kept, err := turn.Put("second.json", 43)
+	kept, err := put(turn, "second.json", 43)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,9 +163,9 @@ func TestRollbackCancellationAndDiscard(t *testing.T) {
 	}
 }
 
-func TestQuotasIncludeStagesStreamsAndRestart(t *testing.T) {
+func TestQuotasIncludeStagesAndRestart(t *testing.T) {
 	limits := DefaultLimits()
-	limits.ArtifactBytes = 32
+	limits.StreamLogicalBytes = 32
 	limits.ContextBytes = 64
 	limits.RootBytes = 64
 	limits.ContextFiles = 1
@@ -169,23 +177,23 @@ func TestQuotasIncludeStagesStreamsAndRestart(t *testing.T) {
 	}
 	ns, _ := s.AllocateNamespace()
 	turn := testTurn(t, s, ns)
-	if _, err = turn.Put("big.json", strings.Repeat("x", 32)); !errors.Is(err, ErrValueTooLarge) {
+	if _, err = put(turn, "big.json", strings.Repeat("x", 32)); !errors.Is(err, ErrValueTooLarge) {
 		t.Fatal(err)
 	}
-	if _, err = turn.Put("../bad.json", 42); !errors.Is(err, ErrInvalidName) {
+	if _, err = put(turn, "../bad.json", 42); !errors.Is(err, ErrInvalidName) {
 		t.Fatal(err)
 	}
-	id, err := turn.Begin("stream.json", "identity", "jsonArray")
+	staged, err := put(turn, "staged.json", 42)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = turn.Put("second.json", 42); !errors.Is(err, ErrQuota) {
+	if _, err = put(turn, "second.json", 42); !errors.Is(err, ErrQuota) {
 		t.Fatal(err)
 	}
-	if err = turn.Abort(id); err != nil {
+	if err = turn.Discard(staged); err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := turn.Put("kept.json", 42)
+	receipt, err := put(turn, "kept.json", 42)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,87 +213,13 @@ func TestQuotasIncludeStagesStreamsAndRestart(t *testing.T) {
 	defer s.Close()
 	ns, _ = s.AllocateNamespace()
 	turn = testTurn(t, s, ns)
-	if _, err = turn.Put("other.json", 1); !errors.Is(err, ErrQuota) {
+	if _, err = put(turn, "other.json", 1); !errors.Is(err, ErrQuota) {
 		t.Fatal("restart quota not charged", err)
 	}
 	if data, err := os.ReadFile(receipt.Path); err != nil || string(data) != "42\n" {
 		t.Fatal(err)
 	}
 	turn.Rollback()
-}
-
-func TestStreamFormatsCountsCompressionAndChecksums(t *testing.T) {
-	for _, compression := range []string{"identity", "lz4"} {
-		for _, format := range []string{"jsonArray", "jsonLines"} {
-			t.Run(compression+format, func(t *testing.T) {
-				s, ns := testStore(t, DefaultLimits())
-				turn := testTurn(t, s, ns)
-				name := "rows.json"
-				expected := "[1,{\"value\":2}]\n"
-				if format == "jsonLines" {
-					name = "rows.jsonl"
-					expected = "1\n{\"value\":2}\n"
-				}
-				if compression == "lz4" {
-					name += ".lz4"
-				}
-				id, err := turn.Begin(name, compression, format)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err = turn.Append(id, 0, []json.RawMessage{json.RawMessage(`1`), json.RawMessage(`{"value":2}`)}); err != nil {
-					t.Fatal(err)
-				}
-				receipt, err := turn.Finish(id, 1, 2)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err = turn.Commit(); err != nil {
-					t.Fatal(err)
-				}
-				data, actual, err := s.Read(context.Background(), ns, name)
-				if err != nil || string(data) != expected || actual != receipt {
-					t.Fatalf("stream read %q %#v %v", data, actual, err)
-				}
-				if err = turn.Finalize(); err != nil {
-					t.Fatal(err)
-				}
-				if compression == "lz4" {
-					stored, err := os.ReadFile(receipt.Path)
-					if err != nil {
-						t.Fatal(err)
-					}
-					stored[len(stored)-1] ^= 0xff
-					if err = os.WriteFile(receipt.Path, stored, 0600); err != nil {
-						t.Fatal(err)
-					}
-					if _, _, err = s.Read(context.Background(), ns, name); err == nil {
-						t.Fatal("corrupt content checksum accepted")
-					}
-				}
-			})
-		}
-	}
-}
-
-func TestFailedStreamReleasesItsReservation(t *testing.T) {
-	limits := DefaultLimits()
-	limits.StreamLogicalBytes = 8
-	s, ns := testStore(t, limits)
-	turn := testTurn(t, s, ns)
-	id, err := turn.Begin("rows.json", "identity", "jsonArray")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = turn.Append(id, 0, []json.RawMessage{json.RawMessage(`"0123456789"`)}); !errors.Is(err, ErrValueTooLarge) {
-		t.Fatal(err)
-	}
-	if _, err = turn.Put("rows.json", 42); err != nil {
-		t.Fatalf("failed stream kept reservation: %v", err)
-	}
-	if err = turn.Commit(); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestSymlinksNamespaceReplacementAndExactRollback(t *testing.T) {
@@ -301,14 +235,14 @@ func TestSymlinksNamespaceReplacementAndExactRollback(t *testing.T) {
 		}
 		defer s.Close()
 		ns, _ := s.AllocateNamespace()
-		if _, err := testTurn(t, s, ns).Put("rows.json", 42); !errors.Is(err, ErrUnsafe) {
+		if _, err := put(testTurn(t, s, ns), "rows.json", 42); !errors.Is(err, ErrUnsafe) {
 			t.Fatal(err)
 		}
 	})
 	t.Run("file", func(t *testing.T) {
 		s, ns := testStore(t, DefaultLimits())
 		initial := testTurn(t, s, ns)
-		if _, err := initial.Put("initial.json", 0); err != nil {
+		if _, err := put(initial, "initial.json", 0); err != nil {
 			t.Fatal(err)
 		}
 		if err := initial.Rollback(); err != nil {
@@ -325,7 +259,7 @@ func TestSymlinksNamespaceReplacementAndExactRollback(t *testing.T) {
 			t.Fatal(err)
 		}
 		turn := testTurn(t, s, ns)
-		if _, err := turn.Put("rows.json", 42); err == nil {
+		if _, err := put(turn, "rows.json", 42); err == nil {
 			t.Fatal("followed destination symlink")
 		}
 		data, _ := os.ReadFile(target)
@@ -337,7 +271,7 @@ func TestSymlinksNamespaceReplacementAndExactRollback(t *testing.T) {
 	t.Run("namespace", func(t *testing.T) {
 		s, ns := testStore(t, DefaultLimits())
 		turn := testTurn(t, s, ns)
-		if _, err := turn.Put("initial.json", 0); err != nil {
+		if _, err := put(turn, "initial.json", 0); err != nil {
 			t.Fatal(err)
 		}
 		directory := filepath.Join(s.root, ns.name)
@@ -347,7 +281,7 @@ func TestSymlinksNamespaceReplacementAndExactRollback(t *testing.T) {
 		if err := os.Mkdir(directory, 0700); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := turn.Put("rows.json", 42); !errors.Is(err, ErrUnsafe) {
+		if _, err := put(turn, "rows.json", 42); !errors.Is(err, ErrUnsafe) {
 			t.Fatal(err)
 		}
 		turn.Rollback()
@@ -355,7 +289,7 @@ func TestSymlinksNamespaceReplacementAndExactRollback(t *testing.T) {
 	t.Run("replacement", func(t *testing.T) {
 		s, ns := testStore(t, DefaultLimits())
 		turn := testTurn(t, s, ns)
-		receipt, err := turn.Put("rows.json", 42)
+		receipt, err := put(turn, "rows.json", 42)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -392,7 +326,7 @@ func TestConcurrentCreateOnlyNameReservation(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			if _, err = turn.Put("same.json", 42); err == nil {
+			if _, err = put(turn, "same.json", 42); err == nil {
 				results <- turn
 			} else if errors.Is(err, ErrExists) {
 				turn.Rollback()
@@ -423,7 +357,7 @@ func TestCloseRollsBackActiveAndScavengesAbandonedStages(t *testing.T) {
 	}
 	ns, _ := s.AllocateNamespace()
 	turn := testTurn(t, s, ns)
-	receipt, err := turn.Put("rows.json", 42)
+	receipt, err := put(turn, "rows.json", 42)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +382,7 @@ func TestCloseRollsBackActiveAndScavengesAbandonedStages(t *testing.T) {
 	defer s.Close()
 	newNS, _ := s.AllocateNamespace()
 	newTurn := testTurn(t, s, newNS)
-	if _, err = newTurn.Put("new.json", 0); err != nil {
+	if _, err = put(newTurn, "new.json", 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = os.Stat(path); !errors.Is(err, os.ErrNotExist) {
@@ -485,22 +419,22 @@ func TestLazySharedRootLocksOnlyOwnedWrites(t *testing.T) {
 		t.Fatal("a turn without writes touched the artifact root", err)
 	}
 	firstTurn = testTurn(t, first, firstNS)
-	if _, err = firstTurn.Put("first.json", 1); err != nil {
+	if _, err = put(firstTurn, "first.json", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = secondTurn.Put("second.json", 2); !errors.Is(err, ErrInUse) {
+	if _, err = put(secondTurn, "second.json", 2); !errors.Is(err, ErrInUse) {
 		t.Fatal("staged ownership did not hold the root lock", err)
 	}
 	if err = firstTurn.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = secondTurn.Put("second.json", 2); !errors.Is(err, ErrInUse) {
+	if _, err = put(secondTurn, "second.json", 2); !errors.Is(err, ErrInUse) {
 		t.Fatal("unfinalized publication did not hold rollback ownership", err)
 	}
 	if err = firstTurn.Finalize(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = secondTurn.Put("second.json", 2); err != nil {
+	if _, err = put(secondTurn, "second.json", 2); err != nil {
 		t.Fatal("idle first store blocked the second write", err)
 	}
 	if err = secondTurn.Commit(); err != nil {
@@ -510,24 +444,24 @@ func TestLazySharedRootLocksOnlyOwnedWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	thirdTurn := testTurn(t, first, firstNS)
-	streamID, err := thirdTurn.Begin("rows.jsonl", "identity", "jsonLines")
+	staged, err := put(thirdTurn, "staged.json", 3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fourthTurn := testTurn(t, second, secondNS)
-	if _, err = fourthTurn.Put("fourth.json", 4); !errors.Is(err, ErrInUse) {
-		t.Fatal("empty stream did not retain the root lock", err)
+	if _, err = put(fourthTurn, "fourth.json", 4); !errors.Is(err, ErrInUse) {
+		t.Fatal("staged export did not retain the root lock", err)
 	}
-	if err = thirdTurn.Abort(streamID); err != nil {
+	if err = thirdTurn.Discard(staged); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = fourthTurn.Put("fourth.json", 4); err != nil {
-		t.Fatal("last stream abort did not release the root lock", err)
+	if _, err = put(fourthTurn, "fourth.json", 4); err != nil {
+		t.Fatal("last staged export discard did not release the root lock", err)
 	}
 	if err = fourthTurn.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := thirdTurn.Put("discarded.json", 3)
+	receipt, err := put(thirdTurn, "discarded.json", 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -535,7 +469,7 @@ func TestLazySharedRootLocksOnlyOwnedWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	fifthTurn := testTurn(t, second, secondNS)
-	if _, err = fifthTurn.Put("fifth.json", 5); err != nil {
+	if _, err = put(fifthTurn, "fifth.json", 5); err != nil {
 		t.Fatal("last stage discard did not release the root lock", err)
 	}
 }

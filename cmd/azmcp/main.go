@@ -2,7 +2,6 @@ package main
 
 import (
 	"azmcp/internal/server"
-	"azmcp/internal/worker"
 	"context"
 	"errors"
 	"fmt"
@@ -12,18 +11,10 @@ import (
 )
 
 func run() error {
-	args := os.Args[1:]
-	if len(args) == 1 && args[0] == "--worker" {
-		return worker.RunWorker(os.Stdin, os.Stdout)
+	if len(os.Args) != 1 {
+		return fmt.Errorf("usage: azmcp")
 	}
-	if len(args) != 0 {
-		return fmt.Errorf("usage: azmcp [--worker]")
-	}
-	executable, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	runtime, err := server.Production(executable)
+	runtime, err := server.Production()
 	if err != nil {
 		return err
 	}

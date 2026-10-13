@@ -2,6 +2,7 @@ package artifact
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -14,7 +15,7 @@ func TestFinalizeRevalidatesPublishedOwnership(t *testing.T) {
 		t.Run(mutation, func(t *testing.T) {
 			s, ns := testStore(t, DefaultLimits())
 			turn := testTurn(t, s, ns)
-			receipt, err := turn.Put("rows.json", 42)
+			receipt, err := put(turn, "rows.json", 42)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -58,7 +59,7 @@ func TestFinalizeRevalidatesPublishedOwnership(t *testing.T) {
 func TestEmptyNamespaceCleanupPreservesReuseAndPersistentFiles(t *testing.T) {
 	s, ns := testStore(t, DefaultLimits())
 	turn := testTurn(t, s, ns)
-	if _, err := turn.Put("canceled.json", 42); err != nil {
+	if _, err := put(turn, "canceled.json", 42); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(s.root, ns.name)
@@ -69,17 +70,17 @@ func TestEmptyNamespaceCleanupPreservesReuseAndPersistentFiles(t *testing.T) {
 		t.Fatalf("rollback kept an empty namespace: %v", err)
 	}
 	turn = testTurn(t, s, ns)
-	id, err := turn.Begin("empty.jsonl", "identity", "jsonLines")
+	staged, err := put(turn, "temporary.json", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = turn.Abort(id); err != nil {
+	if err = turn.Discard(staged); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("abort kept an empty namespace: %v", err)
+		t.Fatalf("discard kept an empty namespace: %v", err)
 	}
-	receipt, err := turn.Put("kept.json", 43)
+	receipt, err := put(turn, "kept.json", 43)
 	if err != nil {
 		t.Fatalf("namespace was not reusable: %v", err)
 	}
@@ -98,10 +99,10 @@ func TestEmptyNamespaceCleanupPreservesReuseAndPersistentFiles(t *testing.T) {
 	}
 }
 
-func TestInvalidStreamDoesNotCreateRoot(t *testing.T) {
+func TestInvalidExportNameDoesNotCreateRoot(t *testing.T) {
 	s, ns := testStore(t, DefaultLimits())
 	turn := testTurn(t, s, ns)
-	if _, err := turn.Begin("../outside.json", "identity", "jsonArray"); !errors.Is(err, ErrInvalidName) {
+	if _, err := turn.PutJSON("../outside.json", json.RawMessage(`null`), "identity"); !errors.Is(err, ErrInvalidName) {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(s.root); !errors.Is(err, os.ErrNotExist) {
@@ -138,7 +139,7 @@ func TestExistingArtifactFormatRemainsUsable(t *testing.T) {
 		t.Fatal(err)
 	}
 	turn := testTurn(t, s, ns)
-	if _, err = turn.Put("next.json", 43); !errors.Is(err, ErrQuota) {
+	if _, err = put(turn, "next.json", 43); !errors.Is(err, ErrQuota) {
 		t.Fatalf("historical artifact was not charged: %v", err)
 	}
 	if err = turn.Rollback(); err != nil {
@@ -161,7 +162,7 @@ func TestExistingArtifactFormatRemainsUsable(t *testing.T) {
 		t.Fatal(err)
 	}
 	turn = testTurn(t, s, ns)
-	if _, err = turn.Put("next.json", 43); err != nil {
+	if _, err = put(turn, "next.json", 43); err != nil {
 		t.Fatalf("existing root was unusable: %v", err)
 	}
 	if err = turn.Commit(); err != nil {

@@ -19,10 +19,8 @@ import (
 )
 
 const (
-	MaxArtifactBytes      = 480 * 1024
 	MaxStreamLogicalBytes = 64 * 1024 * 1024
 	MaxStreamStoredBytes  = 65 * 1024 * 1024
-	MaxAppendBytes        = 400 * 1024
 	MaxContextFiles       = 32
 	MaxContextBytes       = 128 * 1024 * 1024
 	MaxRootFiles          = 256
@@ -43,18 +41,18 @@ var (
 )
 
 type Limits struct {
-	ArtifactBytes, StreamLogicalBytes, StreamStoredBytes int64
-	ContextFiles, RootFiles                              int
-	ContextBytes, RootBytes                              int64
+	StreamLogicalBytes, StreamStoredBytes int64
+	ContextFiles, RootFiles               int
+	ContextBytes, RootBytes               int64
 }
 
 func DefaultLimits() Limits {
-	return Limits{MaxArtifactBytes, MaxStreamLogicalBytes, MaxStreamStoredBytes, MaxContextFiles, MaxRootFiles, MaxContextBytes, MaxRootBytes}
+	return Limits{MaxStreamLogicalBytes, MaxStreamStoredBytes, MaxContextFiles, MaxRootFiles, MaxContextBytes, MaxRootBytes}
 }
 
 func (l Limits) validate() error {
 	d := DefaultLimits()
-	if l.ArtifactBytes <= 0 || l.ArtifactBytes > d.ArtifactBytes || l.StreamLogicalBytes <= 0 || l.StreamLogicalBytes > d.StreamLogicalBytes || l.StreamStoredBytes <= 0 || l.StreamStoredBytes > d.StreamStoredBytes || l.ContextFiles <= 0 || l.ContextFiles > d.ContextFiles || l.RootFiles <= 0 || l.RootFiles > d.RootFiles || l.ContextBytes <= 0 || l.ContextBytes > d.ContextBytes || l.RootBytes <= 0 || l.RootBytes > d.RootBytes || l.ArtifactBytes > l.ContextBytes || l.ArtifactBytes > l.RootBytes || l.ContextFiles > l.RootFiles || l.ContextBytes > l.RootBytes {
+	if l.StreamLogicalBytes <= 0 || l.StreamLogicalBytes > d.StreamLogicalBytes || l.StreamStoredBytes <= 0 || l.StreamStoredBytes > d.StreamStoredBytes || l.ContextFiles <= 0 || l.ContextFiles > d.ContextFiles || l.RootFiles <= 0 || l.RootFiles > d.RootFiles || l.ContextBytes <= 0 || l.ContextBytes > d.ContextBytes || l.RootBytes <= 0 || l.RootBytes > d.RootBytes || l.ContextFiles > l.RootFiles || l.ContextBytes > l.RootBytes {
 		return errors.New("artifact storage limits are invalid")
 	}
 	return nil
@@ -246,7 +244,7 @@ func (s *Store) acquire(create bool) error {
 
 func (s *Store) releaseIdle() error {
 	for turn := range s.turns {
-		if len(turn.stages) != 0 || len(turn.streams) != 0 {
+		if len(turn.stages) != 0 {
 			return nil
 		}
 	}
@@ -310,7 +308,7 @@ func fileFormat(name string) (compression, format string, err error) {
 		format = "jsonLines"
 		stem = strings.TrimSuffix(stem, ".jsonl")
 	} else if strings.HasSuffix(stem, ".json") {
-		format = "jsonArray"
+		format = "json"
 		stem = strings.TrimSuffix(stem, ".json")
 	} else {
 		return "", "", ErrInvalidName
@@ -396,7 +394,7 @@ func (s *Store) BeginTurn(ctx context.Context, ns Namespace) (*Turn, error) {
 	if ns.store != s || !validOpaque(ns.name, "ctx_") {
 		return nil, ErrMismatch
 	}
-	t := &Turn{store: s, namespace: ns, ctx: ctx, streams: make(map[string]*stream)}
+	t := &Turn{store: s, namespace: ns, ctx: ctx}
 	s.turns[t] = true
 	return t, nil
 }
@@ -560,11 +558,6 @@ func (s *Store) Delete(ctx context.Context, ns Namespace, name string) error {
 		if t.namespace == ns {
 			for _, stage := range t.stages {
 				if stage.name == name {
-					return ErrExists
-				}
-			}
-			for _, stream := range t.streams {
-				if stream.stage.name == name {
 					return ErrExists
 				}
 			}

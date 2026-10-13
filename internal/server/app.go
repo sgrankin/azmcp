@@ -4,7 +4,6 @@ import (
 	"azmcp/internal/artifact"
 	"azmcp/internal/azure"
 	"azmcp/internal/core"
-	"azmcp/internal/worker"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -12,10 +11,11 @@ import (
 	"errors"
 	"io"
 	"os"
-	"strings"
 	"sync"
 	"time"
 )
+
+const maxConcurrentOperations = 8
 
 type ProfileSource func(context.Context) ([]byte, error)
 type AppConfig struct {
@@ -26,7 +26,6 @@ type AppConfig struct {
 	Client               *azure.Client
 	Audit                Audit
 	Artifacts            *artifact.Store
-	Worker               WorkerFactory
 	MaxContexts          int
 	IdleTTL, AbsoluteTTL time.Duration
 }
@@ -41,14 +40,11 @@ type contextSlot struct {
 	options                              core.ContextOptions
 	pin                                  *azure.IdentityPin
 	namespace                            artifact.Namespace
-	worker                               WorkerHandle
-	busy                                 bool
+	active                               int
 	opened, idleExpires, absoluteExpires time.Time
 	life                                 context.Context
 	cancel                               context.CancelFunc
-	turn                                 *artifact.Turn
-	refs                                 refStore
-	wake                                 chan struct{}
+	exports                              map[*artifact.Turn]bool
 }
 
 type bindingArgs struct {
@@ -69,10 +65,12 @@ type openArgs struct {
 	GraphScopes          map[core.Cloud]scopeArgs   `json:"graphScopes"`
 	LogsScopes           map[core.Cloud]scopeArgs   `json:"logsScopes"`
 }
-type runArgs struct {
-	ContextID string  `json:"contextId"`
-	Code      string  `json:"code"`
-	TimeoutMS *uint64 `json:"timeoutMs"`
+type exportArgs struct {
+	ContextID   string          `json:"contextId"`
+	Name        string          `json:"name"`
+	Compression string          `json:"compression"`
+	Operation   string          `json:"operation"`
+	Arguments   json.RawMessage `json:"arguments"`
 }
 type contextArgs struct {
 	ContextID string `json:"contextId"`
@@ -93,7 +91,7 @@ func NewApplication(config AppConfig) (*Application, error) {
 	if err := config.Config.Validate(); err != nil {
 		return nil, err
 	}
-	if config.Profile == nil || config.Client == nil || config.Audit == nil || config.Artifacts == nil || config.Worker == nil {
+	if config.Profile == nil || config.Client == nil || config.Audit == nil || config.Artifacts == nil {
 		return nil, failure("invalid_request")
 	}
 	if config.MaxContexts == 0 {
@@ -143,25 +141,43 @@ func (a *Application) Call(ctx context.Context, name string, raw json.RawMessage
 		return a.accounts(ctx)
 	case "azure_context_open":
 		var args openArgs
-		if json.Unmarshal(raw, &args) != nil {
+		if core.DecodeClosed(raw, &args) != nil {
 			return nil, failure("invalid_request")
 		}
 		return a.open(ctx, args)
 	case "azure_context_close":
 		var args contextArgs
-		if json.Unmarshal(raw, &args) != nil {
+		if core.DecodeClosed(raw, &args) != nil {
 			return nil, failure("invalid_request")
 		}
 		return map[string]bool{"closed": true}, a.close(args.ContextID)
-	case "azure_run":
-		var args runArgs
-		if json.Unmarshal(raw, &args) != nil {
+	case "azure_request", "azure_graph", "azure_metrics_single", "azure_metrics_batch", "azure_logs_query":
+		fields, err := closedJSONObject(raw)
+		if err != nil {
 			return nil, failure("invalid_request")
 		}
-		return a.run(ctx, args)
+		var id string
+		if json.Unmarshal(fields["contextId"], &id) != nil {
+			return nil, failure("invalid_request")
+		}
+		delete(fields, "contextId")
+		arguments, err := marshalJSON(fields)
+		if err != nil {
+			return nil, failure("invalid_request")
+		}
+		return a.operate(ctx, id, name, arguments, nil)
+	case "azure_export":
+		var args exportArgs
+		if core.DecodeClosed(raw, &args) != nil || !azureOperation(args.Operation) || len(args.Arguments) == 0 {
+			return nil, failure("invalid_request")
+		}
+		if args.Compression == "" {
+			args.Compression = "identity"
+		}
+		return a.operate(ctx, args.ContextID, args.Operation, args.Arguments, &args)
 	case "azure_schema_search":
 		var args searchArgs
-		if json.Unmarshal(raw, &args) != nil {
+		if core.DecodeClosed(raw, &args) != nil {
 			return nil, failure("invalid_request")
 		}
 		slot, err := a.lease(args.ContextID)
@@ -177,10 +193,16 @@ func (a *Application) Call(ctx context.Context, name string, raw json.RawMessage
 		if err != nil {
 			return nil, err
 		}
+		a.mu.Lock()
+		liveErr := a.liveLocked(slot, ctx)
+		a.mu.Unlock()
+		if liveErr != nil {
+			return nil, liveErr
+		}
 		return map[string]any{"policyHash": slot.options.PolicyHash, "policyVersion": a.config.Schema.PolicyVersion, "query": args.Query, "results": result.Results, "omitted": result.Omitted}, nil
 	case "azure_schema_get":
 		var args getArgs
-		if json.Unmarshal(raw, &args) != nil {
+		if core.DecodeClosed(raw, &args) != nil {
 			return nil, failure("invalid_request")
 		}
 		slot, err := a.lease(args.ContextID)
@@ -191,6 +213,12 @@ func (a *Application) Call(ctx context.Context, name string, raw json.RawMessage
 		result, err := a.config.Schema.Get(slot.options, args.EntryID, args.APIVersion)
 		if err != nil {
 			return nil, err
+		}
+		a.mu.Lock()
+		liveErr := a.liveLocked(slot, ctx)
+		a.mu.Unlock()
+		if liveErr != nil {
+			return nil, liveErr
 		}
 		return map[string]any{"policyHash": slot.options.PolicyHash, "policyVersion": a.config.Schema.PolicyVersion, "schema": result}, nil
 	}
@@ -317,10 +345,15 @@ func (a *Application) resolve(ctx context.Context, args openArgs) (core.ContextO
 	}
 	return options, options.Validate()
 }
-func (a *Application) host(options core.ContextOptions, pin *azure.IdentityPin, correlation string) (*azure.Host, error) {
-	return azure.NewHost(azure.HostConfig{Context: options, Client: a.config.Client, IdentityPin: pin, CorrelationID: correlation, PrepareAudit: a.config.Audit.Prepare, Audit: func(record azure.CallRecord) error { return a.config.Audit.Append(record) }})
+func (a *Application) host(options core.ContextOptions, pin *azure.IdentityPin, correlation string, responseBytes int) (*azure.Host, error) {
+	return azure.NewHost(azure.HostConfig{Context: options, Client: a.config.Client, IdentityPin: pin, CorrelationID: correlation, ResponseBytes: responseBytes, PrepareAudit: a.config.Audit.Prepare, Audit: func(record azure.CallRecord) error { return a.config.Audit.Append(record) }})
 }
 func (a *Application) open(ctx context.Context, args openArgs) (result any, err error) {
+	defer func() {
+		if ctx.Err() != nil && err != nil {
+			err = failure("request_cancelled")
+		}
+	}()
 	options, err := a.resolve(ctx, args)
 	if err != nil {
 		return nil, err
@@ -330,7 +363,7 @@ func (a *Application) open(ctx context.Context, args openArgs) (result any, err 
 	if err != nil {
 		return nil, failure("upstream_error")
 	}
-	host, err := a.host(options, pin, correlation)
+	host, err := a.host(options, pin, correlation, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +376,7 @@ func (a *Application) open(ctx context.Context, args openArgs) (result any, err 
 		}
 	}
 	if ctx.Err() != nil {
-		return nil, failure("context_evicted")
+		return nil, failure("request_cancelled")
 	}
 	var bytes [32]byte
 	if _, err = rand.Read(bytes[:]); err != nil {
@@ -352,7 +385,7 @@ func (a *Application) open(ctx context.Context, args openArgs) (result any, err 
 	id := base64.RawURLEncoding.EncodeToString(bytes[:])
 	now := time.Now()
 	life, cancel := context.WithCancel(context.Background())
-	slot := &contextSlot{id: id, wake: make(chan struct{}, 1), options: options, pin: pin, opened: now, idleExpires: now.Add(a.config.IdleTTL), absoluteExpires: now.Add(a.config.AbsoluteTTL), life: life, cancel: cancel}
+	slot := &contextSlot{id: id, options: options, pin: pin, opened: now, idleExpires: now.Add(a.config.IdleTTL), absoluteExpires: now.Add(a.config.AbsoluteTTL), life: life, cancel: cancel, exports: map[*artifact.Turn]bool{}}
 	if core.Contains(options.LocalCapabilities, core.ArtifactsWriteCapability) {
 		slot.namespace, err = a.config.Artifacts.AllocateNamespace()
 		if err != nil {
@@ -366,6 +399,11 @@ func (a *Application) open(ctx context.Context, args openArgs) (result any, err 
 		cancel()
 		return nil, failure("upstream_error")
 	}
+	if ctx.Err() != nil {
+		a.mu.Unlock()
+		cancel()
+		return nil, failure("request_cancelled")
+	}
 	a.contexts[id] = slot
 	a.mu.Unlock()
 	defer func() {
@@ -373,21 +411,8 @@ func (a *Application) open(ctx context.Context, args openArgs) (result any, err 
 			a.dispose(slot)
 		}
 	}()
-	startup, stop := context.WithCancel(ctx)
-	unsubscribe := context.AfterFunc(life, stop)
-	handle, err := a.config.Worker(startup)
-	unsubscribe()
-	stop()
-	if err != nil {
-		return nil, failure("worker_crashed")
-	}
-	a.mu.Lock()
-	slot.worker = handle
-	live := a.contexts[id] == slot && life.Err() == nil && ctx.Err() == nil
-	a.mu.Unlock()
-	if !live {
-		handle.Terminate()
-		return nil, failure("context_evicted")
+	if ctx.Err() != nil {
+		return nil, failure("request_cancelled")
 	}
 	go a.reap(slot)
 	result = contextMetadata(slot, true)
@@ -407,7 +432,7 @@ func (a *Application) lease(id string) (*contextSlot, error) {
 		a.mu.Unlock()
 		return nil, failure("context_evicted")
 	}
-	if slot.busy {
+	if slot.active >= maxConcurrentOperations {
 		a.mu.Unlock()
 		return nil, failure("context_busy")
 	}
@@ -417,34 +442,30 @@ func (a *Application) lease(id string) (*contextSlot, error) {
 		a.dispose(slot)
 		return nil, failure("context_evicted")
 	}
-	slot.busy = true
+	slot.active++
 	slot.idleExpires = now.Add(a.config.IdleTTL)
 	a.mu.Unlock()
 	return slot, nil
 }
-func (a *Application) release(slot *contextSlot) { a.mu.Lock(); slot.busy = false; a.mu.Unlock() }
+func (a *Application) release(slot *contextSlot) { a.mu.Lock(); slot.active--; a.mu.Unlock() }
 func (a *Application) dispose(slot *contextSlot) error {
-	slot.cancel()
 	a.mu.Lock()
+	slot.cancel()
 	if a.contexts[slot.id] == slot {
 		delete(a.contexts, slot.id)
 	}
-	handle, turn := slot.worker, slot.turn
-	slot.refs = refStore{}
-	a.mu.Unlock()
-	var err error
-	if handle != nil {
-		err = handle.Terminate()
+	turns := make([]*artifact.Turn, 0, len(slot.exports))
+	for turn := range slot.exports {
+		turns = append(turns, turn)
 	}
-	if turn != nil {
-		if cleanup := turn.Rollback(); cleanup != nil {
-			return failure("upstream_error")
+	a.mu.Unlock()
+	var result error
+	for _, turn := range turns {
+		if err := turn.Rollback(); err != nil {
+			result = errors.Join(result, failure("upstream_error"))
 		}
 	}
-	if err != nil {
-		return failure("worker_crashed")
-	}
-	return nil
+	return result
 }
 func (a *Application) close(id string) error {
 	if !validContextID(id) {
@@ -486,27 +507,15 @@ func (a *Application) reap(slot *contextSlot) {
 		if !live {
 			return
 		}
-		a.mu.Lock()
-		for _, entry := range slot.refs.entries {
-			if entry.expires.Before(expires) {
-				expires = entry.expires
-			}
-		}
-		a.mu.Unlock()
 		timer := time.NewTimer(time.Until(expires))
 		select {
 		case <-slot.life.Done():
 			timer.Stop()
 			return
-		case <-slot.wake:
-			timer.Stop()
-			continue
 		case <-timer.C:
 		}
 		a.mu.Lock()
-		now := time.Now()
-		expired := !now.Before(slot.idleExpires) || !now.Before(slot.absoluteExpires)
-		slot.refs.sweep(now)
+		expired := !time.Now().Before(slot.idleExpires) || !time.Now().Before(slot.absoluteExpires)
 		a.mu.Unlock()
 		if expired {
 			a.dispose(slot)
@@ -536,6 +545,7 @@ func contextMetadata(slot *contextSlot, includeID bool) map[string]any {
 	result := map[string]any{"identity": "user", "armTier": "inspect", "dataPlanes": slot.options.DataPlanes, "localCapabilities": slot.options.LocalCapabilities, "allowedSubscriptions": allowed, "graphScopes": graph, "logsScopes": logs}
 	if includeID {
 		result["contextId"] = slot.id
+		result["maxConcurrentOperations"] = maxConcurrentOperations
 		result["resolvedBindings"] = bindings
 		result["expiresAt"] = slot.absoluteExpires.UTC().Format(time.RFC3339)
 	} else {
@@ -545,7 +555,13 @@ func contextMetadata(slot *contextSlot, includeID bool) map[string]any {
 	return result
 }
 func mapArtifactError(err error) *Error {
+	var public *Error
+	if errors.As(err, &public) {
+		return public
+	}
 	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return failure("request_cancelled")
 	case errors.Is(err, artifact.ErrInvalidName):
 		return failure("invalid_request")
 	case errors.Is(err, artifact.ErrValueTooLarge):
@@ -559,184 +575,146 @@ func mapArtifactError(err error) *Error {
 	}
 }
 
-func (a *Application) run(ctx context.Context, args runArgs) (any, error) {
-	timeout := uint64(60000)
-	if args.TimeoutMS != nil {
-		timeout = *args.TimeoutMS
+func azureOperation(name string) bool {
+	switch name {
+	case "azure_request", "azure_graph", "azure_metrics_single", "azure_metrics_batch", "azure_logs_query":
+		return true
 	}
-	if timeout < 1 || timeout > worker.MaxTimeoutMS || len(args.Code) > worker.MaxCodeBytes {
+	return false
+}
+func closedJSONObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	if _, err := core.DecodeJSON(raw); err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
 		return nil, failure("invalid_request")
 	}
-	slot, err := a.lease(args.ContextID)
+	return fields, nil
+}
+
+// The caller holds the registry lock through the final output acceptance point.
+func (a *Application) liveLocked(slot *contextSlot, ctx context.Context) error {
+	now := time.Now()
+	if a.contexts[slot.id] != slot || slot.life.Err() != nil || !now.Before(slot.idleExpires) || !now.Before(slot.absoluteExpires) {
+		return failure("context_evicted")
+	}
+	if ctx.Err() != nil {
+		return failure("request_cancelled")
+	}
+	return nil
+}
+func (a *Application) operate(ctx context.Context, id, operation string, arguments json.RawMessage, export *exportArgs) (result any, err error) {
+	slot, err := a.lease(id)
 	if err != nil {
 		return nil, err
 	}
 	defer a.release(slot)
-	runCtx, cancel := context.WithCancel(ctx)
-	unsubscribe := context.AfterFunc(slot.life, cancel)
-	defer unsubscribe()
+	callCtx, cancel := context.WithDeadline(ctx, slot.absoluteExpires)
+	stop := context.AfterFunc(slot.life, cancel)
+	defer stop()
 	defer cancel()
+	if export != nil && !core.Contains(slot.options.LocalCapabilities, core.ArtifactsWriteCapability) {
+		return nil, failure("invalid_request")
+	}
 	correlation, err := randomHex(16)
 	if err != nil {
 		return nil, failure("upstream_error")
 	}
-	host, err := a.host(slot.options, slot.pin, correlation)
+	limit := 0
+	if export != nil {
+		limit = 8 * 1024 * 1024
+	}
+	host, err := a.host(slot.options, slot.pin, correlation, limit)
 	if err != nil {
 		return nil, err
 	}
 	var turn *artifact.Turn
-	if core.Contains(slot.options.LocalCapabilities, core.ArtifactsWriteCapability) {
-		turn, err = a.config.Artifacts.BeginTurn(runCtx, slot.namespace)
+	if export != nil {
+		turn, err = a.config.Artifacts.BeginTurn(callCtx, slot.namespace)
 		if err != nil {
-			a.dispose(slot)
-			return nil, mapArtifactError(err)
-		}
-	}
-	a.mu.Lock()
-	slot.turn = turn
-	handle := slot.worker
-	live := a.contexts[slot.id] == slot
-	a.mu.Unlock()
-	if !live || handle == nil {
-		if turn != nil {
-			turn.Rollback()
-		}
-		a.dispose(slot)
-		return nil, failure("context_evicted")
-	}
-	var lastArtifact error
-	var artifactMu sync.Mutex
-	handler := func(callCtx context.Context, request worker.HostCallRequest) (json.RawMessage, error) {
-		switch request.Method {
-		case "az.ref":
-			if callCtx.Err() != nil {
-				return nil, failure("context_evicted")
-			}
-			fields, err := closedJSONObject(request.Arguments)
-			if err != nil || len(fields) != 1 {
-				return nil, failure("invalid_request")
-			}
-			var token string
-			if json.Unmarshal(fields["refId"], &token) != nil {
-				return nil, failure("invalid_request")
-			}
-			a.mu.Lock()
-			if a.contexts[slot.id] != slot || slot.life.Err() != nil || callCtx.Err() != nil {
-				a.mu.Unlock()
-				return nil, failure("context_evicted")
-			}
-			value, err := slot.refs.get(token, time.Now())
-			a.mu.Unlock()
-			if err != nil {
-				return nil, failure("invalid_request")
-			}
-			return value, nil
-		case "az.artifacts.writeJson", "az.artifacts.writeJsonArray", "az.artifacts.writeJsonLines":
-			value, err := a.artifactCall(callCtx, turn, request, correlation)
-			if err != nil {
-				artifactMu.Lock()
-				lastArtifact = err
-				artifactMu.Unlock()
-			}
-			return value, err
-		default:
-			return host.Call(callCtx, request.Method, request.Arguments)
-		}
-	}
-	response, err := handle.Execute(runCtx, args.Code, time.Duration(timeout)*time.Millisecond, handler)
-	if slot.life.Err() != nil || ctx.Err() != nil {
-		err = failure("context_evicted")
-		err.(*Error).Fatal = true
-	}
-	if host.PrincipalMismatch() {
-		err = host.LastError()
-		a.dispose(slot)
-	}
-	rollback := func() error {
-		if turn == nil {
-			return nil
-		}
-		return turn.Rollback()
-	}
-	if err != nil {
-		cleanup := rollback()
-		hostErr := host.LastError()
-		artifactMu.Lock()
-		artifactErr := lastArtifact
-		artifactMu.Unlock()
-		e := publicError(err)
-		if e.Fatal || cleanup != nil {
-			a.dispose(slot)
+			return nil, a.artifactFailure(slot, callCtx, err)
 		}
 		a.mu.Lock()
-		if slot.turn == turn {
-			slot.turn = nil
+		err = a.liveLocked(slot, callCtx)
+		if err == nil {
+			slot.exports[turn] = true
 		}
 		a.mu.Unlock()
-		if cleanup != nil {
-			return nil, failure("upstream_error")
+		defer func() {
+			a.mu.Lock()
+			delete(slot.exports, turn)
+			a.mu.Unlock()
+			if result == nil {
+				if cleanup := turn.Rollback(); cleanup != nil {
+					a.dispose(slot)
+					err = failure("upstream_error")
+				}
+			}
+		}()
+		if err != nil {
+			return nil, err
 		}
-		if e.Code != "context_evicted" && hostErr != nil {
-			return nil, hostErr
-		}
-		if e.Code != "context_evicted" && artifactErr != nil {
-			return nil, artifactErr
-		}
+	}
+	value, callErr := host.Call(callCtx, operation, arguments)
+	if host.PrincipalMismatch() {
+		a.dispose(slot)
+		return nil, callErr
+	}
+	a.mu.Lock()
+	err = a.liveLocked(slot, callCtx)
+	a.mu.Unlock()
+	if err != nil {
 		return nil, err
 	}
-	value := response.Value
-	if response.Type == "result_ref" {
-		a.mu.Lock()
-		token, refErr := slot.refs.put(value, time.Now())
-		select {
-		case slot.wake <- struct{}{}:
-		default:
-		}
-		a.mu.Unlock()
-		if refErr != nil {
-			rollback()
-			a.dispose(slot)
-			return nil, failure("result_too_large")
-		}
-		envelope := shapeSummary(value, len(value), worker.MaxResultBytes)
-		envelope["__ref"] = token
-		envelope["sensitivity"] = "customerData"
-		value, _ = marshalJSON(envelope)
+	if callErr != nil {
+		return nil, callErr
 	}
-	if turn != nil {
-		if err = turn.Commit(); err != nil {
-			cleanup := rollback()
-			a.dispose(slot)
-			if cleanup != nil {
-				return nil, failure("upstream_error")
-			}
-			return nil, mapArtifactError(err)
+	records := host.Records()
+	response := map[string]any{"calls": records.Calls, "callsOmitted": records.CallsOmitted, "sensitivity": "customerData", "correlationId": correlation}
+	if export == nil {
+		response["value"] = value
+		a.mu.Lock()
+		err = a.liveLocked(slot, callCtx)
+		a.mu.Unlock()
+		if err != nil {
+			return nil, err
 		}
+		return response, nil
+	}
+	if a.config.Audit.Prepare() != nil {
+		return nil, failure("upstream_error")
+	}
+	receipt, err := turn.PutJSON(export.Name, value, export.Compression)
+	if err != nil {
+		return nil, a.artifactFailure(slot, callCtx, err)
+	}
+	record := artifactAuditRecord{correlation, "azure_export", "authorized", receipt.Bytes, receipt.LogicalBytes, receipt.ContentEncoding, receipt.MediaType, "customerData"}
+	if a.config.Audit.Append(record) != nil {
+		return nil, failure("upstream_error")
+	}
+	if err = turn.Commit(); err != nil {
+		return nil, a.artifactFailure(slot, callCtx, err)
 	}
 	a.mu.Lock()
-	live = a.contexts[slot.id] == slot && slot.life.Err() == nil && runCtx.Err() == nil
-	if live && turn != nil {
-		err = turn.Finalize()
+	err = a.liveLocked(slot, callCtx)
+	if err == nil {
+		if finalErr := turn.Finalize(); finalErr != nil {
+			err = a.liveLocked(slot, callCtx)
+			if err == nil {
+				err = mapArtifactError(finalErr)
+			}
+		}
 	}
-	if live && err == nil {
-		slot.turn = nil
+	if err == nil {
+		delete(slot.exports, turn)
 	}
 	a.mu.Unlock()
 	if err != nil {
-		cleanup := rollback()
-		a.dispose(slot)
-		if cleanup != nil {
-			return nil, failure("upstream_error")
-		}
-		return nil, mapArtifactError(err)
+		return nil, err
 	}
-	if !live {
-		rollback()
-		a.dispose(slot)
-		return nil, failure("context_evicted")
-	}
-	records := host.Records()
-	return map[string]any{"value": value, "console": response.Logs, "consoleOmitted": response.LogsOmitted, "calls": records.Calls, "callsOmitted": records.CallsOmitted, "context": contextMetadata(slot, false), "sensitivity": "customerData", "correlationId": correlation}, nil
+	response["receipt"] = receipt
+	return response, nil
 }
 
 type artifactAuditRecord struct {
@@ -750,112 +728,12 @@ type artifactAuditRecord struct {
 	Sensitivity     string `json:"sensitivity"`
 }
 
-func (a *Application) artifactCall(ctx context.Context, turn *artifact.Turn, request worker.HostCallRequest, correlation string) (json.RawMessage, error) {
-	if turn == nil {
-		return nil, failure("capability_denied")
+func (a *Application) artifactFailure(slot *contextSlot, ctx context.Context, cause error) *Error {
+	a.mu.Lock()
+	liveErr := a.liveLocked(slot, ctx)
+	a.mu.Unlock()
+	if liveErr != nil {
+		return publicError(liveErr)
 	}
-	if ctx.Err() != nil {
-		return nil, failure("context_evicted")
-	}
-	if err := a.config.Audit.Prepare(); err != nil {
-		return nil, failure("upstream_error")
-	}
-	var receipt artifact.Receipt
-	fields, err := closedJSONObject(request.Arguments)
-	if err != nil {
-		return nil, failure("invalid_request")
-	}
-	if request.Method == "az.artifacts.writeJson" {
-		if len(fields) != 2 || fields["name"] == nil || fields["value"] == nil {
-			return nil, failure("invalid_request")
-		}
-		var name string
-		if json.Unmarshal(fields["name"], &name) != nil {
-			return nil, failure("invalid_request")
-		}
-		receipt, err = turn.Put(name, fields["value"])
-	} else {
-		var phase string
-		if json.Unmarshal(fields["phase"], &phase) != nil {
-			return nil, failure("invalid_request")
-		}
-		format := "jsonArray"
-		if strings.HasSuffix(request.Method, "JsonLines") {
-			format = "jsonLines"
-		}
-		var id string
-		switch phase {
-		case "begin":
-			var args struct{ Phase, Name, Compression string }
-			if json.Unmarshal(request.Arguments, &args) != nil {
-				return nil, failure("invalid_request")
-			}
-			if len(fields) != 3 || fields["name"] == nil || fields["compression"] == nil {
-				return nil, failure("invalid_request")
-			}
-			id, err = turn.Begin(args.Name, args.Compression, format)
-			if err == nil {
-				return marshalJSON(map[string]any{"streamId": id})
-			}
-		case "append":
-			var args struct {
-				Phase    string
-				StreamID string `json:"streamId"`
-				Sequence uint16
-				Values   []json.RawMessage
-			}
-			if json.Unmarshal(request.Arguments, &args) != nil || len(fields) != 4 || fields["streamId"] == nil || fields["sequence"] == nil || string(fields["sequence"]) == "null" || fields["values"] == nil {
-				return nil, failure("invalid_request")
-			}
-			if turn.CheckStreamFormat(args.StreamID, format) != nil {
-				return nil, failure("invalid_request")
-			}
-			err = turn.Append(args.StreamID, args.Sequence, args.Values)
-			if err == nil {
-				return marshalJSON(map[string]any{"acceptedSequence": args.Sequence})
-			}
-		case "finish":
-			var args struct {
-				Phase    string
-				StreamID string `json:"streamId"`
-				Chunks   uint16
-				Items    uint64
-			}
-			if json.Unmarshal(request.Arguments, &args) != nil || len(fields) != 4 || fields["streamId"] == nil || fields["chunks"] == nil || string(fields["chunks"]) == "null" || fields["items"] == nil || string(fields["items"]) == "null" {
-				return nil, failure("invalid_request")
-			}
-			if turn.CheckStreamFormat(args.StreamID, format) != nil {
-				return nil, failure("invalid_request")
-			}
-			receipt, err = turn.Finish(args.StreamID, args.Chunks, args.Items)
-		case "abort":
-			if len(fields) != 2 || json.Unmarshal(fields["streamId"], &id) != nil {
-				return nil, failure("invalid_request")
-			}
-			err = turn.Abort(id)
-			if err == nil {
-				return marshalJSON(map[string]bool{"aborted": true})
-			}
-		default:
-			return nil, failure("invalid_request")
-		}
-	}
-	if err != nil {
-		return nil, mapArtifactError(err)
-	}
-	record := artifactAuditRecord{correlation, request.Method, "authorized", receipt.Bytes, receipt.LogicalBytes, receipt.ContentEncoding, receipt.MediaType, "customerData"}
-	if a.config.Audit.Append(record) != nil {
-		if cleanup := turn.Discard(receipt); cleanup != nil {
-			return nil, &Error{Code: "upstream_error", Message: messages["upstream_error"], Fatal: true}
-		}
-		return nil, failure("upstream_error")
-	}
-	encoded, err := marshalJSON(receipt)
-	if err != nil {
-		if cleanup := turn.Discard(receipt); cleanup != nil {
-			return nil, &Error{Code: "upstream_error", Message: messages["upstream_error"], Fatal: true}
-		}
-		return nil, failure("upstream_error")
-	}
-	return encoded, nil
+	return mapArtifactError(cause)
 }

@@ -160,6 +160,14 @@ func accepts(schema map[string]any, value any) bool {
 		if max, ok := schema["maximum"].(float64); ok && float64(n) > max {
 			return false
 		}
+	case "boolean":
+		if _, ok := value.(bool); !ok {
+			return false
+		}
+	case "null":
+		if value != nil {
+			return false
+		}
 	case nil:
 	default:
 		panic("unsupported tool schema type")

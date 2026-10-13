@@ -12,7 +12,7 @@ import (
 	"sync"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 const maxToolResultBytes = 1024 * 1024
 const protocolKey = "io.modelcontextprotocol/protocolVersion"
 const capabilitiesKey = "io.modelcontextprotocol/clientCapabilities"
@@ -355,10 +355,12 @@ func Serve(ctx context.Context, input io.ReadCloser, output io.Writer, applicati
 			defer stop()
 			value, err := application.Call(callCtx, name, arguments)
 			result, rpcErr := toolResult(value, err, version)
-			remember(send(rpcResponse{JSONRPC: "2.0", ID: id, Result: result, Error: rpcErr}))
+			// A client may reuse the ID as soon as it reads the response.
+			stop()
 			activeMu.Lock()
 			delete(active, key)
 			activeMu.Unlock()
+			remember(send(rpcResponse{JSONRPC: "2.0", ID: id, Result: result, Error: rpcErr}))
 		}(append(json.RawMessage(nil), request.ID...), version, name, append(json.RawMessage(nil), arguments...))
 	}
 	readErr, cancelled := scanner.Err(), ctx.Err() != nil

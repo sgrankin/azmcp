@@ -113,7 +113,7 @@ func TestMCPReviewedRevisionsHaveVersionSpecificEnvelopes(t *testing.T) {
 			}
 			c.send(t, request(2, "tools/list", params))
 			tools := c.receive(t)["result"].(map[string]any)
-			if len(tools["tools"].([]any)) != 6 || tools["_meta"] == nil {
+			if len(tools["tools"].([]any)) != 11 || tools["_meta"] == nil {
 				t.Fatal(tools)
 			}
 			_, cache := tools["ttlMs"]
@@ -346,7 +346,7 @@ func TestMCPJSONRejectsInvalidUnicodeBeforeDispatch(t *testing.T) {
 	}))
 	initializeWire(t, c, "2025-11-25")
 	for _, value := range []string{`"\ud800"`, `"\udc00"`, "\"\xff\""} {
-		raw := []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"azure_run","arguments":{"contextId":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","code":` + value + `}}}` + "\n")
+		raw := []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"azure_graph","arguments":{"contextId":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","cloud":"AzureCloud","query":` + value + `}}}` + "\n")
 		if _, err := c.input.Write(raw); err != nil {
 			t.Fatal(err)
 		}
@@ -358,9 +358,9 @@ func TestMCPJSONRejectsInvalidUnicodeBeforeDispatch(t *testing.T) {
 		t.Fatal("invalid JSON reached the tool caller")
 	}
 	for _, value := range []string{`"\ud83d\ude00"`, `"'\\ud800'"`} {
-		c.send(t, json.RawMessage(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"azure_run","arguments":{"contextId":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","code":`+value+`}}}`))
+		c.send(t, json.RawMessage(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"azure_graph","arguments":{"contextId":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","cloud":"AzureCloud","query":`+value+`}}}`))
 		if response := c.receive(t); response["error"] != nil {
-			t.Fatal("valid Unicode or escaped JS source rejected", response)
+			t.Fatal("valid Unicode or escaped source text rejected", response)
 		}
 	}
 }
@@ -369,6 +369,109 @@ type blockedMCPWriter struct {
 	io.WriteCloser
 	entered chan struct{}
 	once    sync.Once
+}
+
+type pausedMCPReplyWriter struct {
+	io.WriteCloser
+	delivered chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func (w *pausedMCPReplyWriter) Write(raw []byte) (int, error) {
+	n, err := w.WriteCloser.Write(raw)
+	if err == nil {
+		w.once.Do(func() {
+			close(w.delivered)
+			<-w.release
+		})
+	}
+	return n, err
+}
+
+func TestMCPCompletedRequestIDCanBeReusedBeforeWriterReturns(t *testing.T) {
+	input, inputWriter := io.Pipe()
+	outputReader, outputWriter := io.Pipe()
+	writer := &pausedMCPReplyWriter{WriteCloser: outputWriter, delivered: make(chan struct{}), release: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	entered := make(chan struct{}, 2)
+	go func() {
+		done <- Serve(ctx, input, writer, callerFunc(func(context.Context, string, json.RawMessage) (any, error) {
+			entered <- struct{}{}
+			return map[string]any{"ok": true}, nil
+		}))
+	}()
+	var release sync.Once
+	t.Cleanup(func() {
+		release.Do(func() { close(writer.release) })
+		cancel()
+		inputWriter.Close()
+		outputReader.Close()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(time.Second):
+			t.Error("MCP server did not stop")
+		}
+	})
+	c := &wireClient{input: inputWriter, output: bufio.NewReader(outputReader), done: done}
+	call := request(1, "tools/call", map[string]any{"name": "azure_accounts", "arguments": map[string]any{}, "_meta": modernMeta("2026-07-28")})
+	c.send(t, call)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first operation did not start")
+	}
+	if response := c.receive(t); response["error"] != nil {
+		t.Fatal(response)
+	}
+	select {
+	case <-writer.delivered:
+	case <-time.After(time.Second):
+		t.Fatal("control did not pause after delivering the reply")
+	}
+	c.send(t, call)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("completed request ID still blocked admission while its writer was paused")
+	}
+	release.Do(func() { close(writer.release) })
+	if response := c.receive(t); response["error"] != nil {
+		t.Fatal("reused request ID received a duplicate error", response)
+	}
+}
+
+func TestMCPDuplicateRunningRequestIDRetainsCancellation(t *testing.T) {
+	started := make(chan struct{}, 2)
+	c := newWire(t, callerFunc(func(ctx context.Context, _ string, _ json.RawMessage) (any, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}))
+	call := request(1, "tools/call", map[string]any{"name": "azure_accounts", "arguments": map[string]any{}, "_meta": modernMeta("2026-07-28")})
+	c.send(t, call)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("operation did not start")
+	}
+	c.send(t, call)
+	if response := c.receive(t); response["error"] == nil || response["error"].(map[string]any)["code"] != float64(-32600) {
+		t.Fatal("running request ID was reused", response)
+	}
+	select {
+	case <-started:
+		t.Fatal("duplicate operation entered the application")
+	default:
+	}
+	c.send(t, map[string]any{"jsonrpc": "2.0", "method": "notifications/cancelled", "params": map[string]any{"requestId": 1}})
+	if response := c.receive(t); response["error"] != nil || response["result"].(map[string]any)["isError"] != true {
+		t.Fatal("running request cancellation was lost", response)
+	}
 }
 
 func (w *blockedMCPWriter) Write(raw []byte) (int, error) {

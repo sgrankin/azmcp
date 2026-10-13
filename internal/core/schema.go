@@ -117,18 +117,51 @@ func access(entry schemaEntry, options ContextOptions) SchemaAccess {
 func surface(purpose string) string {
 	switch purpose {
 	case "request":
-		return "az.request"
+		return "azure_request"
 	case "resourceGraph":
-		return "az.graph"
+		return "azure_graph"
 	case "logsQuery":
-		return "az.logs.query"
+		return "azure_logs_query"
 	case "metricsSingle":
-		return "az.metrics.single"
+		return "azure_metrics_single"
 	case "metricsBatch":
-		return "az.metrics.batch"
+		return "azure_metrics_batch"
 	default:
 		return "internal"
 	}
+}
+
+func copySchema(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		result := make(map[string]any, len(value))
+		for name, child := range value {
+			result[name] = copySchema(child)
+		}
+		return result
+	case []any:
+		result := make([]any, len(value))
+		for i, child := range value {
+			result[i] = copySchema(child)
+		}
+		return result
+	default:
+		return value
+	}
+}
+
+func toolArgumentSchema(source ManifestSchema) any {
+	schema := copySchema(source.ArgumentSchema).(map[string]any)
+	properties := schema["properties"].(map[string]any)
+	properties["contextId"] = map[string]any{"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"}
+	schema["required"] = append([]any{"contextId"}, schema["required"].([]any)...)
+	schema["title"] = surface(source.Purpose) + " arguments"
+	if path, ok := properties["path"].(map[string]any); ok {
+		if description, ok := path["description"].(string); ok {
+			path["description"] = strings.ReplaceAll(description, "az.request", "azure_request")
+		}
+	}
+	return schema
 }
 func pointer(value string) *string { return &value }
 func hit(entry schemaEntry, options ContextOptions) SchemaSearchHit {
@@ -253,7 +286,7 @@ func (index SchemaIndex) Get(options ContextOptions, id, version string) (Schema
 		if entry.source.ResponseBodySchema != nil {
 			availability = "full"
 		}
-		return SchemaDetails{hit(entry, options), version, entry.source.ArgumentSchema, entry.source.RequestBodySchema, entry.source.ResponseBodySchema, availability}, nil
+		return SchemaDetails{hit(entry, options), version, toolArgumentSchema(entry.source), copySchema(entry.source.RequestBodySchema), copySchema(entry.source.ResponseBodySchema), availability}, nil
 	}
 	return SchemaDetails{}, Fail("schema_not_found", "schema entry was not found")
 }

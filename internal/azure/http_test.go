@@ -234,11 +234,11 @@ func TestHostHelpersShapeScopeAndAudience(t *testing.T) {
 		arguments    any
 		wantAudience string
 	}{
-		{"az.request", map[string]any{"cloud": "AzureCloud", "method": "GET", "path": "/", "apiVersion": core.SubscriptionsAPIVersion}, core.Commercial.Audience("request")},
-		{"az.graph", map[string]any{"cloud": "AzureCloud", "query": "secret-query"}, core.Commercial.Audience("resourceGraph")},
-		{"az.metrics.single", map[string]any{"cloud": "AzureCloud", "resourceId": resource, "metricNames": []string{"CPU"}, "timespan": "PT1H", "filter": "Name eq 'x'"}, core.Commercial.Audience("metricsSingle")},
-		{"az.metrics.batch", map[string]any{"cloud": "AzureCloud", "region": "EASTUS", "resourceIds": []string{resource}, "metricNames": []string{"CPU"}, "metricNamespace": "Microsoft.Compute/virtualMachines"}, core.Commercial.Audience("metricsBatch")},
-		{"az.logs.query", map[string]any{"cloud": "AzureCloud", "workspaceId": testWorkspace, "query": "secret-log-query", "timespan": "PT1H"}, core.Commercial.Audience("logsQuery")},
+		{"azure_request", map[string]any{"cloud": "AzureCloud", "method": "GET", "path": "/", "apiVersion": core.SubscriptionsAPIVersion}, core.Commercial.Audience("request")},
+		{"azure_graph", map[string]any{"cloud": "AzureCloud", "query": "secret-query"}, core.Commercial.Audience("resourceGraph")},
+		{"azure_metrics_single", map[string]any{"cloud": "AzureCloud", "resourceId": resource, "metricNames": []string{"CPU"}, "timespan": "PT1H", "filter": "Name eq 'x'"}, core.Commercial.Audience("metricsSingle")},
+		{"azure_metrics_batch", map[string]any{"cloud": "AzureCloud", "region": "EASTUS", "resourceIds": []string{resource}, "metricNames": []string{"CPU"}, "metricNamespace": "Microsoft.Compute/virtualMachines"}, core.Commercial.Audience("metricsBatch")},
+		{"azure_logs_query", map[string]any{"cloud": "AzureCloud", "workspaceId": testWorkspace, "query": "secret-log-query", "timespan": "PT1H"}, core.Commercial.Audience("logsQuery")},
 	}
 	for _, test := range cases {
 		raw, err := host.Call(context.Background(), test.method, argsJSON(test.arguments))
@@ -252,6 +252,9 @@ func TestHostHelpersShapeScopeAndAudience(t *testing.T) {
 	for i, test := range cases {
 		if credentials.requests[i].Audience != test.wantAudience {
 			t.Fatalf("%s wrong audience: %#v", test.method, credentials.requests[i])
+		}
+		if host.Records().Calls[i].Operation != test.method {
+			t.Fatalf("%s audit operation did not retain the public tool name", test.method)
 		}
 	}
 	mu.Lock()
@@ -267,6 +270,20 @@ func TestHostHelpersShapeScopeAndAudience(t *testing.T) {
 		t.Fatal("audit records contain query or bearer")
 	}
 }
+
+func TestHostRejectsLegacyOperationAliases(t *testing.T) {
+	credentials := &fakeCredentials{}
+	server := simulator(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unknown operation reached socket") })
+	host := hostFor(t, loopbackClient(t, credentials, server), core.DefaultOptions([]core.ResolvedBinding{binding(core.Commercial)}))
+	for _, method := range []string{"az.request", "az.graph", "az.metrics.single", "az.metrics.batch", "az.logs.query"} {
+		_, err := host.Call(context.Background(), method, json.RawMessage(`{}`))
+		assertHostCode(t, err, "protocol_error")
+	}
+	if credentials.calls() != 0 || len(host.Records().Calls) != 0 {
+		t.Fatal("legacy aliases entered the authorized operation path")
+	}
+}
+
 func TestHostDenialsAndAuditGate(t *testing.T) {
 	credentials := &fakeCredentials{}
 	var requests atomic.Int32
@@ -279,11 +296,11 @@ func TestHostDenialsAndAuditGate(t *testing.T) {
 		raw    string
 		code   string
 	}{
-		{"az.request", `{"method":"GET","path":"/","apiVersion":"2020-01-01"}`, "cloud_required"},
-		{"az.request", `{"cloud":"AzureCloud","method":"GET","path":"/","apiVersion":"2020-01-01","headers":{"Authorization":"x"}}`, "invalid_request"},
-		{"az.graph", `{"cloud":"AzureCloud","query":"q","scope":"allAccessible"}`, "capability_denied"},
-		{"az.logs.query", fmt.Sprintf(`{"cloud":"AzureCloud","workspaceId":"%s","query":"q","timespan":"PT1H"}`, testWorkspace), "capability_denied"},
-		{"az.request", `{"cloud":"AzureCloud","method":"GET","path":"/","apiVersion":"2020-01-01","unknown":true}`, "invalid_request"},
+		{"azure_request", `{"method":"GET","path":"/","apiVersion":"2020-01-01"}`, "cloud_required"},
+		{"azure_request", `{"cloud":"AzureCloud","method":"GET","path":"/","apiVersion":"2020-01-01","headers":{"Authorization":"x"}}`, "invalid_request"},
+		{"azure_graph", `{"cloud":"AzureCloud","query":"q","scope":"allAccessible"}`, "capability_denied"},
+		{"azure_logs_query", fmt.Sprintf(`{"cloud":"AzureCloud","workspaceId":"%s","query":"q","timespan":"PT1H"}`, testWorkspace), "capability_denied"},
+		{"azure_request", `{"cloud":"AzureCloud","method":"GET","path":"/","apiVersion":"2020-01-01","unknown":true}`, "invalid_request"},
 	} {
 		_, err := host.Call(context.Background(), test.method, json.RawMessage(test.raw))
 		assertHostCode(t, err, test.code)
@@ -295,7 +312,7 @@ func TestHostDenialsAndAuditGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = host.Call(context.Background(), "az.request", argsJSON(map[string]any{"cloud": "AzureCloud", "method": "GET", "path": "/", "apiVersion": core.SubscriptionsAPIVersion}))
+	_, err = host.Call(context.Background(), "azure_request", argsJSON(map[string]any{"cloud": "AzureCloud", "method": "GET", "path": "/", "apiVersion": core.SubscriptionsAPIVersion}))
 	assertHostCode(t, err, "audit_unavailable")
 	if credentials.calls() != 0 {
 		t.Fatal("audit prepare failure reached credentials")
@@ -323,18 +340,51 @@ func TestHostPrincipalChangeIsFatalContextSignal(t *testing.T) {
 	server := simulator(t, func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, `{}`) })
 	host := hostFor(t, loopbackClient(t, credentials, server), core.DefaultOptions([]core.ResolvedBinding{binding(core.Commercial)}))
 	args := argsJSON(map[string]any{"cloud": "AzureCloud", "method": "GET", "path": "/", "apiVersion": core.SubscriptionsAPIVersion})
-	if _, err := host.Call(context.Background(), "az.request", args); err != nil {
+	if _, err := host.Call(context.Background(), "azure_request", args); err != nil {
 		t.Fatal(err)
 	}
 	credentials.mu.Lock()
 	credentials.principal = testWorkspace
 	credentials.mu.Unlock()
-	_, err := host.Call(context.Background(), "az.request", args)
+	_, err := host.Call(context.Background(), "azure_request", args)
 	assertHostCode(t, err, "authentication_required")
 	if !host.PrincipalMismatch() || host.LastError() == nil || !host.LastError().IdentityMismatch {
 		t.Fatal("principal mismatch signal omitted")
 	}
 }
+
+func TestHostPrincipalChangeSignalSurvivesAuditFailure(t *testing.T) {
+	credentials := &fakeCredentials{}
+	server := simulator(t, func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, `{}`) })
+	failAudit := false
+	host, err := NewHost(HostConfig{
+		Context: core.DefaultOptions([]core.ResolvedBinding{binding(core.Commercial)}),
+		Client:  loopbackClient(t, credentials, server), CorrelationID: "azmcp-test-synthetic",
+		Audit: func(CallRecord) error {
+			if failAudit {
+				return errors.New("audit unavailable")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := argsJSON(map[string]any{"cloud": "AzureCloud", "method": "GET", "path": "/", "apiVersion": core.SubscriptionsAPIVersion})
+	if _, err = host.Call(context.Background(), "azure_request", args); err != nil {
+		t.Fatal(err)
+	}
+	credentials.mu.Lock()
+	credentials.principal = testWorkspace
+	credentials.mu.Unlock()
+	failAudit = true
+	_, err = host.Call(context.Background(), "azure_request", args)
+	assertHostCode(t, err, "audit_unavailable")
+	if !host.PrincipalMismatch() {
+		t.Fatal("audit failure erased the fatal principal-mismatch signal")
+	}
+}
+
 func TestLogsTimespanAndResponseShape(t *testing.T) {
 	for _, value := range []string{"PT1H", "P30D", "P1DT2H3M4S"} {
 		if !validTimespan(value) {
@@ -363,7 +413,7 @@ func TestMetricsBatchRejectsUnicodeMixedResourceTypes(t *testing.T) {
 	credentials := &fakeCredentials{}
 	server := simulator(t, func(w http.ResponseWriter, r *http.Request) { t.Error("mixed resource types reached socket") })
 	host := hostFor(t, loopbackClient(t, credentials, server), core.DefaultOptions([]core.ResolvedBinding{binding(core.Commercial)}))
-	_, err := host.Call(context.Background(), "az.metrics.batch", argsJSON(map[string]any{
+	_, err := host.Call(context.Background(), "azure_metrics_batch", argsJSON(map[string]any{
 		"cloud": "AzureCloud", "region": "eastus", "metricNamespace": "Microsoft.Custom/kinds", "metricNames": []string{"Count"},
 		"resourceIds": []string{
 			"/subscriptions/" + testSubscription + "/providers/Microsoft.Custom/kinds/one",
@@ -421,7 +471,7 @@ func TestHostWithholdsResultWhenAuditAppendFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := host.Call(context.Background(), "az.request", argsJSON(map[string]any{"cloud": "AzureCloud", "method": "GET", "path": "/", "apiVersion": core.SubscriptionsAPIVersion}))
+	raw, err := host.Call(context.Background(), "azure_request", argsJSON(map[string]any{"cloud": "AzureCloud", "method": "GET", "path": "/", "apiVersion": core.SubscriptionsAPIVersion}))
 	assertHostCode(t, err, "audit_unavailable")
 	if len(raw) != 0 {
 		t.Fatal("audit failure exposed the successful upstream result")

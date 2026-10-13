@@ -3,6 +3,8 @@ package server
 import (
 	"azmcp/internal/azure"
 	"azmcp/internal/core"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"sort"
@@ -14,24 +16,22 @@ type Error struct {
 	Message   string
 	Retryable bool
 	Details   any
-	Fatal     bool
 }
 
 func (e *Error) Error() string { return e.Code }
 func failure(code string) *Error {
-	return &Error{Code: code, Message: messages[code], Retryable: code == "authentication_required" || code == "worker_crashed" || code == "upstream_error"}
+	return &Error{Code: code, Message: messages[code], Retryable: code == "authentication_required" || code == "context_busy" || code == "upstream_error"}
 }
 
 var messages = map[string]string{
+	"request_cancelled":        "the operation was canceled",
 	"invalid_request":          "request is outside the implemented v0 contract",
 	"account_ambiguous":        "Azure account binding is missing or ambiguous",
 	"authentication_required":  "Azure CLI account profile is unavailable; authenticate the intended cloud and tenant with az login, then retry",
 	"subscription_mismatch":    "subscription binding validation failed",
-	"context_busy":             "another run is already active in this context",
-	"context_evicted":          "the execution context no longer exists",
-	"worker_crashed":           "the isolated JavaScript worker is unavailable",
-	"execution_timeout":        "JavaScript execution exceeded its deadline",
-	"result_too_large":         "the JavaScript result exceeds the v0 size limit",
+	"context_busy":             "context concurrent operation limit reached; retry after an active call completes",
+	"context_evicted":          "the authorization context no longer exists",
+	"result_too_large":         "the result exceeds the transport size limit",
 	"artifact_capacity":        "managed artifact storage capacity is exhausted",
 	"schema_unavailable":       "the offline schema index is unavailable",
 	"schema_not_found":         "the reviewed schema entry was not found",
@@ -62,7 +62,7 @@ func publicError(err error) *Error {
 		case "principal_mismatch":
 			code = "authentication_required"
 		}
-		return &Error{Code: code, Message: host.Message, Retryable: host.Retryable, Fatal: host.IdentityMismatch}
+		return &Error{Code: code, Message: host.Message, Retryable: host.Retryable}
 	}
 	var c *core.Error
 	if errors.As(err, &c) {
@@ -71,7 +71,7 @@ func publicError(err error) *Error {
 	return failure("upstream_error")
 }
 func shapeDetails(value any, size, limit int) any {
-	return map[string]any{"summary": shapeSummary(value, size, limit), "guidance": "Reduce the value in JavaScript before returning it: project needed fields, filter rows, or aggregate counts."}
+	return map[string]any{"summary": shapeSummary(value, size, limit), "guidance": "Project or aggregate results in the Azure query, or use azure_export to write the full response locally."}
 }
 func valueType(value any) string {
 	switch value.(type) {
@@ -141,4 +141,12 @@ func shapeSummary(value any, size, limit int) map[string]any {
 		}
 	}
 	return summary
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }

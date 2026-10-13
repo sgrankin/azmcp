@@ -97,7 +97,7 @@ func envInteger(name string, fallback int64) (int64, error) {
 }
 
 // Production parses only azmcp configuration at startup; Azure profiles and credentials stay lazy.
-func Production(executable string) (*Runtime, error) {
+func Production() (*Runtime, error) {
 	home, err := envPath("HOME", "")
 	if err != nil || home == "" {
 		return nil, errors.New("HOME must be set")
@@ -176,7 +176,7 @@ func Production(executable string) (*Runtime, error) {
 	if err != nil {
 		return fail(err)
 	}
-	app, err := NewApplication(AppConfig{Config: config, Policy: policy, Schema: schema, Profile: FileProfile(profile), Client: client, Audit: audit, Artifacts: store, Worker: func(ctx context.Context) (WorkerHandle, error) { return StartWorker(ctx, executable) }})
+	app, err := NewApplication(AppConfig{Config: config, Policy: policy, Schema: schema, Profile: FileProfile(profile), Client: client, Audit: audit, Artifacts: store})
 	if err != nil {
 		return fail(err)
 	}

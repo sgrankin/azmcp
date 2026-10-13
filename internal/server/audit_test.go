@@ -17,7 +17,7 @@ func TestAuditIsPrivateDurableBoundedAndRotates(t *testing.T) {
 	}
 	defer audit.Close()
 	for i := 0; i < 15; i++ {
-		if err = audit.Append(artifactAuditRecord{CorrelationID: strings.Repeat("a", 10000), Operation: "az.artifacts.writeJson", Decision: "authorized", Bytes: 10, LogicalBytes: 10, MediaType: "application/json", Sensitivity: "customerData"}); err != nil {
+		if err = audit.Append(artifactAuditRecord{CorrelationID: strings.Repeat("a", 10000), Operation: "azure_export", Decision: "authorized", Bytes: 10, LogicalBytes: 10, MediaType: "application/json", Sensitivity: "customerData"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -36,7 +36,7 @@ func TestAuditIsPrivateDurableBoundedAndRotates(t *testing.T) {
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
 		var record map[string]any
-		if json.Unmarshal([]byte(line), &record) != nil || record["timestampUnixMs"] == nil || record["operation"] != "az.artifacts.writeJson" {
+		if json.Unmarshal([]byte(line), &record) != nil || record["timestampUnixMs"] == nil || record["operation"] != "azure_export" {
 			t.Fatal("audit envelope mismatch")
 		}
 	}
@@ -62,14 +62,5 @@ func TestAuditRejectsSymlinkWithoutWritingTarget(t *testing.T) {
 	raw, _ := os.ReadFile(target)
 	if string(raw) != "unchanged" {
 		t.Fatal("audit changed symlink target")
-	}
-}
-func TestResidentMemoryObservationReadsCurrentProcess(t *testing.T) {
-	rss, err := residentBytes(os.Getpid())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rss == 0 {
-		t.Fatal("resident bytes must be positive")
 	}
 }
