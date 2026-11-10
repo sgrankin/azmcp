@@ -29,9 +29,10 @@ const testPrincipal = "55555555-5555-5555-5555-555555555555"
 const testClientID = "66666666-6666-6666-6666-666666666666"
 
 type syntheticCredentials struct {
-	mu       sync.Mutex
-	requests []azure.TokenRequest
-	changed  atomic.Bool
+	mu        sync.Mutex
+	requests  []azure.TokenRequest
+	changed   atomic.Bool
+	signedOut core.Cloud
 }
 
 func (c *syntheticCredentials) Acquire(ctx context.Context, r azure.TokenRequest) (azure.Credential, error) {
@@ -40,7 +41,11 @@ func (c *syntheticCredentials) Acquire(ctx context.Context, r azure.TokenRequest
 	}
 	c.mu.Lock()
 	c.requests = append(c.requests, r)
+	signedOut := r.Cloud == c.signedOut
 	c.mu.Unlock()
+	if signedOut {
+		return azure.Credential{}, &azure.CredentialError{Code: "authentication_required", Message: "synthetic cloud is signed out"}
+	}
 	principal := testPrincipal
 	if c.changed.Load() {
 		principal = testWorkspace

@@ -103,6 +103,7 @@
         },
         "bindings": {
           "type": "object",
+          "description": "A nonempty map selects exactly these clouds; omitted clouds are not added from configuration or cached accounts. Omit bindings or pass an empty map to discover clouds using configuration and cached accounts.",
           "properties": {
             "AzureCloud": {
               "type": "object",

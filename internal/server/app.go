@@ -246,7 +246,12 @@ func (a *Application) accounts(ctx context.Context) (any, error) {
 	return map[string]any{"accounts": result}, nil
 }
 func (a *Application) resolve(ctx context.Context, args openArgs) (core.ContextOptions, error) {
-	clouds := []core.Cloud{core.Commercial, core.Government}
+	var clouds []core.Cloud
+	for _, cloud := range []core.Cloud{core.Commercial, core.Government} {
+		if _, selected := args.Bindings[cloud]; len(args.Bindings) == 0 || selected {
+			clouds = append(clouds, cloud)
+		}
+	}
 	explicit, requiresProfile, autoCloud := false, false, false
 	for _, cloud := range clouds {
 		if override, ok := args.Bindings[cloud]; ok {

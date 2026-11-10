@@ -11,6 +11,9 @@ It fixes user identity, inspect tier, cloud bindings, subscription/tenant allowl
 Graph and Logs scopes, optional local export grant, and reviewed policy identity.
 Credential identity pins survive across calls in that context.
 Bindings resolve from caller overrides, configured bindings, or an unambiguous synthetic/cached profile.
+Nonempty caller bindings select exactly the context's clouds; omitted clouds are excluded
+even when configured or cached.
+Omitted or empty bindings retain configuration/profile discovery for both clouds.
 Every allowed pair is validated before context retention.
 
 The registry holds at most 32 contexts, expiring after 30 minutes idle or 24 hours absolute.

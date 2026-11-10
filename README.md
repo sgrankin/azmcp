@@ -26,6 +26,9 @@ Cloud is exactly `AzureCloud` or `AzureUSGovernment`.
 The server does not infer it from `az cloud set`.
 An authorization context fixes user identity, the inspect tier, subscription/tenant
 bindings and allowlists, Graph scope, optional Logs grant, policy identity, and identity pins.
+Nonempty `bindings` selects exactly the clouds to bind and validate.
+For example, `bindings: {"AzureCloud": {"subscription": "11111111-1111-1111-1111-111111111111"}}` creates a commercial-only
+context even when configuration or cached accounts also contain Government bindings.
 It permits up to eight concurrent operations; saturation returns retryable `context_busy`.
 Request cancellation affects that call.
 Close, expiry, and a credential identity change revoke the entire context.
@@ -201,9 +204,12 @@ root = "/absolute/private/path/to/azmcp-artifacts"
 ```
 
 An omitted primary tenant is resolved only when the cached Azure profile has
-exactly one matching tenant candidate. With no configured or caller-supplied
-bindings, auto-binding succeeds only for a cloud with exactly one candidate;
-ambiguity fails closed.
+exactly one matching tenant candidate.
+Nonempty caller-supplied `bindings` selects exactly those clouds.
+When `bindings` is omitted or empty, each cloud uses its configured binding or,
+if none is configured, its sole cached candidate; ambiguity fails closed.
+Every selected cloud is validated before the context opens, so request both cloud
+bindings only when both are needed and authenticated.
 
 The managed artifact root defaults to
 `$XDG_DATA_HOME/azmcp/artifacts`, or
